@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -11,6 +12,11 @@ from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import ContextTypes
+
+try:
+    from telegram import ReactionTypeEmoji
+except Exception:
+    ReactionTypeEmoji = None  # type: ignore
 
 MESSAGES: dict[str, dict[str, str]] = {}
 logger = logging.getLogger(__name__)
@@ -31,6 +37,96 @@ def configure(deps: dict[str, Any]) -> None:
         if k.startswith('__') and k.endswith('__'):
             continue
         globals()[k] = v
+
+
+_THANKS_REPLY_PATTERNS: list[tuple[str, str]] = [
+    ("uz", r"\b(rahm+a+t|raxm+a+t|rakhmat|tashakkur|tashakkurlar|minnatdor(m\w*)?)\b"),
+    ("en", r"\b(thanks?|thank you|thankyou|thank u|thx|tnx|appreciate it|much appreciated)\b"),
+    ("ru", r"\b(спасибо|благодарю|благодарствую|spasibo)\b"),
+]
+
+
+def _detect_thanks_reply_lang(text: str) -> str | None:
+    cleaned = re.sub(r"[^\w\s]+", " ", str(text or "").lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return None
+    for lang_key, pattern in _THANKS_REPLY_PATTERNS:
+        if re.search(pattern, cleaned):
+            return lang_key
+    return None
+
+
+async def _send_reaction_for_message(update: Update, context: ContextTypes.DEFAULT_TYPE, emoji: str) -> None:
+    msg = getattr(update, "message", None)
+    chat = getattr(update, "effective_chat", None)
+    bot = getattr(context, "bot", None)
+    if not msg or not chat or not bot or not emoji:
+        return
+
+    # PTB >= 21 has native set_message_reaction; PTB 20.x can still call raw API via _post.
+    if hasattr(bot, "set_message_reaction") and ReactionTypeEmoji is not None:
+        try:
+            await bot.set_message_reaction(
+                chat_id=chat.id,
+                message_id=msg.message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+                is_big=False,
+            )
+            return
+        except Exception as e:
+            logger.debug("message reaction (native) failed: %s", e)
+
+    try:
+        reaction_payload = json.dumps([{"type": "emoji", "emoji": emoji}], ensure_ascii=False)
+        await bot._post(
+            "setMessageReaction",
+            data={
+                "chat_id": chat.id,
+                "message_id": msg.message_id,
+                "reaction": reaction_payload,
+                "is_big": False,
+            },
+        )
+    except Exception as e:
+        # Reactions are optional and may be unsupported in some chats / Bot API versions.
+        logger.debug("message reaction (raw) failed: %s", e)
+        return
+
+
+async def _send_heart_reaction_for_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_reaction_for_message(update, context, "❤️")
+
+
+async def _send_salute_reaction_for_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_reaction_for_message(update, context, "🫡")
+
+
+def _get_audio_channel_send_guard(context: ContextTypes.DEFAULT_TYPE, channel_id: int):
+    app = getattr(context, "application", None)
+    bot_data = getattr(app, "bot_data", None) if app else None
+    if not isinstance(bot_data, dict):
+        return None, None
+
+    locks = bot_data.setdefault("_audio_channel_send_locks", {})
+    if not isinstance(locks, dict):
+        locks = {}
+        bot_data["_audio_channel_send_locks"] = locks
+    lock = locks.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[channel_id] = lock
+
+    states = bot_data.setdefault("_audio_channel_send_state", {})
+    if not isinstance(states, dict):
+        states = {}
+        bot_data["_audio_channel_send_state"] = states
+    state = states.get(channel_id)
+    if not isinstance(state, dict):
+        state = {"next_allowed_at": 0.0}
+        states[channel_id] = state
+    state.setdefault("next_allowed_at", 0.0)
+    return lock, state
 
 
 async def _can_show_delete_button(update: Update, user_id: int | None) -> bool:
@@ -635,6 +731,88 @@ async def handle_audiobook_part_callback(update: Update, context: ContextTypes.D
     await safe_answer(query)
 
 
+_AUDIO_REQUEST_BOOK_ID_RE = re.compile(r"\[book_id:\s*([^\]]+)\]", re.IGNORECASE)
+
+
+def _extract_requested_book_id(query_text: str) -> str | None:
+    if not query_text:
+        return None
+    match = _AUDIO_REQUEST_BOOK_ID_RE.search(str(query_text))
+    if not match:
+        return None
+    value = str(match.group(1) or "").strip()
+    return value or None
+
+
+async def _notify_waiting_users_audiobook_ready(
+    context: ContextTypes.DEFAULT_TYPE,
+    book_id: str,
+    book_title: str,
+) -> int:
+    list_requests_fn = globals().get("load_requests") or globals().get("db_list_requests")
+    if not callable(list_requests_fn):
+        return 0
+
+    try:
+        requests = await run_blocking(list_requests_fn)
+    except Exception as e:
+        logger.warning("Failed to load requests for audiobook-ready notify (book_id=%s): %s", book_id, e)
+        return 0
+
+    if not requests:
+        return 0
+
+    mark_done_fn = globals().get("mark_request_fulfilled")
+    update_status_fn = globals().get("update_request_status")
+    notified = 0
+
+    for req in requests:
+        if str(req.get("status") or "") not in {"open", "seen"}:
+            continue
+        req_book_id = _extract_requested_book_id(str(req.get("query") or ""))
+        if not req_book_id or str(req_book_id).strip() != str(book_id).strip():
+            continue
+
+        user_id = req.get("user_id")
+        if not user_id:
+            continue
+
+        req_lang = req.get("language") or "en"
+        msgs = MESSAGES.get(req_lang, MESSAGES.get("en", {}))
+        text = msgs.get(
+            "audiobook_ready_notify",
+            "🎧 Audiobook is ready for: {title}\n👇 Tap the button below to open the book.",
+        ).format(title=book_title)
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(book_title, callback_data=f"book:{book_id}")]]
+        )
+
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        except Exception as e:
+            logger.warning(
+                "Failed to send audiobook-ready message to user=%s for book_id=%s: %s",
+                user_id,
+                book_id,
+                e,
+            )
+            continue
+
+        try:
+            req_id = req.get("id")
+            if req_id:
+                if callable(mark_done_fn):
+                    await run_blocking(mark_done_fn, req_id, book_id)
+                elif callable(update_status_fn):
+                    await run_blocking(update_status_fn, req_id, "done", None, "Audiobook added automatically")
+        except Exception as e:
+            logger.warning("Failed to mark audiobook request as done (request_id=%s): %s", req.get("id"), e)
+
+        notified += 1
+
+    return notified
+
+
 async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Capture audio/voice/document while an audiobook add flow is pending."""
     pending = context.user_data.get("pending_abook")
@@ -729,14 +907,34 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         sent = None
         last_err = None
         send_retry_max = 5
+        try:
+            send_min_interval = max(0.0, float(os.getenv("AUDIO_UPLOAD_SEND_DELAY_SEC", "0.90") or "0.90"))
+        except Exception:
+            send_min_interval = 0.90
+
+        channel_lock, channel_state = _get_audio_channel_send_guard(context, int(audio_channel_id))
+
+        async def _send_once():
+            if getattr(msg, "audio", None):
+                return await context.bot.send_audio(chat_id=audio_channel_id, audio=file_id)
+            if getattr(msg, "voice", None):
+                return await context.bot.send_voice(chat_id=audio_channel_id, voice=file_id)
+            return await context.bot.send_document(chat_id=audio_channel_id, document=file_id)
+
         for attempt in range(1, send_retry_max + 1):
             try:
-                if getattr(msg, "audio", None):
-                    sent = await context.bot.send_audio(chat_id=audio_channel_id, audio=file_id)
-                elif getattr(msg, "voice", None):
-                    sent = await context.bot.send_voice(chat_id=audio_channel_id, voice=file_id)
+                if channel_lock is not None:
+                    async with channel_lock:
+                        if isinstance(channel_state, dict):
+                            now_ts = asyncio.get_running_loop().time()
+                            next_allowed_at = float(channel_state.get("next_allowed_at", 0.0) or 0.0)
+                            if next_allowed_at > now_ts:
+                                await asyncio.sleep(next_allowed_at - now_ts)
+                        sent = await _send_once()
+                        if isinstance(channel_state, dict) and send_min_interval > 0:
+                            channel_state["next_allowed_at"] = asyncio.get_running_loop().time() + send_min_interval
                 else:
-                    sent = await context.bot.send_document(chat_id=audio_channel_id, document=file_id)
+                    sent = await _send_once()
                 last_err = None
                 break
             except Exception as e:
@@ -744,6 +942,11 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 retry_after = getattr(e, "retry_after", None)
                 if retry_after is not None and attempt < send_retry_max:
                     wait_s = float(retry_after or 1) + 0.5
+                    if isinstance(channel_state, dict):
+                        channel_state["next_allowed_at"] = max(
+                            float(channel_state.get("next_allowed_at", 0.0) or 0.0),
+                            asyncio.get_running_loop().time() + wait_s,
+                        )
                     logger.warning(
                         "Audio channel flood control for channel %s, waiting %.2fs (attempt %s/%s)",
                         audio_channel_id,
@@ -760,6 +963,11 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
                 if transient and attempt < send_retry_max:
                     backoff = min(10.0, 0.5 * (2 ** (attempt - 1)))
+                    if isinstance(channel_state, dict):
+                        channel_state["next_allowed_at"] = max(
+                            float(channel_state.get("next_allowed_at", 0.0) or 0.0),
+                            asyncio.get_running_loop().time() + backoff,
+                        )
                     logger.warning(
                         "Audio channel transient error for channel %s: %s (attempt %s/%s, wait %.2fs)",
                         audio_channel_id,
@@ -859,8 +1067,101 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text(MESSAGES[lang]["audiobook_part_saved"].format(index=part_index))
     except Exception:
         pass
+
+    # Auto-notify users who requested audiobook for this specific book.
+    try:
+        notify_book_id = str(pending.get("book_id") or "").strip()
+        if not notify_book_id:
+            get_abook_by_id = globals().get("get_audio_book_by_id")
+            if callable(get_abook_by_id):
+                abook_row = await run_blocking(get_abook_by_id, audio_book_id)
+                notify_book_id = str((abook_row or {}).get("book_id") or "").strip()
+
+        if notify_book_id:
+            title = notify_book_id
+            find_book_fn = globals().get("find_book_by_id") or globals().get("get_book_by_id")
+            if callable(find_book_fn):
+                book_row = await run_blocking(find_book_fn, notify_book_id)
+                if book_row:
+                    get_title = globals().get("get_result_title")
+                    if callable(get_title):
+                        t = get_title(book_row)
+                        if t:
+                            title = str(t)
+                    if title == notify_book_id:
+                        title = str(
+                            book_row.get("book_name")
+                            or book_row.get("display_name")
+                            or title
+                        )
+
+            notified_count = await _notify_waiting_users_audiobook_ready(context, notify_book_id, title)
+            if notified_count:
+                logger.info(
+                    "Audiobook-ready auto notifications sent: book_id=%s users=%s",
+                    notify_book_id,
+                    notified_count,
+                )
+    except Exception as e:
+        logger.warning("Audiobook-ready auto notify failed: %s", e)
+
     # stop further handlers (like upload_flow.handle_file)
     raise ApplicationHandlerStop()
+
+
+async def _handle_missing_audiobook_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+    lang: str,
+    book_id: str,
+) -> None:
+    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
+    book_title = str(book_id)
+
+    try:
+        lookup = globals().get("find_book_by_id") or globals().get("get_book_by_id")
+        if callable(lookup):
+            book = await run_blocking(lookup, book_id)
+            if book:
+                get_title = globals().get("get_result_title")
+                if callable(get_title):
+                    title = get_title(book)
+                    if title:
+                        book_title = str(title)
+                if book_title == str(book_id):
+                    book_title = str(
+                        book.get("display_name")
+                        or book.get("book_name")
+                        or book.get("name")
+                        or book_title
+                    )
+    except Exception as e:
+        logger.debug("Failed to resolve title for audiobook request (book_id=%s): %s", book_id, e)
+
+    request_query = msgs.get(
+        "audiobook_missing_request_query",
+        "🎧 Audiobook request: {title} [book_id: {book_id}]",
+    ).format(title=book_title, book_id=book_id)
+
+    try:
+        send_request = globals().get("send_request_to_admin")
+        if callable(send_request) and update.effective_user:
+            await send_request(context, update.effective_user, request_query, lang)
+    except Exception as e:
+        logger.warning("Failed to send audiobook request to admin group (book_id=%s): %s", book_id, e)
+
+    try:
+        await query.message.reply_text(
+            msgs.get(
+                "audiobook_missing_reply",
+                "🎧 This book has no audiobook yet.\n⏳ We will add it within 1 hour.\n🔔 Wait for our message.",
+            )
+        )
+    except Exception:
+        pass
+
+    await safe_answer(query)
 
 
 async def handle_audiobook_listen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -877,29 +1178,29 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     book_id = data.split(":", 1)[1]
-    
+
     # Get the audiobook for this book
     audio_book = await run_blocking(get_audio_book_for_book, book_id)
     if not audio_book:
-        await safe_answer(query, MESSAGES[lang].get("audiobook_not_found", "Audiobook not found"), show_alert=True)
+        await _handle_missing_audiobook_request(update, context, query, lang, book_id)
         return
-    
+
     # Get all audio parts
     all_parts = await run_blocking(list_audio_book_parts, audio_book.get("id"))
     if not all_parts:
-        await safe_answer(query, MESSAGES[lang].get("audiobook_no_parts", "No audio parts found"), show_alert=True)
+        await _handle_missing_audiobook_request(update, context, query, lang, book_id)
         return
-    
+
     # Pagination: show only first 10 parts initially
     parts_per_page = 10
     parts = all_parts[:parts_per_page]
-    
+
     # Build keyboard with audio parts (3 per row)
     keyboard = []
     row = []
     for i, part in enumerate(parts):
         part_index = part.get("part_index", 0)
-        
+
         # Multilingual button text based on user language
         if lang == "uz":
             button_text = f"🎵 {part_index}-qism"
@@ -907,15 +1208,15 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
             button_text = f"🎵 Часть {part_index}"
         else:  # English default
             button_text = f"🎵 Part {part_index}"
-            
+
         callback_data = f"abplay:{part.get('id')}"
         row.append(InlineKeyboardButton(button_text, callback_data=callback_data))
-        
+
         # Add row when we have 3 buttons or it's the last part
         if len(row) == 3 or i == len(parts) - 1:
             keyboard.append(row)
             row = []
-    
+
     # Add pagination if more than 10 parts
     if len(all_parts) > 10:
         # Navigation row with prev/next buttons and page info
@@ -926,15 +1227,16 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
             InlineKeyboardButton("➡️ Next", callback_data=f"abpage:{book_id}:next")
         ]
         keyboard.append(nav_row)
-    
+
     text = MESSAGES[lang].get("audiobook_listen_title", f"🎧 Audiobook: {len(all_parts)} parts")
-    
+
     try:
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.debug("Failed to send audiobook parts message: %s", e)
         await safe_answer(query)
-    
+        return
+
     await safe_answer(query)
 
 
@@ -1499,16 +1801,11 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Simple thanks replies
-        text_lower = update.message.text.strip().lower()
-        thanks_text = re.sub(r"[^\w\s]+", " ", text_lower)
-        thanks_text = re.sub(r"\s+", " ", thanks_text).strip()
-        is_rahmat = re.fullmatch(r"(rahm+a+t|raxm+a+t)", thanks_text) is not None
-        is_thanks = thanks_text in {"thank you", "thanks", "thankyou"}
-        if is_rahmat or is_thanks:
-            if is_rahmat:
-                await safe_reply(update, MESSAGES["uz"]["thanks_reply"])
-            else:
-                await safe_reply(update, MESSAGES["en"]["thanks_reply"])
+        thanks_lang = _detect_thanks_reply_lang(update.message.text)
+        if thanks_lang:
+            await _send_heart_reaction_for_message(update, context)
+            reply_lang = thanks_lang if thanks_lang in MESSAGES else lang
+            await safe_reply(update, MESSAGES[reply_lang]["thanks_reply"])
             return
 
         if context.user_data.get("awaiting_request"):
@@ -1548,6 +1845,7 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if handled:
                     return
 
+            await _send_salute_reaction_for_message(update, context)
             try:
                 progress_message = await update.message.reply_text(
                     MESSAGES[lang].get("processing_movie_search", "🎬 Searching movies... please wait.")
@@ -1659,6 +1957,7 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not query:
             await update.message.reply_text(MESSAGES[lang]["enter_specific"])
             return
+        await _send_salute_reaction_for_message(update, context)
         try:
             progress_message = await update.message.reply_text(
                 MESSAGES[lang].get("processing_search", "🔎 Searching... Please wait.")
@@ -1894,6 +2193,14 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         audio_book = await run_blocking(get_audio_book_for_book, book_id)
         has_ab = bool(audio_book)
         can_add_ab = bool(_is_admin_user(query.from_user.id)) if callable(globals().get("_is_admin_user")) else False
+        is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
+        show_listen_btn = has_ab if is_owner_user else True
+        ab_request_count = 0
+        if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
+            try:
+                ab_request_count = await run_blocking(count_pending_audiobook_requests, book_id)
+            except Exception:
+                ab_request_count = 0
         reactions_kb = build_book_keyboard(
             book_id,
             counts,
@@ -1903,6 +2210,8 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             lang,
             has_audiobook=has_ab,
             can_add_audiobook=can_add_ab,
+            show_listen_button=show_listen_btn,
+            audiobook_request_count=ab_request_count,
         )
 
         # --- Case 1: File ID available (prefer cache) ---
@@ -2012,6 +2321,14 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                     audio_book2 = await run_blocking(get_audio_book_for_book, book_id)
                     has_ab2 = bool(audio_book2)
                     can_add_ab2 = bool(_is_admin_user(query.from_user.id)) if callable(globals().get("_is_admin_user")) else False
+                    is_owner_user2 = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
+                    show_listen_btn2 = has_ab2 if is_owner_user2 else True
+                    ab_request_count2 = 0
+                    if can_add_ab2 and is_owner_user2 and callable(globals().get("count_pending_audiobook_requests")):
+                        try:
+                            ab_request_count2 = await run_blocking(count_pending_audiobook_requests, book_id)
+                        except Exception:
+                            ab_request_count2 = 0
                     await sent.edit_caption(
                         caption=build_book_caption(book, new_downloads, fav_count, counts),
                         reply_markup=build_book_keyboard(
@@ -2023,6 +2340,8 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             lang,
                             has_audiobook=has_ab2,
                             can_add_audiobook=can_add_ab2,
+                            show_listen_button=show_listen_btn2,
+                            audiobook_request_count=ab_request_count2,
                         ),
                     )
             except Exception as e:

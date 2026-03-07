@@ -395,9 +395,28 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
             audio_book = await run_blocking(get_audio_book_for_book, book_id)
             has_ab = bool(audio_book)
             can_add_ab = bool(_is_admin_user(query.from_user.id)) if callable(globals().get("_is_admin_user")) else False
+            is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
+            show_listen_btn = has_ab if is_owner_user else True
+            ab_request_count = 0
+            if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
+                try:
+                    ab_request_count = await run_blocking(count_pending_audiobook_requests, book_id)
+                except Exception:
+                    ab_request_count = 0
             await query.message.edit_caption(
                 caption=build_book_caption(book, downloads, fav_count, counts),
-                reply_markup=build_book_keyboard(book_id, counts, is_fav_now, user_reaction, can_delete, lang, has_ab, can_add_ab),
+                reply_markup=build_book_keyboard(
+                    book_id,
+                    counts,
+                    is_fav_now,
+                    user_reaction,
+                    can_delete,
+                    lang,
+                    has_audiobook=has_ab,
+                    can_add_audiobook=can_add_ab,
+                    show_listen_button=show_listen_btn,
+                    audiobook_request_count=ab_request_count,
+                ),
             )
     except Exception:
         pass
@@ -454,9 +473,28 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
             audio_book = await run_blocking(get_audio_book_for_book, book_id)
             has_ab = bool(audio_book)
             can_add_ab = bool(_is_admin_user(query.from_user.id)) if callable(globals().get("_is_admin_user")) else False
+            is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
+            show_listen_btn = has_ab if is_owner_user else True
+            ab_request_count = 0
+            if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
+                try:
+                    ab_request_count = await run_blocking(count_pending_audiobook_requests, book_id)
+                except Exception:
+                    ab_request_count = 0
             await query.message.edit_caption(
                 caption=build_book_caption(book, downloads, fav_count, counts),
-                reply_markup=build_book_keyboard(book_id, counts, is_fav_now, user_reaction, can_delete, lang, has_ab, can_add_ab),
+                reply_markup=build_book_keyboard(
+                    book_id,
+                    counts,
+                    is_fav_now,
+                    user_reaction,
+                    can_delete,
+                    lang,
+                    has_audiobook=has_ab,
+                    can_add_audiobook=can_add_ab,
+                    show_listen_button=show_listen_btn,
+                    audiobook_request_count=ab_request_count,
+                ),
             )
         await safe_answer(query)
     except Exception as e:

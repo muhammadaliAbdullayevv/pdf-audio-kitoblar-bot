@@ -569,6 +569,8 @@ def build_book_keyboard(
     lang: str = "en",
     has_audiobook: bool = False,
     can_add_audiobook: bool = False,
+    show_listen_button: bool = True,
+    audiobook_request_count: int = 0,
 ) -> InlineKeyboardMarkup:
     like = counts.get("like", 0)
     dislike = counts.get("dislike", 0)
@@ -581,6 +583,7 @@ def build_book_keyboard(
     def label(key: str, emoji: str, count: int) -> str:
         prefix = "★ " if user_reaction == key else ""
         return f"{prefix}{emoji} {count}"
+
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(label("whale", REACTION_EMOJI["whale"], whale), callback_data=f"react:{book_id}:whale"),
@@ -590,19 +593,33 @@ def build_book_keyboard(
         ],
         ## [InlineKeyboardButton(summary_label, callback_data=f"summary:{book_id}")],
     ]
-    if has_audiobook:
+
+    if show_listen_button:
         listen_label = m.get("audiobook_listen_button", "🎧 Listen Audiobook")
         rows.append([InlineKeyboardButton(listen_label, callback_data=f"abook:{book_id}")])
+
     rows.append([InlineKeyboardButton(fav_label, callback_data=f"fav:toggle:{book_id}")])
+
     if can_add_audiobook:
         add_label = m.get("audiobook_add_button", "➕ Add Audiobook")
+        try:
+            pending_count = int(audiobook_request_count or 0)
+        except Exception:
+            pending_count = 0
+        if pending_count > 0:
+            template = m.get("audiobook_add_button_with_requests", "{label} ({count})")
+            add_label = template.format(label=add_label, count=pending_count)
         rows.append([InlineKeyboardButton(add_label, callback_data=f"abadd:{book_id}")])
+
     if has_audiobook and can_add_audiobook:
         del_audio_label = m.get("audiobook_delete_all_button", "🗑️ Delete Audios")
         rows.append([InlineKeyboardButton(del_audio_label, callback_data=f"abdelbook:{book_id}")])
+
     if can_delete:
         rows.append([InlineKeyboardButton("🗑️ Delete book", callback_data=f"delbook:{book_id}")])
+
     return InlineKeyboardMarkup(rows)
+
 
 
 def build_book_caption(book, downloads: int, fav_count: int, counts: dict) -> str:
@@ -639,6 +656,9 @@ async def send_book(bot, chat_id, book):
     audio_book = get_audio_book_for_book(book_id) if book_id else None
     has_ab = bool(audio_book)
     can_add_ab = bool(_is_admin_user(user_id)) if user_id else False
+    is_owner_user = bool(_is_owner_user(user_id)) if user_id and callable(globals().get("_is_owner_user")) else False
+    show_listen_btn = has_ab if is_owner_user else True
+    ab_request_count = count_pending_audiobook_requests(book_id) if (book_id and can_add_ab and is_owner_user) else 0
     reactions_kb = (
         build_book_keyboard(
             book_id,
@@ -649,6 +669,8 @@ async def send_book(bot, chat_id, book):
             "en",
             has_audiobook=has_ab,
             can_add_audiobook=can_add_ab,
+            show_listen_button=show_listen_btn,
+            audiobook_request_count=ab_request_count,
         )
         if book_id
         else None
@@ -1073,6 +1095,38 @@ def set_request_admin_message(request_id: str, chat_id: int, message_id: int):
 
 def get_request_by_id(request_id: str):
     return db_get_request_by_id(request_id)
+
+
+_AUDIOBOOK_REQUEST_BOOK_ID_RE = re.compile(r"\[book_id:\s*([^\]]+)\]", re.IGNORECASE)
+
+
+def _extract_audiobook_request_book_id(query_text: str | None) -> str | None:
+    if not query_text:
+        return None
+    match = _AUDIOBOOK_REQUEST_BOOK_ID_RE.search(str(query_text))
+    if not match:
+        return None
+    value = str(match.group(1) or "").strip()
+    return value or None
+
+
+def count_pending_audiobook_requests(book_id: str) -> int:
+    target = str(book_id or "").strip()
+    if not target:
+        return 0
+    try:
+        requests = load_requests()
+    except Exception:
+        return 0
+
+    pending = 0
+    for r in requests or []:
+        if (r.get("status") or "") not in {"open", "seen"}:
+            continue
+        req_book_id = _extract_audiobook_request_book_id(r.get("query"))
+        if req_book_id and req_book_id.strip() == target:
+            pending += 1
+    return pending
 
 
 def find_open_requests_for_book(book: dict):
