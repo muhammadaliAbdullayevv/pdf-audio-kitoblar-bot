@@ -1601,6 +1601,10 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await _pdf_maker_handle_text_input(update, context, lang):
             return
 
+        if callable(globals().get("_pdfed_handle_text_input")):
+            if await _pdfed_handle_text_input(update, context, lang):
+                return
+
         pending_bonus = context.user_data.get("awaiting_user_bonus")
         if pending_bonus and update.effective_user.id in {ADMIN_ID, OWNER_ID}:
             if time.time() > pending_bonus.get("expires_at", 0):

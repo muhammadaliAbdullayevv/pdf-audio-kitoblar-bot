@@ -100,10 +100,10 @@ def build_help_text(
         other_lines = [
             f"{m.get('menu_top_books', '🔥 Top kitoblar')} — eng mashhur kitoblar.",
             f"{m.get('menu_movie_upload', '⬆️ Kino yuklash')} — kinolarni saqlash uchun yuborish.",
-            f"{m.get('menu_favorites', '⭐ Sevimlilar')} — saqlangan kitoblar.",
-            f"{m.get('menu_audio_converter', '🎛️ Audio Cutter & Converter')} — voice/mp3 format o‘zgartirish, kesish va nomini o‘zgartirish.",
-            f"{m.get('menu_myprofile', '👤 Mening profilim')} — statistika va sovg‘alar.",
+            f"{m.get('menu_pdf_editor', '🧰 PDF muharriri')} — PDF siqish, OCR, TXT/EPUB va suv belgisi.",
+            f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — voice/mp3 format o‘zgartirish, kesish va nomini o‘zgartirish.",
             f"{m.get('menu_help', '❓ Yordam')} — ushbu yo‘riqnoma.",
+            "⌨️ /myprofile, /favorite, /request — buyruqlar menyusida.",
         ]
         note_lines = [
             "🌐 Tilni o‘zgartirish uchun Language bo‘limidan foydalaning.",
@@ -137,10 +137,10 @@ def build_help_text(
         other_lines = [
             f"{m.get('menu_top_books', '🔥 Топ книг')} — самые популярные книги.",
             f"{m.get('menu_movie_upload', '⬆️ Загрузить фильмы')} — отправка фильмов для сохранения.",
-            f"{m.get('menu_favorites', '⭐ Избранное')} — сохранённые книги.",
-            f"{m.get('menu_audio_converter', '🎛️ Audio Cutter & Converter')} — конвертация voice/mp3, обрезка и переименование.",
-            f"{m.get('menu_myprofile', '👤 Мой профиль')} — статистика и бонусы.",
+            f"{m.get('menu_pdf_editor', '🧰 PDF редактор')} — сжатие PDF, OCR, TXT/EPUB и водяной знак.",
+            f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — конвертация voice/mp3, обрезка и переименование.",
             f"{m.get('menu_help', '❓ Помощь')} — эта инструкция.",
+            "⌨️ /myprofile, /favorite, /request — в меню команд.",
         ]
         note_lines = [
             "🌐 Язык можно изменить через раздел Language.",
@@ -174,10 +174,10 @@ def build_help_text(
         other_lines = [
             f"{m.get('menu_top_books', '🔥 Top Books')} — most popular books.",
             f"{m.get('menu_movie_upload', '⬆️ Upload Movies')} — send movies for storage.",
-            f"{m.get('menu_favorites', '⭐ Favorites')} — saved books.",
-            f"{m.get('menu_audio_converter', '🎛️ Audio Cutter & Converter')} — convert voice/mp3, cut audio, and rename files.",
-            f"{m.get('menu_myprofile', '👤 My Profile')} — stats and rewards.",
+            f"{m.get('menu_pdf_editor', '🧰 PDF Editor')} — compress PDF, OCR, TXT/EPUB, and watermark.",
+            f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — convert voice/mp3, cut audio, and rename files.",
             f"{m.get('menu_help', '❓ Help')} — this guide.",
+            "⌨️ /myprofile, /favorite, /request — available in command menu.",
         ]
         note_lines = [
             "🌐 Use the Language section to change your language.",
@@ -227,6 +227,7 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_ai_grammar": "matn xatolarini tuzatadi.",
             "menu_ai_email_writer": "xat/letter draft tayyorlaydi.",
             "menu_pdf_maker": "matndan PDF tayyorlaydi.",
+            "menu_pdf_editor": "PDF siqish, OCR, TXT/EPUB va suv belgisi.",
             "menu_ai_quiz": "mavzu bo'yicha Telegram quiz savollar yaratadi.",
             "menu_ai_music": "prompt bo'yicha instrumental musiqa yaratadi (lokal).",
             "menu_ai_image": "hozircha tez orada qo'shiladi.",
@@ -248,6 +249,7 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_ai_grammar": "исправляет ошибки в тексте.",
             "menu_ai_email_writer": "черновик письма/сообщения.",
             "menu_pdf_maker": "создание PDF из текста.",
+            "menu_pdf_editor": "сжатие PDF, OCR, TXT/EPUB и водяной знак.",
             "menu_ai_quiz": "создаёт Telegram quiz-вопросы по теме.",
             "menu_ai_music": "создаёт инструментальную музыку по prompt (локально).",
             "menu_ai_image": "пока будет добавлен позже.",
@@ -269,6 +271,7 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_ai_grammar": "fix grammar and spelling.",
             "menu_ai_email_writer": "draft emails/letters.",
             "menu_pdf_maker": "create a PDF from text.",
+            "menu_pdf_editor": "compress PDF, OCR, TXT/EPUB, and watermark.",
             "menu_ai_quiz": "generate Telegram quiz questions from a topic.",
             "menu_ai_music": "generate instrumental music from a prompt (local).",
             "menu_ai_image": "will be added soon.",
@@ -297,6 +300,7 @@ def main_menu_text_action(
         "menu_search_movies": "search_movies",
         "menu_text_to_voice": "tts",
         "menu_pdf_maker": "pdf",
+        "menu_pdf_editor": "pdf_editor",
         "menu_request_book": "request",
         "menu_favorites": "favorites",
         "menu_other_functions": "other",

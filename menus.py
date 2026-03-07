@@ -5,6 +5,29 @@ from telegram import ReplyKeyboardMarkup
 from menu_ui import ADMIN_MENU_LABELS
 
 
+def _pack_compact_rows(
+    items: list[str],
+    *,
+    max_cols: int = 3,
+    max_row_chars: int = 44,
+) -> list[list[str]]:
+    """Pack short labels into up to 3 columns while keeping long rows readable."""
+    rows: list[list[str]] = []
+    row: list[str] = []
+    for item in items:
+        candidate = row + [item]
+        est_chars = sum(len(x) for x in candidate) + (len(candidate) - 1) * 2
+        if len(candidate) > max_cols or est_chars > max_row_chars:
+            if row:
+                rows.append(row)
+            row = [item]
+        else:
+            row = candidate
+    if row:
+        rows.append(row)
+    return rows
+
+
 def build_main_menu_keyboard(
     lang: str,
     section: str,
@@ -20,11 +43,10 @@ def build_main_menu_keyboard(
     if section == "other":
         keyboard = [
             [m.get("menu_top_books", "🔥 Top Books"), m.get("menu_top_users", "🏆 Top Users")],
+            [m.get("menu_audio_converter", "🎛️ Audio Editor"), m.get("menu_pdf_editor", "🧰 PDF Editor")],
             [m.get("menu_upload", "⬆️ Upload Books"), m.get("menu_movie_upload", "⬆️ Upload Movies")],
-            [m.get("menu_request_book", "📝 Request Book")],
-            [m.get("menu_contact_admin", "📞 Contact Admin"), m.get("menu_myprofile", "👤 My Profile")],
-            [m.get("menu_favorites", "⭐ Favorites"), m.get("menu_audio_converter", "🎛️ Audio Cutter & Converter")],
-            [m.get("menu_help", "❓ Help"), m.get("menu_back", "⬅️ Back")],
+            [m.get("menu_contact_admin", "📞 Contact Admin"), m.get("menu_help", "❓ Help")],
+            [m.get("menu_back", "⬅️ Back")],
         ]
     elif section == "ai_tools":
         keyboard = [
@@ -35,18 +57,28 @@ def build_main_menu_keyboard(
             [m.get("menu_back", "⬅️ Back")],
         ]
     elif section == "admin":
-        keyboard = [
-            [labels["admin_user_search"], labels["admin_upload"], labels["admin_audit"]],
-            [labels["admin_prune"], labels["admin_broadcast"], labels["admin_missing"]],
-            [labels["admin_pause"], labels["admin_resume"]],
-            [labels["admin_cancel_task"], labels["admin_dupes_status"]],
-            [labels["admin_db_dupes"], labels["admin_es_dupes"]],
-            [labels["admin_upload_local_status"]],
-            [labels["admin_upload_local_all"], labels["admin_upload_local_missing"]],
-            [labels["admin_upload_local_unique"], labels["admin_upload_local_large"]],
-            [labels["admin_missing_confirm"]],
-            [m.get("menu_back", "⬅️ Back")],
+        admin_items = [
+            labels["admin_user_search"],
+            labels["admin_upload"],
+            labels["admin_audit"],
+            labels["admin_prune"],
+            labels["admin_broadcast"],
+            labels["admin_missing"],
+            labels["admin_pause"],
+            labels["admin_resume"],
+            labels["admin_cancel_task"],
+            labels["admin_dupes_status"],
+            labels["admin_db_dupes"],
+            labels["admin_es_dupes"],
+            labels["admin_upload_local_status"],
+            labels["admin_upload_local_all"],
+            labels["admin_upload_local_missing"],
+            labels["admin_upload_local_unique"],
+            labels["admin_upload_local_large"],
+            labels["admin_missing_confirm"],
         ]
+        keyboard = _pack_compact_rows(admin_items)
+        keyboard.append([m.get("menu_back", "⬅️ Back")])
     elif section == "admin_maintenance":
         keyboard = [
             [labels["admin_prune"], labels["admin_missing"]],

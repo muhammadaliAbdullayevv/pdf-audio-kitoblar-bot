@@ -15,18 +15,16 @@ from telegram import (
 _MENU_BACKED_PUBLIC_COMMANDS = {
     "help",
     "pdf_maker",
+    "pdf_editor",
     "text_to_voice",
     "ramazon",
-    "myprofile",
     "top",
     "top_users",
-    "favorite",
-    "request",
     "upload",
     "movie_upload",
 }
 
-_PUBLIC_PREFERRED_ORDER = ("start", "language", "requests")
+_PUBLIC_PREFERRED_ORDER = ("start", "language", "myprofile", "favorite", "request", "requests")
 
 
 def get_public_commands(lang: str = "en") -> list[BotCommand]:
@@ -35,6 +33,7 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("start", "🚀 Start / choose language"),
             BotCommand("help", "❓ How to use the bot"),
             BotCommand("pdf_maker", "📄 Make PDF from text"),
+            BotCommand("pdf_editor", "🧰 Edit PDF files"),
             BotCommand("text_to_voice", "🎙️ Convert text to voice"),
             BotCommand("ramazon", "🌙 Saharlik & iftorlik duas"),
             BotCommand("myprofile", "👤 My profile"),
@@ -52,6 +51,7 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("start", "🚀 Запуск / выбор языка"),
             BotCommand("help", "❓ Как пользоваться ботом"),
             BotCommand("pdf_maker", "📄 PDF из текста"),
+            BotCommand("pdf_editor", "🧰 Редактировать PDF"),
             BotCommand("text_to_voice", "🎙️ Текст в голос"),
             BotCommand("ramazon", "🌙 Сахарлик и ифторлик дуалары"),
             BotCommand("myprofile", "👤 Профиль"),
@@ -69,6 +69,7 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("start", "🚀 Botni ishga tushirish / til tanlash"),
             BotCommand("help", "❓ Botdan foydalanish"),
             BotCommand("pdf_maker", "📄 Matndan PDF yaratish"),
+            BotCommand("pdf_editor", "🧰 PDF fayl tahrirlash"),
             BotCommand("text_to_voice", "🎙️ Matndan ovoz yaratish"),
             BotCommand("ramazon", "🌙 Saharlik va iftorlik duolari"),
             BotCommand("myprofile", "👤 Profilim"),
@@ -143,7 +144,7 @@ def get_group_admin_commands(lang: str = "en") -> list[BotCommand]:
 def _owner_minimal_commands(lang: str = "en") -> list[BotCommand]:
     by_name = {cmd.command: cmd for cmd in get_public_commands(lang)}
     ordered: list[BotCommand] = []
-    for name in ("start", "language", "requests"):
+    for name in ("start", "language", "myprofile", "favorite", "request", "requests"):
         cmd = by_name.get(name)
         if cmd:
             ordered.append(cmd)

@@ -359,6 +359,7 @@ except ImportError:
     cache_delete = lambda k: False
     get_redis_client = lambda: None
 import pdf_maker as _pdf_maker_mod
+import pdf_editor as _pdf_editor
 import engagement_handlers as _engagement_handlers
 import admin_runtime as _admin_runtime
 import user_interactions as _user_interactions
@@ -3455,6 +3456,12 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
         _pdf_maker_clear_session(context)
         cancelled = True
 
+    pdf_editor_session = _pdfed_get_session(context) if callable(globals().get("_pdfed_get_session")) else None
+    if pdf_editor_session and (not user_id or pdf_editor_session.get("user_id") in {None, user_id}):
+        await _edit_prompt_if_any(pdf_editor_session)
+        _pdfed_clear_session(context)
+        cancelled = True
+
     ai_tool_mode_session = _ai_tool_mode_get_session(context)
     if ai_tool_mode_session and (not user_id or ai_tool_mode_session.get("user_id") in {None, user_id}):
         await _edit_prompt_if_any(ai_tool_mode_session)
@@ -3532,6 +3539,10 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     if action == "pdf":
         context.user_data["main_menu_section"] = "main"
         await _pdf_maker_start_session_from_message(update.message, update, context, lang)
+        return True
+    if action == "pdf_editor":
+        context.user_data["main_menu_section"] = "other"
+        await _pdfed_start_session_from_message(update.message, update, context, lang)
         return True
     if action == "request":
         keep_section = "other" if current_section == "other" else "main"
@@ -3793,11 +3804,54 @@ _upload_flow.configure(globals())
 upload_command = _upload_flow.upload_command
 movie_upload_command = _upload_flow.movie_upload_command
 _process_upload = _upload_flow._process_upload
-handle_file = _upload_flow.handle_file
+_raw_handle_file = _upload_flow.handle_file
 handle_movie_video = _upload_flow.handle_movie_video
-handle_photo_message = _upload_flow.handle_photo_message
+_raw_handle_photo_message = _upload_flow.handle_photo_message
 sync_unindexed_books = _upload_flow.sync_unindexed_books
 sync_unindexed_movies = _upload_flow.sync_unindexed_movies
+
+
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route photo to audio converter first (cover upload mode), then fallback to photo search hint."""
+    audio_conv_handler = globals().get("_audio_conv_handle_media_input")
+    if callable(audio_conv_handler):
+        try:
+            lang = ensure_user_language(update, context)
+            handled = await audio_conv_handler(update, context, lang)
+            if handled:
+                return
+        except ApplicationHandlerStop:
+            raise
+        except Exception as e:
+            logger.warning("audio converter photo handler failed: %s", e, exc_info=True)
+    await _raw_handle_photo_message(update, context)
+
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route document/image to audio converter first (cover upload mode), then fallback to upload flow."""
+    audio_conv_handler = globals().get("_audio_conv_handle_media_input")
+    if callable(audio_conv_handler):
+        try:
+            lang = ensure_user_language(update, context)
+            handled = await audio_conv_handler(update, context, lang)
+            if handled:
+                return
+        except ApplicationHandlerStop:
+            raise
+        except Exception as e:
+            logger.warning("audio converter file handler failed: %s", e, exc_info=True)
+    pdf_editor_handler = globals().get("_pdfed_handle_media_input")
+    if callable(pdf_editor_handler):
+        try:
+            lang = ensure_user_language(update, context)
+            handled = await pdf_editor_handler(update, context, lang)
+            if handled:
+                return
+        except ApplicationHandlerStop:
+            raise
+        except Exception as e:
+            logger.warning("pdf editor file handler failed: %s", e, exc_info=True)
+    await _raw_handle_file(update, context)
 
 
 def _format_bytes(bytes_count: int) -> str:
@@ -4780,6 +4834,17 @@ pdf_maker_command = _pdf_maker_mod.pdf_maker_command
 _pdf_maker_start_session_from_message = _pdf_maker_mod._pdf_maker_start_session_from_message
 handle_pdf_maker_callback = _pdf_maker_mod.handle_pdf_maker_callback
 
+# PDF Editor extracted module bridge
+_pdf_editor.configure(globals())
+
+_pdfed_clear_session = _pdf_editor._pdf_editor_clear_session
+_pdfed_get_session = _pdf_editor._pdf_editor_get_session
+_pdfed_start_session_from_message = _pdf_editor._pdf_editor_start_session_from_message
+_pdfed_handle_text_input = _pdf_editor._pdf_editor_handle_text_input
+_pdfed_handle_media_input = _pdf_editor._pdf_editor_handle_media_input
+pdf_editor_command = _pdf_editor.pdf_editor_command
+handle_pdf_editor_callback = _pdf_editor.handle_pdf_editor_callback
+
 
 # TTS extracted module bridge
 _tts_tools.configure(globals())
@@ -5077,8 +5142,10 @@ def main():
         app.add_handler(CommandHandler("language", language_command_handler))
         app.add_handler(CommandHandler("ramazon", ramazon_command))
         app.add_handler(CommandHandler("pdf_maker", pdf_maker_command))
+        app.add_handler(CommandHandler("pdf_editor", pdf_editor_command))
         app.add_handler(CommandHandler("text_to_voice", text_to_voice_command))
         app.add_handler(CallbackQueryHandler(handle_pdf_maker_callback, pattern="^pdfmk:"))
+        app.add_handler(CallbackQueryHandler(handle_pdf_editor_callback, pattern="^pdfed:"))
         app.add_handler(CallbackQueryHandler(handle_tts_callback, pattern="^tts:"))
         app.add_handler(CallbackQueryHandler(handle_video_downloader_callback, pattern="^vdl:"))
         app.add_handler(CallbackQueryHandler(handle_audio_converter_callback, pattern="^atool:"))
