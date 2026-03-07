@@ -1,0 +1,21 @@
+[Unit]
+Description=SmartAIToolsBot - Main Bot Application
+Wants=network-online.target SmartAIToolsBot.service
+After=network-online.target SmartAIToolsBot.service
+
+[Service]
+Type=simple
+User=muhammadaliabdullayev
+Group=muhammadaliabdullayev
+WorkingDirectory=/home/muhammadaliabdullayev/Documents/worldLibraryBot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/smartaitoolsbot.env
+ExecStart=/home/muhammadaliabdullayev/Documents/worldLibraryBot/venv312/bin/python /home/muhammadaliabdullayev/Documents/worldLibraryBot/bot.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

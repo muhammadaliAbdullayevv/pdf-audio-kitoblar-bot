@@ -1,0 +1,22 @@
+[Unit]
+Description=SmartAIToolsBot - Local Telegram Bot API Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=muhammadaliabdullayev
+Group=muhammadaliabdullayev
+WorkingDirectory=/home/muhammadaliabdullayev
+EnvironmentFile=/etc/smartaitoolsbot.env
+Environment=BOTAPI_DATA_DIR=/home/muhammadaliabdullayev/.local/share/telegram-bot-api
+ExecStartPre=/usr/bin/mkdir -p /home/muhammadaliabdullayev/.local/share/telegram-bot-api
+ExecStart=/usr/local/bin/telegram-bot-api --api-id=${TELEGRAM_API_ID} --api-hash=${TELEGRAM_API_HASH} --local --http-port=8081 --dir=${BOTAPI_DATA_DIR}
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

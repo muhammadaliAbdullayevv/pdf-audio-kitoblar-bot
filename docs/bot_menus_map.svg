@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1320" viewBox="0 0 1800 1320">
+  <defs>
+    <style>
+      .bg { fill: #0b1220; }
+      .title { fill: #f8fafc; font: 700 34px DejaVu Sans, Arial, sans-serif; }
+      .subtitle { fill: #cbd5e1; font: 500 16px DejaVu Sans, Arial, sans-serif; }
+      .panel { fill: #111827; stroke: #334155; stroke-width: 2; rx: 18; ry: 18; }
+      .panel-title { fill: #e2e8f0; font: 700 20px DejaVu Sans, Arial, sans-serif; }
+      .row { fill: #1f2937; stroke: #374151; stroke-width: 1; rx: 10; ry: 10; }
+      .row-text { fill: #f8fafc; font: 600 14px DejaVu Sans, Arial, sans-serif; }
+      .note { fill: #94a3b8; font: 500 12px DejaVu Sans, Arial, sans-serif; }
+      .arrow { stroke: #60a5fa; stroke-width: 3; fill: none; marker-end: url(#arrowhead); opacity: 0.9; }
+      .small-arrow { stroke: #34d399; stroke-width: 2.5; fill: none; marker-end: url(#arrowhead2); opacity: 0.9; }
+      .chip { fill: #0f172a; stroke: #475569; stroke-width: 1; rx: 12; ry: 12; }
+      .chip-text { fill: #cbd5e1; font: 600 12px DejaVu Sans, Arial, sans-serif; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0,0 10,4 0,8" fill="#60a5fa"/>
+    </marker>
+    <marker id="arrowhead2" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0,0 9,3.5 0,7" fill="#34d399"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1320"/>
+
+  <text class="title" x="40" y="52">World Library Bot - Full Menu Map (Current)</text>
+  <text class="subtitle" x="40" y="80">Based on current menu layout in menus.py + admin labels in menu_ui.py</text>
+
+  <!-- Start / language flow -->
+  <rect class="panel" x="40" y="110" width="520" height="170" rx="18" ry="18"/>
+  <text class="panel-title" x="60" y="140">Start Flow</text>
+  <rect class="row" x="60" y="160" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="75" y="182">/start - show language picker first (no menu yet)</text>
+  <rect class="row" x="60" y="204" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="75" y="226">Language selection (UZ / RU / EN)</text>
+  <rect class="row" x="60" y="248" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="75" y="270">After language chosen - main dynamic menu is shown</text>
+
+  <!-- Main menu -->
+  <rect class="panel" x="40" y="330" width="560" height="360" rx="18" ry="18"/>
+  <text class="panel-title" x="60" y="360">Main Menu (default section)</text>
+  <text class="note" x="60" y="382">Admin users see "Admin Control" next to "Search Books" on the first row.</text>
+
+  <rect class="row" x="60" y="400" width="520" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="75" y="424">Row 1: Search Books | Admin Control (admin only)</text>
+
+  <rect class="row" x="60" y="448" width="520" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="75" y="472">Row 2: AI Tools | Text to Voice</text>
+
+  <rect class="row" x="60" y="496" width="520" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="75" y="520">Row 3: PDF Maker | My Profile</text>
+
+  <rect class="row" x="60" y="544" width="520" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="75" y="568">Row 4: Ramadan Duas</text>
+
+  <rect class="row" x="60" y="592" width="520" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="75" y="616">Row 5: Other Functions</text>
+
+  <text class="note" x="60" y="650">Main-menu text typing is accepted for book search (legacy + new UX compatibility).</text>
+  <text class="note" x="60" y="670">Search Books button still activates explicit search mode for guided users.</text>
+
+  <!-- AI Tools -->
+  <rect class="panel" x="650" y="110" width="540" height="320" rx="18" ry="18"/>
+  <text class="panel-title" x="670" y="140">AI Tools Menu</text>
+
+  <rect class="row" x="670" y="160" width="500" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="685" y="184">Row 1: Chat with AI | AI Translator</text>
+
+  <rect class="row" x="670" y="208" width="500" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="685" y="232">Row 2: AI Grammar Fix | AI Email Writer</text>
+
+  <rect class="row" x="670" y="256" width="500" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="685" y="280">Row 3: AI Quiz Generator | AI Image Generator (coming soon)</text>
+
+  <rect class="row" x="670" y="304" width="500" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="685" y="328">Row 4: Back</text>
+
+  <text class="note" x="670" y="362">AI Translator uses inline target-language buttons.</text>
+  <text class="note" x="670" y="380">AI tools show active-mode keyboard (Change AI Tool / Exit AI Tool).</text>
+
+  <!-- Other Functions -->
+  <rect class="panel" x="650" y="470" width="540" height="380" rx="18" ry="18"/>
+  <text class="panel-title" x="670" y="500">Other Functions Menu</text>
+
+  <rect class="row" x="670" y="520" width="500" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="685" y="544">Row 1: Top Books | Top Users</text>
+
+  <rect class="row" x="670" y="568" width="500" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="685" y="592">Row 2: Upload Books | Request Book</text>
+
+  <rect class="row" x="670" y="616" width="500" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="685" y="640">Row 3: Video Downloader</text>
+
+  <rect class="row" x="670" y="664" width="500" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="685" y="688">Row 4: Favorites | Help</text>
+
+  <rect class="row" x="670" y="712" width="500" height="38" rx="10" ry="10"/>
+  <text class="row-text" x="685" y="736">Row 5: Back</text>
+
+  <text class="note" x="670" y="774">Video Downloader = YouTube/Instagram public links (beta limits may apply).</text>
+
+  <!-- Admin Control -->
+  <rect class="panel" x="1240" y="110" width="520" height="940" rx="18" ry="18"/>
+  <text class="panel-title" x="1260" y="140">Admin Control Menu (admin only)</text>
+  <text class="note" x="1260" y="162">Single dynamic menu with admin actions (no nested inline panel required).</text>
+
+  <rect class="row" x="1260" y="180" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="202">Row 1: User Search | Upload Book | Audit</text>
+  <rect class="row" x="1260" y="222" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="244">Row 2: Prune Users | Broadcast | Missing Files</text>
+  <rect class="row" x="1260" y="264" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="286">Row 3: Pause Bot | Resume Bot</text>
+  <rect class="row" x="1260" y="306" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="328">Row 4: Cancel Task | Dupes Status</text>
+  <rect class="row" x="1260" y="348" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="370">Row 5: DB Dupes | ES Dupes</text>
+  <rect class="row" x="1260" y="390" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="412">Row 6: Upload Status</text>
+  <rect class="row" x="1260" y="432" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="454">Row 7: All | Missing (local bulk upload)</text>
+  <rect class="row" x="1260" y="474" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="496">Row 8: Unique | Large (local bulk upload)</text>
+  <rect class="row" x="1260" y="516" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="538">Row 9: Missing Confirm</text>
+  <rect class="row" x="1260" y="558" width="480" height="34" rx="10" ry="10"/>
+  <text class="row-text" x="1275" y="580">Row 10: Back</text>
+
+  <rect class="chip" x="1260" y="620" width="480" height="408" rx="14" ry="14"/>
+  <text class="panel-title" x="1280" y="648" style="font-size:18px;">Admin Notes</text>
+  <text class="note" x="1280" y="676">• Search Users supports name / username / full or partial user ID.</text>
+  <text class="note" x="1280" y="700">• Broadcast and User Search prompt modes keep menu context.</text>
+  <text class="note" x="1280" y="724">• Local upload actions are admin-only and use existing upload tools.</text>
+  <text class="note" x="1280" y="748">• Missing Confirm is destructive (DB/ES cleanup helper).</text>
+  <text class="note" x="1280" y="772">• Admin menu uses reply keyboard (not inline panel) by design.</text>
+  <text class="note" x="1280" y="810">Slash commands visible in group chats:</text>
+  <text class="note" x="1300" y="832">/start, /language only</text>
+  <text class="note" x="1280" y="864">Slash commands in private chats are menu-minimized (fallback only).</text>
+  <text class="note" x="1280" y="896">/my_quiz command exists (saved AI quizzes list).</text>
+  <text class="note" x="1280" y="928">AI Quiz Generator flow:</text>
+  <text class="note" x="1300" y="950">Name -&gt; Source (Prompt/Topic) -&gt; Content -&gt; Count -&gt; Interval -&gt; Card</text>
+  <text class="note" x="1280" y="982">Quiz card buttons: Start Test / Start in Group / Share</text>
+  <text class="note" x="1280" y="1014">Saved quizzes list: Start / Group / Share / Delete</text>
+
+  <!-- Arrows -->
+  <path class="arrow" d="M 300 280 C 300 305, 300 320, 300 330"/>
+  <path class="arrow" d="M 600 458 C 635 430, 640 380, 650 305"/>
+  <path class="arrow" d="M 600 610 C 635 620, 640 640, 650 650"/>
+  <path class="arrow" d="M 600 420 C 820 420, 1040 250, 1240 250"/>
+
+  <!-- Legend -->
+  <rect class="chip" x="40" y="730" width="1150" height="285" rx="14" ry="14"/>
+  <text class="panel-title" x="60" y="760" style="font-size:18px;">Legend / Flow Notes</text>
+  <text class="note" x="60" y="790">• Dynamic menus appear after language selection. /start shows language picker first.</text>
+  <text class="note" x="60" y="815">• Main menu supports direct text book search (for old users) and Search Books button (for new users).</text>
+  <text class="note" x="60" y="840">• AI tools and other submenus use Back to return to main menu.</text>
+  <text class="note" x="60" y="865">• AI Translator target language is selected using inline buttons (not reply-keyboard buttons).</text>
+  <text class="note" x="60" y="890">• Video Downloader preview uses thumbnail + quality buttons + MP3/Preview/Trim (trim placeholder).</text>
+  <text class="note" x="60" y="915">• TTS and PDF Maker are main-menu features (not nested under new tool menus; those changes were reverted).</text>
+  <text class="note" x="60" y="940">• Some advanced/legacy admin subsections exist in code but the active admin UX is the single Admin Control menu above.</text>
+  <text class="note" x="60" y="965">• This diagram is an overview image of menu structure, not every inline callback wizard step.</text>
+</svg>

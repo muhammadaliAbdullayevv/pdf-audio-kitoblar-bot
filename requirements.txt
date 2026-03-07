@@ -1,0 +1,9 @@
+python-telegram-bot==20.7
+textblob
+rapidfuzz
+requests
+urllib3<2.0
+elasticsearch==8.15.0
+psycopg2-binary
+python-dotenv==1.0.1
+redis

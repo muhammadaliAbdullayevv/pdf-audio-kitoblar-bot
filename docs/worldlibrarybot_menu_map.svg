@@ -1,0 +1,250 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1400" viewBox="0 0 1900 1400">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1220"/>
+      <stop offset="100%" stop-color="#121d33"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#17253d"/>
+      <stop offset="100%" stop-color="#111a2c"/>
+    </linearGradient>
+    <linearGradient id="accent1" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#4fd1c5"/>
+      <stop offset="100%" stop-color="#63b3ed"/>
+    </linearGradient>
+    <linearGradient id="accent2" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f6ad55"/>
+      <stop offset="100%" stop-color="#f56565"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="14" flood-color="#020617" flood-opacity="0.45"/>
+    </filter>
+    <style>
+      .title { font: 700 34px 'DejaVu Sans', Arial, sans-serif; fill: #eaf2ff; }
+      .subtitle { font: 400 16px 'DejaVu Sans', Arial, sans-serif; fill: #b6c2dc; }
+      .cardTitle { font: 700 20px 'DejaVu Sans', Arial, sans-serif; fill: #edf3ff; }
+      .cardSub { font: 400 13px 'DejaVu Sans', Arial, sans-serif; fill: #9eb0d3; }
+      .row { font: 600 14px 'DejaVu Sans', Arial, sans-serif; fill: #e9f0ff; }
+      .rowSmall { font: 500 12px 'DejaVu Sans', Arial, sans-serif; fill: #c7d4ef; }
+      .pillText { font: 600 12px 'DejaVu Sans', Arial, sans-serif; fill: #dff7ff; }
+      .note { font: 500 13px 'DejaVu Sans', Arial, sans-serif; fill: #d8e3fb; }
+      .noteDim { font: 400 12px 'DejaVu Sans', Arial, sans-serif; fill: #9bb0d8; }
+      .connector { fill: none; stroke: #6aa0ff; stroke-width: 3; stroke-linecap: round; stroke-opacity: 0.85; }
+      .connectorAlt { fill: none; stroke: #70e1d0; stroke-width: 3; stroke-linecap: round; stroke-opacity: 0.85; }
+      .dashed { stroke-dasharray: 7 8; }
+    </style>
+  </defs>
+
+  <rect width="1900" height="1400" fill="url(#bg)"/>
+
+  <g opacity="0.08">
+    <circle cx="1720" cy="170" r="180" fill="#78c0ff"/>
+    <circle cx="140" cy="1220" r="220" fill="#58e3c9"/>
+    <circle cx="1220" cy="1280" r="260" fill="#8f7cff"/>
+  </g>
+
+  <text x="70" y="70" class="title">World Library Bot Menu Map</text>
+  <text x="70" y="98" class="subtitle">Dynamic reply-keyboard hierarchy (main menu + all submenus) based on current code</text>
+
+  <!-- Language picker -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="135" rx="18" ry="18" width="360" height="170" fill="url(#card)" stroke="#243756" stroke-width="1.5"/>
+    <rect x="70" y="135" rx="18" ry="18" width="360" height="8" fill="url(#accent1)"/>
+    <text x="95" y="178" class="cardTitle">1. Language Picker</text>
+    <text x="95" y="202" class="cardSub">Shown on every `/start` before menu appears</text>
+    <rect x="95" y="222" rx="10" ry="10" width="80" height="30" fill="#1f3252" stroke="#2f4a74"/>
+    <rect x="185" y="222" rx="10" ry="10" width="80" height="30" fill="#1f3252" stroke="#2f4a74"/>
+    <rect x="275" y="222" rx="10" ry="10" width="80" height="30" fill="#1f3252" stroke="#2f4a74"/>
+    <text x="116" y="242" class="pillText">🇺🇿 Uzbek</text>
+    <text x="206" y="242" class="pillText">🇬🇧 English</text>
+    <text x="296" y="242" class="pillText">🇷🇺 Русский</text>
+    <text x="95" y="278" class="noteDim">After selecting a language, bot shows the Main Menu below.</text>
+  </g>
+
+  <!-- Main menu -->
+  <g filter="url(#shadow)">
+    <rect x="520" y="135" rx="20" ry="20" width="640" height="360" fill="url(#card)" stroke="#29406a" stroke-width="1.5"/>
+    <rect x="520" y="135" rx="20" ry="20" width="640" height="10" fill="url(#accent1)"/>
+    <text x="550" y="178" class="cardTitle">2. Main Menu</text>
+    <text x="550" y="202" class="cardSub">Default dynamic menu after language selection</text>
+
+    <!-- Rows -->
+    <g>
+      <rect x="548" y="226" rx="11" ry="11" width="262" height="38" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="566" y="250" class="row">🔎 Search Books</text>
+      <rect x="822" y="226" rx="11" ry="11" width="310" height="38" fill="#231d38" stroke="#4b3d74"/>
+      <text x="840" y="250" class="row">🛠 Admin Control (admin only)</text>
+
+      <rect x="548" y="276" rx="11" ry="11" width="286" height="38" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="566" y="300" class="row">🤖 AI Tools</text>
+      <rect x="846" y="276" rx="11" ry="11" width="286" height="38" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="864" y="300" class="row">🎙️ Text to Voice</text>
+
+      <rect x="548" y="326" rx="11" ry="11" width="286" height="38" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="566" y="350" class="row">📄 PDF Maker</text>
+      <rect x="846" y="326" rx="11" ry="11" width="286" height="38" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="864" y="350" class="row">👤 My Profile</text>
+
+      <rect x="548" y="376" rx="11" ry="11" width="584" height="38" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="566" y="400" class="row">🌙 Ramadan Duas</text>
+
+      <rect x="548" y="426" rx="11" ry="11" width="584" height="38" fill="#1f253f" stroke="#415a8a"/>
+      <text x="566" y="450" class="row">🛠️ Other Functions</text>
+    </g>
+  </g>
+
+  <!-- Actions note -->
+  <g filter="url(#shadow)">
+    <rect x="1210" y="135" rx="18" ry="18" width="620" height="220" fill="url(#card)" stroke="#243756" stroke-width="1.5"/>
+    <rect x="1210" y="135" rx="18" ry="18" width="620" height="8" fill="url(#accent2)"/>
+    <text x="1240" y="176" class="cardTitle">Main Menu Direct Actions (not submenus)</text>
+    <text x="1240" y="202" class="cardSub">These buttons open feature flows directly</text>
+    <text x="1240" y="238" class="note">• Search Books (also accepts direct book-name text on Main Menu)</text>
+    <text x="1240" y="266" class="note">• Text to Voice</text>
+    <text x="1240" y="294" class="note">• PDF Maker</text>
+    <text x="1240" y="322" class="note">• My Profile / Ramadan Duas</text>
+  </g>
+
+  <!-- Other Functions -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="395" rx="20" ry="20" width="520" height="400" fill="url(#card)" stroke="#29406a" stroke-width="1.5"/>
+    <rect x="70" y="395" rx="20" ry="20" width="520" height="10" fill="url(#accent2)"/>
+    <text x="100" y="438" class="cardTitle">Other Functions Menu</text>
+    <text x="100" y="462" class="cardSub">Opened from Main Menu → Other Functions</text>
+
+    <g>
+      <rect x="98" y="486" rx="10" ry="10" width="188" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <rect x="300" y="486" rx="10" ry="10" width="262" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="114" y="509" class="row">🔥 Top Books</text>
+      <text x="316" y="509" class="row">🏆 Top Users</text>
+
+      <rect x="98" y="536" rx="10" ry="10" width="220" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <rect x="332" y="536" rx="10" ry="10" width="230" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="114" y="559" class="row">⬆️ Upload Books</text>
+      <text x="348" y="559" class="row">📝 Request Book</text>
+
+      <rect x="98" y="586" rx="10" ry="10" width="464" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="114" y="609" class="row">🎬 Video Downloader</text>
+
+      <rect x="98" y="636" rx="10" ry="10" width="220" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <rect x="332" y="636" rx="10" ry="10" width="230" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="114" y="659" class="row">⭐ Favorites</text>
+      <text x="348" y="659" class="row">❓ Help</text>
+
+      <rect x="98" y="700" rx="10" ry="10" width="464" height="38" fill="#22324f" stroke="#466390"/>
+      <text x="114" y="724" class="row">⬅️ Back (returns to Main Menu)</text>
+    </g>
+  </g>
+
+  <!-- AI Tools -->
+  <g filter="url(#shadow)">
+    <rect x="640" y="555" rx="20" ry="20" width="620" height="360" fill="url(#card)" stroke="#29406a" stroke-width="1.5"/>
+    <rect x="640" y="555" rx="20" ry="20" width="620" height="10" fill="url(#accent1)"/>
+    <text x="670" y="598" class="cardTitle">AI Tools Menu</text>
+    <text x="670" y="622" class="cardSub">Opened from Main Menu → AI Tools</text>
+
+    <g>
+      <rect x="668" y="646" rx="10" ry="10" width="286" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <rect x="966" y="646" rx="10" ry="10" width="266" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="684" y="669" class="row">💬 Chat with AI</text>
+      <text x="982" y="669" class="row">🌐 AI Translator</text>
+
+      <rect x="668" y="696" rx="10" ry="10" width="286" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <rect x="966" y="696" rx="10" ry="10" width="266" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="684" y="719" class="row">✍️ AI Grammar Fix</text>
+      <text x="982" y="719" class="row">📧 AI Email Writer</text>
+
+      <rect x="668" y="746" rx="10" ry="10" width="286" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <rect x="966" y="746" rx="10" ry="10" width="266" height="36" fill="#1a2944" stroke="#2e4a75"/>
+      <text x="684" y="769" class="row">📝 AI Quiz Generator</text>
+      <text x="982" y="769" class="row">🖼️ AI Image Generator</text>
+
+      <rect x="668" y="810" rx="10" ry="10" width="564" height="38" fill="#22324f" stroke="#466390"/>
+      <text x="684" y="834" class="row">⬅️ Back (returns to Main Menu)</text>
+    </g>
+
+    <text x="670" y="885" class="rowSmall">Note: AI tool active modes show a temporary “active” keyboard row + Change/Exit buttons.</text>
+  </g>
+
+  <!-- Admin Control -->
+  <g filter="url(#shadow)">
+    <rect x="1295" y="395" rx="20" ry="20" width="535" height="890" fill="url(#card)" stroke="#49356f" stroke-width="1.5"/>
+    <rect x="1295" y="395" rx="20" ry="20" width="535" height="10" fill="url(#accent2)"/>
+    <text x="1325" y="438" class="cardTitle">Admin Control Menu (admin only)</text>
+    <text x="1325" y="462" class="cardSub">Opened from Main Menu → Admin Control</text>
+
+    <g>
+      <!-- Row 1 -->
+      <rect x="1323" y="486" rx="9" ry="9" width="148" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <rect x="1484" y="486" rx="9" ry="9" width="148" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <rect x="1645" y="486" rx="9" ry="9" width="157" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <text x="1336" y="508" class="row">Search Users</text>
+      <text x="1498" y="508" class="row">Upload Book</text>
+      <text x="1692" y="508" class="row" text-anchor="middle">Audit</text>
+
+      <!-- Row 2 -->
+      <rect x="1323" y="532" rx="9" ry="9" width="160" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <rect x="1495" y="532" rx="9" ry="9" width="148" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <rect x="1655" y="532" rx="9" ry="9" width="147" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <text x="1337" y="554" class="row">Prune Users</text>
+      <text x="1515" y="554" class="row">Broadcast</text>
+      <text x="1678" y="554" class="row">Missing Files</text>
+
+      <!-- Row 3 -->
+      <rect x="1323" y="578" rx="9" ry="9" width="236" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <rect x="1571" y="578" rx="9" ry="9" width="231" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <text x="1368" y="600" class="row">Pause Bot</text>
+      <text x="1622" y="600" class="row">Resume Bot</text>
+
+      <!-- Row 4 -->
+      <rect x="1323" y="624" rx="9" ry="9" width="236" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <rect x="1571" y="624" rx="9" ry="9" width="231" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <text x="1370" y="646" class="row">Cancel Task</text>
+      <text x="1610" y="646" class="row">Dupes Status</text>
+
+      <!-- Row 5 -->
+      <rect x="1323" y="670" rx="9" ry="9" width="236" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <rect x="1571" y="670" rx="9" ry="9" width="231" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <text x="1380" y="692" class="row">DB Dupes</text>
+      <text x="1632" y="692" class="row">ES Dupes</text>
+
+      <!-- Upload local section -->
+      <rect x="1323" y="728" rx="9" ry="9" width="479" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <text x="1342" y="750" class="row">Upload Status (local bulk upload)</text>
+
+      <rect x="1323" y="774" rx="9" ry="9" width="236" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <rect x="1571" y="774" rx="9" ry="9" width="231" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <text x="1402" y="796" class="row">All</text>
+      <text x="1650" y="796" class="row">Missing</text>
+
+      <rect x="1323" y="820" rx="9" ry="9" width="236" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <rect x="1571" y="820" rx="9" ry="9" width="231" height="34" fill="#2a1f44" stroke="#5c448f"/>
+      <text x="1400" y="842" class="row">Unique</text>
+      <text x="1659" y="842" class="row">Large</text>
+
+      <rect x="1323" y="878" rx="9" ry="9" width="479" height="34" fill="#3a2338" stroke="#8d4a74"/>
+      <text x="1342" y="900" class="row">Missing Confirm (destructive)</text>
+
+      <rect x="1323" y="938" rx="9" ry="9" width="479" height="38" fill="#2b3654" stroke="#4f6a98"/>
+      <text x="1342" y="962" class="row">⬅️ Back</text>
+    </g>
+
+    <text x="1325" y="1012" class="rowSmall">Admin menu is a reply keyboard (single-page control panel). Some actions then ask for text input.</text>
+    <text x="1325" y="1036" class="rowSmall">Visible only to admin/owner users.</text>
+  </g>
+
+  <!-- Connectors -->
+  <path class="connectorAlt" d="M430 220 C470 220, 470 220, 520 220"/>
+  <path class="connector" d="M840 495 C840 520, 920 520, 950 555"/>
+  <path class="connector" d="M760 495 C700 540, 540 540, 330 560"/>
+  <path class="connector dashed" d="M1090 245 C1190 300, 1270 350, 1380 395"/>
+
+  <!-- Legend -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="1210" rx="16" ry="16" width="1170" height="125" fill="url(#card)" stroke="#253a5e" stroke-width="1.2"/>
+    <text x="100" y="1250" class="cardTitle">How to read this map</text>
+    <text x="100" y="1278" class="note">• Boxes = dynamic reply-keyboard menus. Rows show button layout.</text>
+    <text x="100" y="1304" class="note">• Main menu buttons can open submenus (AI Tools / Other Functions / Admin Control) or start feature flows directly.</text>
+    <text x="100" y="1330" class="note">• `/start` shows language picker first, then the Main Menu after a language is chosen.</text>
+  </g>
+</svg>
