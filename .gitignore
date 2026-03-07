@@ -32,6 +32,11 @@ downloads/
 tmp/
 *.log
 *.pid
+*_result.txt
+*_results.txt
+*_test.txt
+diagnostic_output.txt
+*_diagnosis.txt
 
 # IDE/editor
 .vscode/
