@@ -214,6 +214,7 @@ from admin_tools import (
 )
 
 import ai_tools as _ai_tools
+import audio_converter as _audio_converter
 import video_downloader as _video_downloader
 import search_flow as _search_flow
 import tts_tools as _tts_tools
@@ -3478,6 +3479,12 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
         _video_dl_clear_session(context)
         cancelled = True
 
+    audio_conv_session = _audio_conv_get_session(context) if callable(globals().get("_audio_conv_get_session")) else None
+    if audio_conv_session and (not user_id or audio_conv_session.get("user_id") in {None, user_id}):
+        await _edit_prompt_if_any(audio_conv_session)
+        _audio_conv_clear_session(context)
+        cancelled = True
+
     if context.user_data.get("awaiting_request"):
         context.user_data["awaiting_request"] = False
         context.user_data.pop("awaiting_request_until", None)
@@ -3619,6 +3626,10 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     if action == "video_downloader":
         context.user_data["main_menu_section"] = "other"
         await _video_dl_start_session_from_message(update.message, update, context, lang)
+        return True
+    if action == "audio_converter":
+        context.user_data["main_menu_section"] = "other"
+        await _audio_conv_start_session_from_message(update.message, update, context, lang)
         return True
     if action == "contact_admin":
         context.user_data["main_menu_section"] = "other"
@@ -4901,6 +4912,16 @@ _video_dl_start_session_from_message = _video_downloader._video_dl_start_session
 _video_dl_handle_text_input = _video_downloader._video_dl_handle_text_input
 handle_video_downloader_callback = _video_downloader.handle_video_downloader_callback
 
+# Audio converter extracted module bridge
+_audio_converter.configure(globals())
+
+_audio_conv_clear_session = _audio_converter._audio_conv_clear_session
+_audio_conv_get_session = _audio_converter._audio_conv_get_session
+_audio_conv_start_session_from_message = _audio_converter._audio_conv_start_session_from_message
+_audio_conv_handle_text_input = _audio_converter._audio_conv_handle_text_input
+_audio_conv_handle_media_input = _audio_converter._audio_conv_handle_media_input
+handle_audio_converter_callback = _audio_converter.handle_audio_converter_callback
+
 # Refresh search_flow dependencies after late-bound feature bridges.
 _search_flow.configure(globals())
 
@@ -5060,6 +5081,7 @@ def main():
         app.add_handler(CallbackQueryHandler(handle_pdf_maker_callback, pattern="^pdfmk:"))
         app.add_handler(CallbackQueryHandler(handle_tts_callback, pattern="^tts:"))
         app.add_handler(CallbackQueryHandler(handle_video_downloader_callback, pattern="^vdl:"))
+        app.add_handler(CallbackQueryHandler(handle_audio_converter_callback, pattern="^atool:"))
         app.add_handler(CallbackQueryHandler(handle_ai_tools_callback, pattern="^aitool:"))
         app.add_handler(CallbackQueryHandler(handle_my_quiz_callback, pattern="^myquiz:"))
         app.add_handler(PollAnswerHandler(handle_ai_quiz_poll_answer))

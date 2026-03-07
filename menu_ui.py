@@ -101,6 +101,7 @@ def build_help_text(
             f"{m.get('menu_top_books', '🔥 Top kitoblar')} — eng mashhur kitoblar.",
             f"{m.get('menu_movie_upload', '⬆️ Kino yuklash')} — kinolarni saqlash uchun yuborish.",
             f"{m.get('menu_favorites', '⭐ Sevimlilar')} — saqlangan kitoblar.",
+            f"{m.get('menu_audio_converter', '🎛️ Audio Cutter & Converter')} — voice/mp3 format o‘zgartirish, kesish va nomini o‘zgartirish.",
             f"{m.get('menu_myprofile', '👤 Mening profilim')} — statistika va sovg‘alar.",
             f"{m.get('menu_help', '❓ Yordam')} — ushbu yo‘riqnoma.",
         ]
@@ -137,6 +138,7 @@ def build_help_text(
             f"{m.get('menu_top_books', '🔥 Топ книг')} — самые популярные книги.",
             f"{m.get('menu_movie_upload', '⬆️ Загрузить фильмы')} — отправка фильмов для сохранения.",
             f"{m.get('menu_favorites', '⭐ Избранное')} — сохранённые книги.",
+            f"{m.get('menu_audio_converter', '🎛️ Audio Cutter & Converter')} — конвертация voice/mp3, обрезка и переименование.",
             f"{m.get('menu_myprofile', '👤 Мой профиль')} — статистика и бонусы.",
             f"{m.get('menu_help', '❓ Помощь')} — эта инструкция.",
         ]
@@ -173,6 +175,7 @@ def build_help_text(
             f"{m.get('menu_top_books', '🔥 Top Books')} — most popular books.",
             f"{m.get('menu_movie_upload', '⬆️ Upload Movies')} — send movies for storage.",
             f"{m.get('menu_favorites', '⭐ Favorites')} — saved books.",
+            f"{m.get('menu_audio_converter', '🎛️ Audio Cutter & Converter')} — convert voice/mp3, cut audio, and rename files.",
             f"{m.get('menu_myprofile', '👤 My Profile')} — stats and rewards.",
             f"{m.get('menu_help', '❓ Help')} — this guide.",
         ]
@@ -230,6 +233,7 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_top_books": "eng mashhur kitoblar.",
             "menu_movie_upload": "kinolarni saqlash uchun yuborish.",
             "menu_favorites": "saqlangan kitoblar.",
+            "menu_audio_converter": "voice/mp3 formatni o'zgartirish, kesish va nomini o'zgartirish.",
             "menu_myprofile": "statistika va sovg'alar.",
             "menu_help": "ushbu yo'riqnoma.",
         },
@@ -250,6 +254,7 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_top_books": "самые популярные книги.",
             "menu_movie_upload": "отправка фильмов для сохранения.",
             "menu_favorites": "сохранённые книги.",
+            "menu_audio_converter": "конвертация voice/mp3, обрезка и переименование.",
             "menu_myprofile": "статистика и бонусы.",
             "menu_help": "эта инструкция.",
         },
@@ -270,6 +275,7 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_top_books": "most popular books.",
             "menu_movie_upload": "send movies for storage.",
             "menu_favorites": "saved books.",
+            "menu_audio_converter": "convert voice/mp3, cut audio, and rename files.",
             "menu_myprofile": "stats and rewards.",
             "menu_help": "this guide.",
         }
@@ -299,6 +305,7 @@ def main_menu_text_action(
         "menu_top_users": "top_users",
         "menu_upload": "upload",
         "menu_movie_upload": "movie_upload",
+        "menu_audio_converter": "audio_converter",
         "menu_video_downloader": "video_downloader",
         "menu_contact_admin": "contact_admin",
         "menu_ramadan_duas": "ramazon",

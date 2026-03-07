@@ -23,8 +23,8 @@ def build_main_menu_keyboard(
             [m.get("menu_upload", "⬆️ Upload Books"), m.get("menu_movie_upload", "⬆️ Upload Movies")],
             [m.get("menu_request_book", "📝 Request Book")],
             [m.get("menu_contact_admin", "📞 Contact Admin"), m.get("menu_myprofile", "👤 My Profile")],
-            [m.get("menu_favorites", "⭐ Favorites"), m.get("menu_help", "❓ Help")],
-            [m.get("menu_back", "⬅️ Back")],
+            [m.get("menu_favorites", "⭐ Favorites"), m.get("menu_audio_converter", "🎛️ Audio Cutter & Converter")],
+            [m.get("menu_help", "❓ Help"), m.get("menu_back", "⬅️ Back")],
         ]
     elif section == "ai_tools":
         keyboard = [

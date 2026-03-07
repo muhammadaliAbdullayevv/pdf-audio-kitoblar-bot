@@ -818,8 +818,19 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     pending = context.user_data.get("pending_abook")
     logger.debug("handle_abook_audio called (pending=%s)", pending is not None)
     if not pending:
-        # not in audiobook flow, let other handlers run
-        logger.debug("handle_abook_audio: no pending flow, returning")
+        # If audiobook flow is not active, let audio converter session consume media.
+        audio_conv_handler = globals().get("_audio_conv_handle_media_input")
+        if callable(audio_conv_handler):
+            try:
+                lang = ensure_user_language(update, context)
+                handled = await audio_conv_handler(update, context, lang)
+                if handled:
+                    raise ApplicationHandlerStop()
+            except ApplicationHandlerStop:
+                raise
+            except Exception as e:
+                logger.warning("audio converter media handler failed: %s", e, exc_info=True)
+        logger.debug("handle_abook_audio: no pending audiobook flow, returning")
         return
     # identify file object
     msg = update.message
@@ -1796,6 +1807,10 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if await _video_dl_handle_text_input(update, context, lang):
             return
+
+        if callable(globals().get("_audio_conv_handle_text_input")):
+            if await _audio_conv_handle_text_input(update, context, lang):
+                return
 
         if await _ai_chat_handle_text_input(update, context, lang):
             return
