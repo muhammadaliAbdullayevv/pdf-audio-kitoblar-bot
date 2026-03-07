@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from db import init_db, list_books, insert_book, find_duplicate_book
 from bot import normalize
 
-BOOKS_DIR = "/home/muhammadaliabdullayev/Documents/worldLibraryBot/downloads/localbooks"
+BOOKS_DIR = "/home/muhammadaliabdullayev/Documents/SmartAIToolsBot/downloads/localbooks"
 
 def update_local_books():
     load_dotenv()

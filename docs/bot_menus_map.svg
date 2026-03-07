@@ -24,7 +24,7 @@
 
   <rect class="bg" x="0" y="0" width="1800" height="1320"/>
 
-  <text class="title" x="40" y="52">World Library Bot - Full Menu Map (Current)</text>
+  <text class="title" x="40" y="52">Smart AI Tools Bot - Full Menu Map (Current)</text>
   <text class="subtitle" x="40" y="80">Based on current menu layout in menus.py + admin labels in menu_ui.py</text>
 
   <!-- Start / language flow -->

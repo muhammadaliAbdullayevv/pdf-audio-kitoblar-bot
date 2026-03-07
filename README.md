@@ -233,7 +233,7 @@ Additional optional dependencies used by features (install as needed):
 ## Quick Start (Manual)
 
 ```bash
-cd ~/Documents/worldLibraryBot
+cd ~/Documents/SmartAIToolsBot
 python3 -m venv venv312
 source venv312/bin/activate
 pip install -r requirements.txt
@@ -389,7 +389,7 @@ Set the project interpreter to `venv312` so editor diagnostics match runtime:
 `.vscode/settings.json`
 ```json
 {
-  "python.defaultInterpreterPath": "/home/muhammadaliabdullayev/Documents/worldLibraryBot/venv312/bin/python3"
+  "python.defaultInterpreterPath": "/home/muhammadaliabdullayev/Documents/SmartAIToolsBot/venv312/bin/python3"
 }
 ```
 
