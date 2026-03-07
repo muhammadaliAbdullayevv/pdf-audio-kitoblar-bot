@@ -1853,6 +1853,17 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 progress_message = None
 
+            async def _record_movie_search_analytics() -> None:
+                try:
+                    await _run_db_retry(increment_analytics, "searches", 1)
+                    await _run_db_retry(increment_user_analytics, user_id, "searches", 1)
+                    await _run_db_retry(db_increment_counter, "search_total", 1)
+                    await _run_db_retry(db_increment_counter, "movie_search_total", 1)
+                except Exception as e:
+                    logger.warning("movie search analytics update failed: %s", e)
+
+            _schedule_bg_task(context, _record_movie_search_analytics())
+
             entries: list[dict[str, str]] = []
 
             cleaned_movie_query = normalize(movie_query).lower()
@@ -2435,11 +2446,22 @@ async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_T
                     await query.message.reply_text(message)
             else:
                 await query.message.reply_text(message)
-        elif status_msg:
-            try:
-                await status_msg.edit_text(MESSAGES[lang].get("sent", "✅ Sent."))
-            except Exception:
-                pass
+        else:
+            async def _record_movie_download_analytics() -> None:
+                try:
+                    await _run_db_retry(increment_analytics, "buttons", 1)
+                    await _run_db_retry(increment_user_analytics, query.from_user.id, "buttons", 1)
+                    await _run_db_retry(db_increment_counter, "download_total", 1)
+                    await _run_db_retry(db_increment_counter, "movie_download_total", 1)
+                except Exception as e:
+                    logger.warning("movie download analytics update failed: %s", e)
+
+            _schedule_bg_task(context, _record_movie_download_analytics())
+            if status_msg:
+                try:
+                    await status_msg.edit_text(MESSAGES[lang].get("sent", "✅ Sent."))
+                except Exception:
+                    pass
 
         await safe_answer(query)
     except Exception as e:

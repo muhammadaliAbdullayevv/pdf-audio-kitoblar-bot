@@ -2,21 +2,13 @@ import logging
 import warnings
 import os
 import json
-import base64
 import re
-import hashlib
 import traceback
 import tempfile
 import io
 import time
 import math
 import asyncio
-import textwrap
-import socket
-import subprocess
-import shutil
-import urllib.request
-import urllib.error
 import fcntl
 import atexit
 from functools import partial
@@ -31,7 +23,6 @@ from telegram.ext import InlineQueryHandler
 import uuid
 from telegram import InlineQueryResultCachedDocument
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update, InputFile
-from telegram.ext import CallbackQueryHandler, ContextTypes
 
 from urllib3.exceptions import InsecureRequestWarning
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
@@ -228,6 +219,133 @@ import search_flow as _search_flow
 import tts_tools as _tts_tools
 
 logger = logging.getLogger(__name__)
+
+# Explicit bridge deps: DB symbols are consumed indirectly by extracted modules
+# via configure(globals()). This keeps IDE static analysis from dimming them as unused.
+_BRIDGE_DB_SYMBOLS = (
+    init_db,
+    get_user,
+    list_users,
+    upsert_user,
+    update_user_language,
+    update_user_left_date,
+    set_user_allowed,
+    set_user_delete_allowed,
+    set_user_stopped,
+    set_user_blocked,
+    db_add_user_coin_adjustment,
+    db_get_user_coin_adjustment,
+    delete_users_by_ids,
+    insert_removed_users,
+    db_add_favorite,
+    db_remove_favorite,
+    db_is_favorited,
+    db_list_favorites,
+    db_award_favorite_action,
+    db_get_user_favorite_awards_count,
+    db_add_recent,
+    db_increment_analytics,
+    db_increment_user_analytics,
+    db_increment_counter,
+    db_get_counters,
+    db_backfill_counters_if_empty,
+    db_backfill_user_awards_if_empty,
+    get_analytics_map,
+    get_db_stats,
+    db_get_book_totals,
+    db_get_favorites_total,
+    db_get_user_favorites_count,
+    db_get_user_usage_stats,
+    db_get_user_reaction_count,
+    db_get_user_referrals_count,
+    db_get_request_status_counts,
+    db_get_upload_request_status_counts,
+    db_get_user_status_counts,
+    db_get_reaction_totals,
+    db_get_user_reaction,
+    db_award_reaction_action,
+    db_get_user_reaction_awards_count,
+    db_get_daily_analytics,
+    db_get_user_daily_counts,
+    db_list_books,
+    db_get_book_by_id,
+    db_get_book_summary,
+    db_get_book_by_path,
+    db_get_book_by_name,
+    db_get_book_by_file_unique_id,
+    db_list_movies,
+    db_list_unindexed_movies,
+    db_get_movie_by_id,
+    db_get_movie_by_file_unique_id,
+    db_search_movies,
+    db_find_duplicate_book,
+    db_find_duplicate_movie,
+    db_get_duplicate_counts_file_unique_id,
+    db_get_duplicate_counts_path,
+    db_get_duplicate_counts_name,
+    db_get_book_storage_counts,
+    db_get_audio_book_stats,
+    db_get_storage_stats,
+    db_increment_book_download,
+    db_increment_book_searches,
+    db_set_book_reaction,
+    db_get_book_stats,
+    db_get_top_books,
+    db_get_top_users,
+    db_insert_book,
+    db_insert_movie,
+    bulk_upsert_books,
+    update_book_file_id,
+    update_book_indexed,
+    update_movie_indexed,
+    update_book_by_path,
+    db_update_book_storage_meta,
+    get_audio_book_for_book,
+    get_audio_book_by_id,
+    list_audio_book_parts,
+    get_audio_book_part,
+    get_audio_book_part_by_file_unique_id,
+    get_audio_book_part_by_file_unique_id_and_audio_book,
+    create_audio_book_for_book,
+    insert_audio_book_part,
+    delete_audio_book_part,
+    delete_audio_book,
+    delete_audio_books_by_book_id,
+    increment_audio_book_download,
+    increment_audio_book_searches,
+    delete_books_by_ids,
+    delete_book_and_related,
+    db_list_requests,
+    db_list_requests_for_user,
+    db_get_request_by_id,
+    db_insert_request,
+    db_update_request,
+    db_delete_request,
+    db_set_request_status,
+    db_list_upload_requests,
+    db_get_upload_request_by_id,
+    db_insert_upload_request,
+    db_update_upload_request,
+    db_set_upload_request_status,
+    db_insert_upload_receipt,
+    db_update_upload_receipt,
+    db_update_book_upload_meta,
+    db_upsert_book_summary,
+    db_save_user_quiz,
+    db_get_user_quiz,
+    db_list_user_quizzes,
+    db_count_user_quizzes,
+    db_delete_user_quiz,
+    db_mark_user_quiz_started,
+    db_increment_user_quiz_share_count,
+    db_search_users_by_name,
+    db_is_user_delete_allowed,
+    db_is_user_stopped,
+    db_set_user_referrer,
+)
+
+# Tiny runtime use to keep static analyzers from flagging this tuple itself as dead.
+_BRIDGE_DB_SYMBOLS_COUNT = len(_BRIDGE_DB_SYMBOLS)
 
 # Import cache for performance
 try:
@@ -1002,6 +1120,7 @@ def add_upload_request_record(user, lang: str):
         "admin_note": None
     }
     db_insert_upload_request(record)
+    db_increment_counter("upload_request_created", 1)
     return record
 
 
@@ -3768,8 +3887,12 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "request_no",
             "upload_accept",
             "upload_reject",
+            "upload_request_created",
             "reaction_like",
             "reaction_dislike",
+            "movie_search_total",
+            "movie_download_total",
+            "video_downloads",
             "reaction_berry",
             "reaction_whale",
             # AI Tools counters
@@ -3868,11 +3991,15 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             MESSAGES[lang]["audit_section_events"],
             f"- {MESSAGES[lang]['audit_search_total']}: {counters.get('search_total', 0)}",
             f"- {MESSAGES[lang]['audit_download_total']}: {counters.get('download_total', 0)}",
+            f"- Movie searches: {counters.get('movie_search_total', 0)}",
+            f"- Movie downloads: {counters.get('movie_download_total', 0)}",
+            f"- Video downloader downloads: {counters.get('video_downloads', 0)}",
             f"- {MESSAGES[lang]['audit_requests_created']}: {counters.get('request_created', 0)}",
             f"- {MESSAGES[lang]['audit_requests_cancelled']}: {counters.get('request_cancelled', 0)}",
             f"- {MESSAGES[lang]['audit_requests_seen_total']}: {counters.get('request_seen', 0)}",
             f"- {MESSAGES[lang]['audit_requests_done_total']}: {counters.get('request_done', 0)}",
             f"- {MESSAGES[lang]['audit_requests_no_total']}: {counters.get('request_no', 0)}",
+            f"- Upload requests created: {counters.get('upload_request_created', 0)}",
             f"- {MESSAGES[lang]['audit_upload_accept_total']}: {counters.get('upload_accept', 0)}",
             f"- {MESSAGES[lang]['audit_upload_reject_total']}: {counters.get('upload_reject', 0)}",
         ]
@@ -4701,6 +4828,7 @@ _ai_tools.configure(
     db_delete_user_quiz_fn=db_delete_user_quiz,
     db_mark_user_quiz_started_fn=db_mark_user_quiz_started,
     db_increment_user_quiz_share_count_fn=db_increment_user_quiz_share_count,
+    db_increment_counter_fn=db_increment_counter,
 )
 
 _AI_CHAT_SESSION_KEY = _ai_tools._AI_CHAT_SESSION_KEY
@@ -4849,6 +4977,14 @@ def main():
             ",".join(str(x) for x in (UPLOAD_CHANNEL_IDS or [])) or "none",
             AUDIO_UPLOAD_CHANNEL_ID,
             VIDEO_UPLOAD_CHANNEL_ID,
+        )
+
+        logger.info(
+            "Ollama config: url=%s chat_model=%s tools_model=%s translator_backend=%s",
+            os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/"),
+            os.getenv("AI_CHAT_OLLAMA_MODEL", os.getenv("TTS_OLLAMA_MODEL", os.getenv("PDF_MAKER_OLLAMA_MODEL", "qwen2.5:7b"))),
+            os.getenv("AI_TOOLS_OLLAMA_MODEL", os.getenv("AI_CHAT_OLLAMA_MODEL", os.getenv("TTS_OLLAMA_MODEL", os.getenv("PDF_MAKER_OLLAMA_MODEL", "qwen2.5:7b")))),
+            os.getenv("AI_TRANSLATOR_BACKEND", "nllb"),
         )
 
         es_status = "down"

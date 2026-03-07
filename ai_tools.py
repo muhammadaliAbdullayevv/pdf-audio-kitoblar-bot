@@ -57,6 +57,7 @@ _db_count_user_quizzes = None
 _db_delete_user_quiz = None
 _db_mark_user_quiz_started = None
 _db_increment_user_quiz_share_count = None
+_db_increment_counter = None
 _MUSICGEN_CACHE: dict[tuple[str, str], dict] = {}
 _MUSICGEN_LOCK = Lock()
 _WEBAPP_URL = ""  # Web app removed; keep for backward-compatible function signature
@@ -81,10 +82,11 @@ def configure(
     db_delete_user_quiz_fn=None,
     db_mark_user_quiz_started_fn=None,
     db_increment_user_quiz_share_count_fn=None,
+    db_increment_counter_fn=None,
 ) -> None:
     global MESSAGES, logger, run_blocking, run_blocking_heavy, _send_with_retry, _main_menu_keyboard
     global _db_save_user_quiz, _db_get_user_quiz, _db_list_user_quizzes, _db_count_user_quizzes
-    global _db_delete_user_quiz, _db_mark_user_quiz_started, _db_increment_user_quiz_share_count
+    global _db_delete_user_quiz, _db_mark_user_quiz_started, _db_increment_user_quiz_share_count, _db_increment_counter
     MESSAGES = messages
     logger = logger_obj
     run_blocking = run_blocking_fn
@@ -98,6 +100,26 @@ def configure(
     _db_delete_user_quiz = db_delete_user_quiz_fn
     _db_mark_user_quiz_started = db_mark_user_quiz_started_fn
     _db_increment_user_quiz_share_count = db_increment_user_quiz_share_count_fn
+    _db_increment_counter = db_increment_counter_fn
+
+
+async def _ai_increment_counter(key: str, amount: int = 1) -> None:
+    if not callable(_db_increment_counter):
+        return
+    try:
+        await run_blocking(_db_increment_counter, key, amount)
+    except Exception as e:
+        logger.debug("AI counter update failed (%s): %s", key, e)
+
+
+def _ai_schedule_counter_increment(context: ContextTypes.DEFAULT_TYPE, key: str, amount: int = 1) -> None:
+    if not callable(_db_increment_counter):
+        return
+    app = getattr(context, "application", None)
+    if app and hasattr(app, "create_task"):
+        app.create_task(_ai_increment_counter(key, amount))
+        return
+    asyncio.create_task(_ai_increment_counter(key, amount))
 
 
 _AI_CHAT_SESSION_KEY = "ai_chat_session"
@@ -2112,6 +2134,7 @@ async def _ai_chat_start_session_from_message(target_message, update: Update, co
     msgs = _ai_chat_texts(lang_ui)
     uid = update.effective_user.id if update.effective_user else None
     await _send_with_retry(lambda: target_message.reply_text(msgs["greeting"]))
+    _ai_schedule_counter_increment(context, "ai_chat_sessions", 1)
 
 
 async def _ai_chat_handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_ui: str) -> bool:
@@ -2415,6 +2438,8 @@ async def _ai_image_handle_text_input(update: Update, context: ContextTypes.DEFA
     if short_prompt:
         caption += f"\n📝 {short_prompt[:200]}"
     sent_any = await _ai_image_send_results(update, images, caption, lang_ui)
+    if sent_any:
+        _ai_schedule_counter_increment(context, "ai_image_generated", 1)
     if status:
         try:
             await status.edit_text(msgs["done"] if sent_any else MESSAGES[lang_ui]["error"])
@@ -2565,6 +2590,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                     await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
             else:
                 await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+            _ai_schedule_counter_increment(context, "ai_translator_uses", 1)
         except Exception:
             if status:
                 try:
@@ -2590,6 +2616,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                     await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
             else:
                 await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+            _ai_schedule_counter_increment(context, "ai_grammar_fixes", 1)
         except Exception:
             if status:
                 try:
@@ -2615,6 +2642,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                     await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
             else:
                 await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+            _ai_schedule_counter_increment(context, "ai_email_writes", 1)
         except Exception:
             if status:
                 try:

@@ -781,6 +781,11 @@ async def _video_dl_run_download_job(
             except Exception:
                 pass
         sent = await _video_dl_send_result(update, result, title, lang)
+        if sent:
+            try:
+                await run_blocking(db_increment_counter, "video_downloads", 1)
+            except Exception:
+                logger.exception("video downloader: failed to increment video_downloads counter")
         if sent and update.effective_user:
             try:
                 await _video_dl_increment_user_download_count(context, int(update.effective_user.id))
