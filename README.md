@@ -5,6 +5,7 @@ Telegram bot for searching and delivering books/audiobooks, with multilingual UI
 ## What This Bot Does
 
 - Search books (DB + optional Elasticsearch) with inline pagination and download buttons
+- Search movies (DB + optional Elasticsearch) with book-like result flow
 - Deliver books from cached Telegram `file_id` or local files
 - Store audiobook parts in a dedicated Telegram channel (optional) and keep `channel_id`/`channel_message_id` in DB
 - Dynamic menu-first UX (Uzbek / English / Russian)
@@ -15,9 +16,11 @@ Telegram bot for searching and delivering books/audiobooks, with multilingual UI
   - AI Email Writer
 - Text to Voice (Edge TTS + optional AI text polishing)
 - PDF Maker (step-by-step wizard, text-only PDF output, optional AI font-size selection)
+- Audio Editor, PDF Editor, and Sticker Tools in Other Functions
 - Favorites, reactions, top books/users, profile, requests
 - Admin Control (reply-keyboard panel, no slash-command dependency for routine admin tasks)
 - Beta Video Downloader (YouTube/Instagram public links)
+- Name Meanings menu scaffold (coming soon)
 - Bot profile texts (description/about) are synced per language (`en`, `uz`, `ru`) on startup
 
 ## Current UX (Important)
@@ -26,10 +29,12 @@ This bot is **menu-first**.
 
 - Most user features are accessed via dynamic reply-keyboard menus
 - Slash commands are kept minimal / fallback
-- Public users mostly see only:
-  - `/start`
-  - `/language`
-  - `/requests`
+- Public users keep personal commands in command menu:
+  - `/start`, `/language`
+  - `/myprofile`, `/favorite`
+  - `/request`, `/requests`
+  - `/my_quiz`
+- Upload commands are **not** in public command menu; they are scoped to admin/owner command menus.
 
 ### Group Chat Behavior
 
@@ -51,6 +56,7 @@ This bot is **menu-first**.
 
 ### Main Menu
 - `🔎 Search Books`
+- `🎬 Search Movies`
 - `🤖 AI Tools`
 - `🎙️ Text to Voice`
 - `⬇️ Insta Youtub` (beta)
@@ -66,17 +72,22 @@ This bot is **menu-first**.
 - `📝 AI Quiz Generator`
 - `🎵 AI Music Generator`
 - `🤖 AI PDF Maker`
+- `🌐📄 AI PDF Translator`
 - `🖼️ AI Image Generator` (currently coming soon)
 
 ### Other Functions Menu
 - `🔥 Top Books`
 - `🏆 Top Users`
-- `⬆️ Upload Books`
-- `📝 Request Book`
+- `🎛️ Audio Editor`
+- `🧰 PDF Editor`
+- `🧩 Sticker Tools`
+- `🪪 Name Meanings` (coming soon)
 - `📞 Contact Admin`
-- `👤 My Profile`
-- `⭐ Favorites`
 - `❓ Help`
+
+Notes:
+- `My Profile`, `Favorites`, and `Request Book` are available from slash commands.
+- Upload actions are command-based (`/upload`, `/movie_upload`) for admin/allowed users.
 
 ## AI Tools (Current Behavior)
 
@@ -132,7 +143,8 @@ This bot is **menu-first**.
 
 ## Upload Flow (Current)
 
-- `/upload` enables upload mode for allowed users/admins
+- `/upload` enables **book** upload mode for allowed users/admins
+- `/movie_upload` enables **movie** upload mode for allowed users/admins
 - For each file, user-facing status is sent once:
   - `Saved ...`
   - `Duplicate ...`
@@ -170,7 +182,7 @@ Admin UX is reply-keyboard based (not inline panel), and available only to admin
 
 Examples of actions inside Admin Control:
 - Search users (name / username / full or partial user ID)
-- Upload Book (existing upload flow)
+- Upload books/movies via `/upload` and `/movie_upload` (admin-scoped command menu)
 - Audit report
 - Pause / Resume bot
 - Prune users
@@ -180,7 +192,7 @@ Examples of actions inside Admin Control:
 - Local bulk upload tools (`all`, `missing`, `unique`, `large`, `status`)
 
 ### Owner command visibility
-Owner/admin command menu can be minimized (current setup hides most slash commands because admin actions are accessible through the Admin Control menu).
+Owner/admin command menu is scoped and includes upload commands (`/upload`, `/movie_upload`), while public users do not see these upload commands.
 
 ## Modular Code Layout (Current)
 
@@ -408,7 +420,9 @@ Set the project interpreter to `venv312` so editor diagnostics match runtime:
 - Telegram `file_id` caching reduces re-uploads
 - `upload_receipts` tracks upload pipeline states (`received`, `saved_db`, `indexed`, `duplicate`, `index_failed`, etc.)
 - `books` stores optional storage pointers (`storage_chat_id`, `storage_message_id`)
+- `movies` stores movie media pointers/metadata and indexing state
 - `audio_book_parts` stores optional channel source pointers (`channel_id`, `channel_message_id`)
+- `name_meanings` table exists as schema scaffold for future name-meaning feature
 
 ## Troubleshooting
 

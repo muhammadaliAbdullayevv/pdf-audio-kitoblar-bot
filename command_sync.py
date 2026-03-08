@@ -144,7 +144,7 @@ def get_group_admin_commands(lang: str = "en") -> list[BotCommand]:
 def _owner_minimal_commands(lang: str = "en") -> list[BotCommand]:
     by_name = {cmd.command: cmd for cmd in get_public_commands(lang)}
     ordered: list[BotCommand] = []
-    for name in ("start", "language", "myprofile", "favorite", "request", "requests"):
+    for name in ("start", "language", "myprofile", "favorite", "request", "requests", "upload", "movie_upload"):
         cmd = by_name.get(name)
         if cmd:
             ordered.append(cmd)
@@ -154,7 +154,17 @@ def _owner_minimal_commands(lang: str = "en") -> list[BotCommand]:
 def get_admin_commands(lang: str = "en", *, owner_user: bool = False) -> list[BotCommand]:
     if owner_user:
         return _owner_minimal_commands(lang)
-    return get_public_commands_for_menu(lang) + [
+
+    # Keep upload commands out of public menu, but include them for admin command menu.
+    base = list(get_public_commands_for_menu(lang))
+    by_name = {cmd.command: cmd for cmd in get_public_commands(lang)}
+    present = {cmd.command for cmd in base}
+    for name in ("upload", "movie_upload"):
+        cmd = by_name.get(name)
+        if cmd and name not in present:
+            base.append(cmd)
+
+    return base + [
         BotCommand("admin", "🛠️ Admin control panel"),
         BotCommand("smoke", "🧪 Smoke test checklist (admin)"),
         BotCommand("broadcast", "📣 Broadcast to all users (admin)"),

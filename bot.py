@@ -215,6 +215,7 @@ from admin_tools import (
 
 import ai_tools as _ai_tools
 import audio_converter as _audio_converter
+import sticker_tools as _sticker_tools
 import video_downloader as _video_downloader
 import search_flow as _search_flow
 import tts_tools as _tts_tools
@@ -3492,6 +3493,12 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
         _audio_conv_clear_session(context)
         cancelled = True
 
+    sticker_session = _sticker_get_session(context) if callable(globals().get("_sticker_get_session")) else None
+    if sticker_session and (not user_id or sticker_session.get("user_id") in {None, user_id}):
+        await _edit_prompt_if_any(sticker_session)
+        _sticker_clear_session(context)
+        cancelled = True
+
     if context.user_data.get("awaiting_request"):
         context.user_data["awaiting_request"] = False
         context.user_data.pop("awaiting_request_until", None)
@@ -3569,6 +3576,10 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         context.user_data["main_menu_section"] = "ai_tools"
         await _ai_chat_start_session_from_message(update.message, update, context, lang)
         return True
+    if action == "ai_pdf_translator":
+        context.user_data["main_menu_section"] = "ai_tools"
+        await _pdfed_start_translation_session_from_message(update.message, update, context, lang)
+        return True
     if action in {"ai_translator", "ai_grammar", "ai_email_writer", "ai_quiz", "ai_music"}:
         context.user_data["main_menu_section"] = "ai_tools"
         mode_map = {
@@ -3641,6 +3652,20 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     if action == "audio_converter":
         context.user_data["main_menu_section"] = "other"
         await _audio_conv_start_session_from_message(update.message, update, context, lang)
+        return True
+    if action == "sticker_tools":
+        context.user_data["main_menu_section"] = "other"
+        await _sticker_start_session_from_message(update.message, update, context, lang)
+        return True
+    if action == "name_meanings":
+        context.user_data["main_menu_section"] = "other"
+        await update.message.reply_text(
+            m.get(
+                "menu_name_meanings_coming_soon",
+                "🪪 Name Meanings will be available soon. 🙏✨\n📌 We are preparing this section. Thank you for your patience.",
+            ),
+            reply_markup=_main_menu_keyboard(lang, "other", user_id),
+        )
         return True
     if action == "contact_admin":
         context.user_data["main_menu_section"] = "other"
@@ -3805,7 +3830,7 @@ upload_command = _upload_flow.upload_command
 movie_upload_command = _upload_flow.movie_upload_command
 _process_upload = _upload_flow._process_upload
 _raw_handle_file = _upload_flow.handle_file
-handle_movie_video = _upload_flow.handle_movie_video
+_raw_handle_movie_video = _upload_flow.handle_movie_video
 _raw_handle_photo_message = _upload_flow.handle_photo_message
 sync_unindexed_books = _upload_flow.sync_unindexed_books
 sync_unindexed_movies = _upload_flow.sync_unindexed_movies
@@ -3824,6 +3849,17 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             raise
         except Exception as e:
             logger.warning("audio converter photo handler failed: %s", e, exc_info=True)
+    sticker_handler = globals().get("_sticker_handle_media_input")
+    if callable(sticker_handler):
+        try:
+            lang = ensure_user_language(update, context)
+            handled = await sticker_handler(update, context, lang)
+            if handled:
+                return
+        except ApplicationHandlerStop:
+            raise
+        except Exception as e:
+            logger.warning("sticker tools photo handler failed: %s", e, exc_info=True)
     await _raw_handle_photo_message(update, context)
 
 
@@ -3840,6 +3876,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise
         except Exception as e:
             logger.warning("audio converter file handler failed: %s", e, exc_info=True)
+    sticker_handler = globals().get("_sticker_handle_media_input")
+    if callable(sticker_handler):
+        try:
+            lang = ensure_user_language(update, context)
+            handled = await sticker_handler(update, context, lang)
+            if handled:
+                return
+        except ApplicationHandlerStop:
+            raise
+        except Exception as e:
+            logger.warning("sticker tools file handler failed: %s", e, exc_info=True)
     pdf_editor_handler = globals().get("_pdfed_handle_media_input")
     if callable(pdf_editor_handler):
         try:
@@ -3852,6 +3899,22 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning("pdf editor file handler failed: %s", e, exc_info=True)
     await _raw_handle_file(update, context)
+
+
+async def handle_movie_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route video/GIF to sticker tools first, then fallback to movie upload flow."""
+    sticker_handler = globals().get("_sticker_handle_media_input")
+    if callable(sticker_handler):
+        try:
+            lang = ensure_user_language(update, context)
+            handled = await sticker_handler(update, context, lang)
+            if handled:
+                return
+        except ApplicationHandlerStop:
+            raise
+        except Exception as e:
+            logger.warning("sticker tools video handler failed: %s", e, exc_info=True)
+    await _raw_handle_movie_video(update, context)
 
 
 def _format_bytes(bytes_count: int) -> str:
@@ -4840,9 +4903,11 @@ _pdf_editor.configure(globals())
 _pdfed_clear_session = _pdf_editor._pdf_editor_clear_session
 _pdfed_get_session = _pdf_editor._pdf_editor_get_session
 _pdfed_start_session_from_message = _pdf_editor._pdf_editor_start_session_from_message
+_pdfed_start_translation_session_from_message = _pdf_editor._pdf_editor_start_translation_session_from_message
 _pdfed_handle_text_input = _pdf_editor._pdf_editor_handle_text_input
 _pdfed_handle_media_input = _pdf_editor._pdf_editor_handle_media_input
 pdf_editor_command = _pdf_editor.pdf_editor_command
+pdf_translator_command = _pdf_editor.pdf_translator_command
 handle_pdf_editor_callback = _pdf_editor.handle_pdf_editor_callback
 
 
@@ -4941,6 +5006,8 @@ _ai_tool_translation_output_looks_bad = _ai_tools._ai_tool_translation_output_lo
 _ai_tool_translate_ollama_blocking = _ai_tools._ai_tool_translate_ollama_blocking
 _ai_tool_translate_blocking = _ai_tools._ai_tool_translate_blocking
 _ai_tool_translate_with_source_retry_blocking = _ai_tools._ai_tool_translate_with_source_retry_blocking
+# pdf_editor needs translator bindings after AI tools bridge is ready.
+_pdf_editor.configure(globals())
 _ai_tool_grammar_fix_blocking = _ai_tools._ai_tool_grammar_fix_blocking
 _ai_tool_email_writer_blocking = _ai_tools._ai_tool_email_writer_blocking
 _ai_tool_mode_start_session_from_message = _ai_tools._ai_tool_mode_start_session_from_message
@@ -4986,6 +5053,17 @@ _audio_conv_start_session_from_message = _audio_converter._audio_conv_start_sess
 _audio_conv_handle_text_input = _audio_converter._audio_conv_handle_text_input
 _audio_conv_handle_media_input = _audio_converter._audio_conv_handle_media_input
 handle_audio_converter_callback = _audio_converter.handle_audio_converter_callback
+
+# Sticker tools extracted module bridge
+_sticker_tools.configure(globals())
+
+_sticker_clear_session = _sticker_tools._sticker_clear_session
+_sticker_get_session = _sticker_tools._sticker_get_session
+_sticker_start_session_from_message = _sticker_tools._sticker_start_session_from_message
+_sticker_handle_text_input = _sticker_tools._sticker_handle_text_input
+_sticker_handle_media_input = _sticker_tools._sticker_handle_media_input
+handle_sticker_tools_callback = _sticker_tools.handle_sticker_tools_callback
+sticker_tools_command = _sticker_tools.sticker_tools_command
 
 # Refresh search_flow dependencies after late-bound feature bridges.
 _search_flow.configure(globals())
@@ -5137,6 +5215,7 @@ def main():
         # audiobook audio parts (when admin is uploading)
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | (filters.Document.ALL & filters.Document.MimeType("audio/")), handle_abook_audio))
         app.add_handler(MessageHandler(filters.VIDEO | (filters.Document.ALL & filters.Document.MimeType("video/")), handle_movie_video))
+        app.add_handler(MessageHandler(filters.ANIMATION, handle_movie_video))
         app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_books))
         app.add_handler(CommandHandler("language", language_command_handler))
@@ -5144,11 +5223,13 @@ def main():
         app.add_handler(CommandHandler("pdf_maker", pdf_maker_command))
         app.add_handler(CommandHandler("pdf_editor", pdf_editor_command))
         app.add_handler(CommandHandler("text_to_voice", text_to_voice_command))
+        app.add_handler(CommandHandler("sticker_tools", sticker_tools_command))
         app.add_handler(CallbackQueryHandler(handle_pdf_maker_callback, pattern="^pdfmk:"))
         app.add_handler(CallbackQueryHandler(handle_pdf_editor_callback, pattern="^pdfed:"))
         app.add_handler(CallbackQueryHandler(handle_tts_callback, pattern="^tts:"))
         app.add_handler(CallbackQueryHandler(handle_video_downloader_callback, pattern="^vdl:"))
         app.add_handler(CallbackQueryHandler(handle_audio_converter_callback, pattern="^atool:"))
+        app.add_handler(CallbackQueryHandler(handle_sticker_tools_callback, pattern="^stkr:"))
         app.add_handler(CallbackQueryHandler(handle_ai_tools_callback, pattern="^aitool:"))
         app.add_handler(CallbackQueryHandler(handle_my_quiz_callback, pattern="^myquiz:"))
         app.add_handler(PollAnswerHandler(handle_ai_quiz_poll_answer))

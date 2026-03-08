@@ -1816,6 +1816,10 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if await _audio_conv_handle_text_input(update, context, lang):
                 return
 
+        if callable(globals().get("_sticker_handle_text_input")):
+            if await _sticker_handle_text_input(update, context, lang):
+                return
+
         if await _ai_chat_handle_text_input(update, context, lang):
             return
 

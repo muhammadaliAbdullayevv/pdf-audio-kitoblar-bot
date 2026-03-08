@@ -57,6 +57,7 @@ def _tts_texts(lang: str) -> dict[str, str]:
             "added": "Qo‘shimcha matn qo‘shildi.",
             "working": "🎙️ Ovoz tayyorlanmoqda...",
             "done": "✅ Ovoz tayyor.",
+            "done_next": "✅ Ovoz yuborildi.\n📝 Yana matn yuboring yoki bekor qilish uchun `cancel` yozing.",
             "cancelled": "Text to Voice bekor qilindi.",
             "expired": "Sessiya tugadi. Pastdagi menyudan Text to Voice bo‘limini qayta tanlang.",
             "empty": "Iltimos, matn yuboring.",
@@ -117,6 +118,7 @@ def _tts_texts(lang: str) -> dict[str, str]:
             "added": "Дополнительный текст добавлен.",
             "working": "🎙️ Создаю голос...",
             "done": "✅ Голос готов.",
+            "done_next": "✅ Голос отправлен.\n📝 Отправьте следующий текст или напишите `cancel` для отмены.",
             "cancelled": "Text to Voice отменен.",
             "expired": "Сессия истекла. Снова выберите Text to Voice в меню ниже.",
             "empty": "Пожалуйста, отправьте текст.",
@@ -176,6 +178,7 @@ def _tts_texts(lang: str) -> dict[str, str]:
         "added": "Added another text part.",
         "working": "🎙️ Generating voice...",
         "done": "✅ Voice is ready.",
+        "done_next": "✅ Voice sent.\n📝 Send another text, or type `cancel` to stop.",
         "cancelled": "Text to Voice cancelled.",
         "expired": "Session expired. Please choose Text to Voice again from the menu below.",
         "empty": "Please send text.",
@@ -1067,9 +1070,32 @@ async def handle_tts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             "output": session.get("output"),
             "ai": bool(session.get("ai")),
         }
-        _tts_clear_session(context)
         await safe_answer(query, msgs["generating_short"])
-        await _tts_generate_and_send(update, context, lang_ui, final_text, opts)
+        sent_ok = await _tts_generate_and_send(update, context, lang_ui, final_text, opts)
+        if sent_ok:
+            session["phase"] = "awaiting_text"
+            session["text_buffer"] = ""
+            session["expires_at"] = time.time() + 1800
+            _tts_save_session(context, session)
+            menu_markup = None
+            main_menu_keyboard_fn = globals().get("_main_menu_keyboard")
+            if callable(main_menu_keyboard_fn):
+                try:
+                    uid = update.effective_user.id if update.effective_user else session.get("user_id")
+                    menu_markup = main_menu_keyboard_fn(lang_ui, "main", uid)
+                except Exception:
+                    menu_markup = None
+            await _tts_edit_or_send_prompt(
+                update,
+                context,
+                session,
+                msgs["done_next"],
+                reply_markup=menu_markup,
+                prefer_edit=False,
+            )
+        else:
+            session["expires_at"] = time.time() + 1800
+            _tts_save_session(context, session)
         return
 
     await safe_answer(query, MESSAGES[lang_ui]["error"], show_alert=True)

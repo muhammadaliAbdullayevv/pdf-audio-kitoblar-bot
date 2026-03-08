@@ -1061,8 +1061,23 @@ def _ai_tools_ollama_generate_blocking(prompt: str, *, temperature: float = 0.2,
     return out, model
 
 
+def _ai_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _ai_translator_backend() -> str:
-    return str(os.getenv("AI_TRANSLATOR_BACKEND", "nllb")).strip().lower()
+    raw = str(os.getenv("AI_TRANSLATOR_BACKEND", "hybrid")).strip().lower()
+    aliases = {
+        "nllb200": "nllb",
+        "nllb-200": "nllb",
+        "nllb+ollama": "hybrid",
+        "nllb_ollama": "hybrid",
+        "nllb-hybrid": "hybrid",
+    }
+    return aliases.get(raw, raw)
 
 
 def _ai_translator_nllb_lang_code(lang_key: str) -> str:
@@ -1199,15 +1214,42 @@ def _ai_tool_translate_ollama_blocking(user_text: str, target_lang: str, reply_l
 
 def _ai_tool_translate_blocking(user_text: str, target_lang: str, reply_lang_hint: str) -> str:
     backend = _ai_translator_backend()
-    if backend in {"nllb", "nllb200"}:
+    allow_ollama_fallback = _ai_env_bool("AI_TRANSLATOR_FALLBACK_OLLAMA", True)
+
+    if backend in {"nllb", "hybrid"}:
         try:
-            return _ai_tool_translate_nllb_blocking(user_text, target_lang, reply_lang_hint)
+            nllb_out = _ai_tool_translate_nllb_blocking(user_text, target_lang, reply_lang_hint)
         except Exception as e:
-            allow_fallback = str(os.getenv("AI_TRANSLATOR_FALLBACK_OLLAMA", "1")).strip().lower() in {"1", "true", "yes", "on"}
-            logger.info("AI Translator NLLB fallback to Ollama: %s", e)
-            if not allow_fallback:
+            logger.info("AI Translator NLLB failed (backend=%s): %s", backend, e)
+            if not allow_ollama_fallback:
                 raise
             return _ai_tool_translate_ollama_blocking(user_text, target_lang, reply_lang_hint)
+
+        if backend == "hybrid":
+            nllb_suspicious = _ai_tool_translation_output_is_suspicious(user_text, nllb_out)
+            recheck_always = _ai_env_bool("AI_TRANSLATOR_HYBRID_RECHECK_ALWAYS", False)
+            if nllb_suspicious or recheck_always:
+                try:
+                    ollama_out = _ai_tool_translate_ollama_blocking(user_text, target_lang, reply_lang_hint)
+                    ollama_suspicious = _ai_tool_translation_output_is_suspicious(user_text, ollama_out)
+                    if nllb_suspicious and not ollama_suspicious:
+                        return ollama_out
+                    if not nllb_suspicious and ollama_suspicious:
+                        return nllb_out
+                    if not nllb_suspicious and not ollama_suspicious:
+                        return nllb_out
+                    return ollama_out if len(str(ollama_out or "").strip()) > len(str(nllb_out or "").strip()) else nllb_out
+                except Exception as e:
+                    logger.info("AI Translator hybrid Ollama recheck failed: %s", e)
+                    return nllb_out
+            return nllb_out
+
+        return nllb_out
+
+    if backend == "ollama":
+        return _ai_tool_translate_ollama_blocking(user_text, target_lang, reply_lang_hint)
+
+    # Unknown backend value -> safe fallback.
     return _ai_tool_translate_ollama_blocking(user_text, target_lang, reply_lang_hint)
 
 

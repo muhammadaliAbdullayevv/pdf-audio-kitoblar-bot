@@ -244,6 +244,41 @@ def init_db():
                 logger.warning("Could not create uniq_movies_file_unique_id (skipping): %s", e)
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS name_meanings (
+                    id BIGSERIAL PRIMARY KEY,
+                    name_latin TEXT NOT NULL,
+                    name_uz_cyrillic TEXT,
+                    name_ru_cyrillic TEXT,
+                    gender TEXT NOT NULL DEFAULT 'unisex',
+                    origin_primary TEXT,
+                    origin_list TEXT,
+                    meaning_uz TEXT,
+                    meaning_ru TEXT,
+                    meaning_en TEXT,
+                    source_name TEXT,
+                    source_url TEXT,
+                    confidence TEXT,
+                    notes TEXT,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_latin ON name_meanings (name_latin);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_uz_cyr ON name_meanings (name_uz_cyrillic);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_ru_cyr ON name_meanings (name_ru_cyrillic);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_gender ON name_meanings (gender);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_origin ON name_meanings (origin_primary);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_active ON name_meanings (active);")
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uniq_name_meanings_latin_gender
+                ON name_meanings ((LOWER(name_latin)), gender);
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS upload_receipts (
                     id TEXT PRIMARY KEY,
                     user_id BIGINT,

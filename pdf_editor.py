@@ -53,6 +53,7 @@ _main_menu_keyboard = _pdf_missing_dep
 is_blocked = _pdf_missing_dep
 is_stopped_user = _pdf_missing_dep_async
 update_user_info = _pdf_missing_dep_async
+_ai_tool_translate_with_source_retry_blocking = _pdf_missing_dep
 
 
 def configure(deps: dict[str, Any]) -> None:
@@ -63,6 +64,8 @@ def configure(deps: dict[str, Any]) -> None:
 
 
 _PDF_EDITOR_SESSION_KEY = "pdf_editor_session"
+_TRANSLATOR_SUPPORTED_EXTS = {".pdf", ".epub", ".docx", ".doc", ".txt", ".md", ".markdown"}
+_TRANSLATOR_TEXTISH_EXTS = {".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml", ".ini", ".log", ".html", ".htm", ".xml", ".rtf"}
 
 
 def _pdf_editor_texts(lang: str) -> dict[str, str]:
@@ -70,6 +73,7 @@ def _pdf_editor_texts(lang: str) -> dict[str, str]:
         return {
             "start": "🧰 PDF muharriri yoqildi.\n📥 PDF fayl yuboring.\n👇 Siqish, OCR, TXT/EPUB va suv belgisi ishlaydi.",
             "prompt_send_pdf": "📥 PDF fayl yuboring.",
+            "prompt_send_file": "📥 Tarjima uchun fayl yuboring (PDF, EPUB, DOCX, DOC, TXT, MD).",
             "source_set": "✅ Fayl qabul qilindi: {name}",
             "choose_action": "👇 Amalni tanlang.",
             "current_file": "📄 Joriy fayl: {name} ({size_mb} MB)",
@@ -81,24 +85,37 @@ def _pdf_editor_texts(lang: str) -> dict[str, str]:
             "session_other": "Bu sessiya boshqa foydalanuvchiga tegishli.",
             "cancelled": "❌ Bekor qilindi.",
             "completed": "✅ PDF muharriri yakunlandi.",
-            "no_source": "⚠️ Avval PDF yuboring.",
+            "no_source": "⚠️ Avval fayl yuboring.",
             "not_pdf": "⚠️ Faqat PDF fayl qabul qilinadi.",
+            "not_supported_translator": "⚠️ Qo'llab-quvvatlanadigan formatlar: PDF, EPUB, DOCX, DOC, TXT, MD.",
             "too_large": "⚠️ Fayl katta ({size_mb} MB). Kichikroq yuboring.",
             "tools_missing": "⚠️ `pypdf` topilmadi. PDF Editor ishlamaydi.",
             "ocr_text_only": "ℹ️ OCR text tayyor. Searchable PDF uchun `ocrmypdf` kerak.",
             "ocr_tools_missing": "⚠️ OCR vositalari topilmadi (`pdftoppm`, `tesseract`, yoki `ocrmypdf`).",
             "watermark_missing": "⚠️ Suv belgisi uchun `reportlab` kerak.",
+            "translate_unavailable": "⚠️ AI tarjimon hozir mavjud emas.",
+            "doc_tools_missing": "⚠️ .doc uchun `antiword` yoki `catdoc` o'rnatilmagan.",
+            "translate_empty": "⚠️ Tarjima uchun matn topilmadi.",
+            "ask_translate_lang": "🌐 Tarjima tilini tanlang.",
+            "translating": "⏳ Fayl matni tarjima qilinmoqda...",
+            "translate_done": "✅ Tarjima tayyor ({lang}).",
             "btn_compress": "🗜️ Siqish",
             "btn_ocr": "🔎 OCR",
             "btn_to_txt": "📝 TXT",
             "btn_to_epub": "📚 EPUB",
             "btn_watermark": "🏷️ Suv belgisi",
+            "btn_translate": "🌐 AI PDF tarjimon",
+            "btn_lang_uz": "🇺🇿 O‘zbek",
+            "btn_lang_en": "🇬🇧 English",
+            "btn_lang_ru": "🇷🇺 Русский",
             "btn_clear": "🧹 Tozalash",
             "btn_complete": "✅ Yakunlash",
             "btn_cancel": "❌ Bekor",
             "caption_pdf": "📄 PDF Editor natijasi",
             "caption_txt": "📝 PDF dan matn",
             "caption_epub": "📚 PDF dan EPUB",
+            "caption_translated_txt": "🌐 Tarjima qilingan matn",
+            "caption_translated_epub": "🌐 Tarjima qilingan EPUB",
             "compress_report": "🗜️ Siqildi: {before_mb} MB → {after_mb} MB",
             "watermark_done": "🏷️ Suv belgisi qo‘shildi.",
             "clear_done": "🧹 Sessiya fayli tozalandi.",
@@ -107,6 +124,7 @@ def _pdf_editor_texts(lang: str) -> dict[str, str]:
         return {
             "start": "🧰 PDF-редактор включён.\n📥 Отправьте PDF файл.\n👇 Доступно: сжатие, OCR, TXT/EPUB и водяной знак.",
             "prompt_send_pdf": "📥 Отправьте PDF файл.",
+            "prompt_send_file": "📥 Отправьте файл для перевода (PDF, EPUB, DOCX, DOC, TXT, MD).",
             "source_set": "✅ Файл получен: {name}",
             "choose_action": "👇 Выберите действие.",
             "current_file": "📄 Текущий файл: {name} ({size_mb} MB)",
@@ -118,24 +136,37 @@ def _pdf_editor_texts(lang: str) -> dict[str, str]:
             "session_other": "Эта сессия принадлежит другому пользователю.",
             "cancelled": "❌ Отменено.",
             "completed": "✅ PDF-редактор завершён.",
-            "no_source": "⚠️ Сначала отправьте PDF.",
+            "no_source": "⚠️ Сначала отправьте файл.",
             "not_pdf": "⚠️ Поддерживаются только PDF файлы.",
+            "not_supported_translator": "⚠️ Поддерживаемые форматы: PDF, EPUB, DOCX, DOC, TXT, MD.",
             "too_large": "⚠️ Файл слишком большой ({size_mb} MB).",
             "tools_missing": "⚠️ `pypdf` не найден. PDF Editor недоступен.",
             "ocr_text_only": "ℹ️ OCR-текст готов. Для searchable PDF нужен `ocrmypdf`.",
             "ocr_tools_missing": "⚠️ OCR инструменты не найдены (`pdftoppm`, `tesseract`, или `ocrmypdf`).",
             "watermark_missing": "⚠️ Для водяного знака нужен `reportlab`.",
+            "translate_unavailable": "⚠️ AI-переводчик сейчас недоступен.",
+            "doc_tools_missing": "⚠️ Для .doc не найден `antiword` или `catdoc`.",
+            "translate_empty": "⚠️ Не удалось извлечь текст для перевода.",
+            "ask_translate_lang": "🌐 Выберите язык перевода.",
+            "translating": "⏳ Перевожу текст файла...",
+            "translate_done": "✅ Перевод готов ({lang}).",
             "btn_compress": "🗜️ Сжать",
             "btn_ocr": "🔎 OCR",
             "btn_to_txt": "📝 TXT",
             "btn_to_epub": "📚 EPUB",
             "btn_watermark": "🏷️ Водяной знак",
+            "btn_translate": "🌐 AI PDF переводчик",
+            "btn_lang_uz": "🇺🇿 O‘zbek",
+            "btn_lang_en": "🇬🇧 English",
+            "btn_lang_ru": "🇷🇺 Русский",
             "btn_clear": "🧹 Очистить",
             "btn_complete": "✅ Завершить",
             "btn_cancel": "❌ Отмена",
             "caption_pdf": "📄 Результат PDF Editor",
             "caption_txt": "📝 Текст из PDF",
             "caption_epub": "📚 EPUB из PDF",
+            "caption_translated_txt": "🌐 Переведённый текст",
+            "caption_translated_epub": "🌐 Переведённый EPUB",
             "compress_report": "🗜️ Сжато: {before_mb} MB → {after_mb} MB",
             "watermark_done": "🏷️ Водяной знак добавлен.",
             "clear_done": "🧹 Файл сессии очищен.",
@@ -143,6 +174,7 @@ def _pdf_editor_texts(lang: str) -> dict[str, str]:
     return {
         "start": "🧰 PDF Editor is on.\n📥 Send a PDF file.\n👇 Available: compress, OCR, TXT/EPUB, watermark.",
         "prompt_send_pdf": "📥 Send a PDF file.",
+        "prompt_send_file": "📥 Send a file to translate (PDF, EPUB, DOCX, DOC, TXT, MD).",
         "source_set": "✅ File received: {name}",
         "choose_action": "👇 Choose an action.",
         "current_file": "📄 Current file: {name} ({size_mb} MB)",
@@ -154,24 +186,37 @@ def _pdf_editor_texts(lang: str) -> dict[str, str]:
         "session_other": "This session belongs to another user.",
         "cancelled": "❌ Cancelled.",
         "completed": "✅ PDF Editor completed.",
-        "no_source": "⚠️ Send a PDF first.",
+        "no_source": "⚠️ Send a file first.",
         "not_pdf": "⚠️ Only PDF files are supported.",
+        "not_supported_translator": "⚠️ Supported formats: PDF, EPUB, DOCX, DOC, TXT, MD.",
         "too_large": "⚠️ File is too large ({size_mb} MB).",
         "tools_missing": "⚠️ `pypdf` is missing. PDF Editor is unavailable.",
         "ocr_text_only": "ℹ️ OCR text is ready. Install `ocrmypdf` for searchable PDF output.",
         "ocr_tools_missing": "⚠️ OCR tools are missing (`pdftoppm`, `tesseract`, or `ocrmypdf`).",
         "watermark_missing": "⚠️ Watermark needs `reportlab`.",
+        "translate_unavailable": "⚠️ AI translator is currently unavailable.",
+        "doc_tools_missing": "⚠️ `.doc` extraction needs `antiword` or `catdoc`.",
+        "translate_empty": "⚠️ No text could be extracted for translation.",
+        "ask_translate_lang": "🌐 Choose translation language.",
+        "translating": "⏳ Translating file text...",
+        "translate_done": "✅ Translation is ready ({lang}).",
         "btn_compress": "🗜️ Compress",
         "btn_ocr": "🔎 OCR",
         "btn_to_txt": "📝 TXT",
         "btn_to_epub": "📚 EPUB",
         "btn_watermark": "🏷️ Watermark",
+        "btn_translate": "🌐 AI PDF Translator",
+        "btn_lang_uz": "🇺🇿 O‘zbek",
+        "btn_lang_en": "🇬🇧 English",
+        "btn_lang_ru": "🇷🇺 Русский",
         "btn_clear": "🧹 Clear",
         "btn_complete": "✅ Complete",
         "btn_cancel": "❌ Cancel",
         "caption_pdf": "📄 PDF Editor output",
         "caption_txt": "📝 Text extracted from PDF",
         "caption_epub": "📚 EPUB converted from PDF",
+        "caption_translated_txt": "🌐 Translated text",
+        "caption_translated_epub": "🌐 Translated EPUB",
         "compress_report": "🗜️ Compressed: {before_mb} MB → {after_mb} MB",
         "watermark_done": "🏷️ Watermark added.",
         "clear_done": "🧹 Session file cleared.",
@@ -194,8 +239,7 @@ def _pdf_editor_save_session(context: ContextTypes.DEFAULT_TYPE, session: dict):
 def _pdf_editor_sanitize_name(name: str, fallback: str = "pdf") -> str:
     clean = re.sub(r"[^\w\- .]+", "", str(name or "").strip())
     clean = re.sub(r"\s+", "_", clean).strip("._ ")
-    if clean.lower().endswith(".pdf"):
-        clean = clean[:-4].strip("._ ")
+    clean = re.sub(r"\.(pdf|epub|docx|doc|txt|md|markdown)$", "", clean, flags=re.IGNORECASE).strip("._ ")
     if not clean:
         clean = fallback
     return clean[:80]
@@ -217,22 +261,45 @@ def _pdf_editor_target_message(update: Update):
     return update.message or (update.callback_query.message if update.callback_query else None)
 
 
-def _pdf_editor_extract_pdf_info(message) -> dict | None:
+def _pdf_editor_file_ext(name: str) -> str:
+    return os.path.splitext(str(name or ""))[1].lower().strip()
+
+
+def _pdf_editor_extract_document_info(message) -> dict | None:
     if not message:
         return None
     doc = getattr(message, "document", None)
     if not doc:
         return None
-    name = str(getattr(doc, "file_name", "") or "")
-    mime = str(getattr(doc, "mime_type", "") or "").lower()
-    if mime != "application/pdf" and not name.lower().endswith(".pdf"):
-        return None
+    name = str(getattr(doc, "file_name", "") or "").strip() or f"file_{int(time.time())}"
     return {
         "file_id": getattr(doc, "file_id", None),
         "file_unique_id": getattr(doc, "file_unique_id", None),
-        "file_name": name or f"pdf_{int(time.time())}.pdf",
+        "file_name": name,
         "file_size": int(getattr(doc, "file_size", 0) or 0),
+        "mime_type": str(getattr(doc, "mime_type", "") or "").lower().strip(),
     }
+
+
+def _pdf_editor_extract_pdf_info(message) -> dict | None:
+    info = _pdf_editor_extract_document_info(message)
+    if not info:
+        return None
+    name = str(info.get("file_name") or "")
+    mime = str(info.get("mime_type") or "")
+    if mime != "application/pdf" and _pdf_editor_file_ext(name) != ".pdf":
+        return None
+    return info
+
+
+def _pdf_editor_extract_translator_file_info(message) -> dict | None:
+    info = _pdf_editor_extract_document_info(message)
+    if not info:
+        return None
+    ext = _pdf_editor_file_ext(info.get("file_name") or "")
+    if ext not in _TRANSLATOR_SUPPORTED_EXTS and ext not in _TRANSLATOR_TEXTISH_EXTS:
+        return None
+    return info
 
 
 def _pdf_editor_touch_session(session: dict):
@@ -243,7 +310,8 @@ def _pdf_editor_set_current_file(session: dict, info: dict):
     session["file"] = {
         "file_id": info.get("file_id"),
         "file_unique_id": info.get("file_unique_id"),
-        "name": info.get("file_name") or f"pdf_{int(time.time())}.pdf",
+        "name": info.get("file_name") or f"file_{int(time.time())}",
+        "ext": _pdf_editor_file_ext(info.get("file_name") or ""),
         "size": int(info.get("file_size") or 0),
         "updated_at": int(time.time()),
     }
@@ -256,24 +324,34 @@ def _pdf_editor_current_file(session: dict) -> dict | None:
 
 def _pdf_editor_action_keyboard(lang: str, session: dict | None = None) -> InlineKeyboardMarkup:
     t = _pdf_editor_texts(lang)
-    has_source = bool(_pdf_editor_current_file(session or {}))
+    session = session or {}
+    has_source = bool(_pdf_editor_current_file(session))
+    mode = str(session.get("mode") or "editor")
 
     rows: list[list[InlineKeyboardButton]] = []
     if has_source:
-        rows.extend(
-            [
+        if mode == "translator":
+            rows.extend(
                 [
-                    InlineKeyboardButton(t["btn_compress"], callback_data="pdfed:cmp"),
-                    InlineKeyboardButton(t["btn_ocr"], callback_data="pdfed:ocr"),
-                ],
+                    [InlineKeyboardButton(t["btn_translate"], callback_data="pdfed:tr")],
+                    [InlineKeyboardButton(t["btn_clear"], callback_data="pdfed:clr")],
+                ]
+            )
+        else:
+            rows.extend(
                 [
-                    InlineKeyboardButton(t["btn_to_txt"], callback_data="pdfed:txt"),
-                    InlineKeyboardButton(t["btn_to_epub"], callback_data="pdfed:epub"),
-                ],
-                [InlineKeyboardButton(t["btn_watermark"], callback_data="pdfed:wm")],
-                [InlineKeyboardButton(t["btn_clear"], callback_data="pdfed:clr")],
-            ]
-        )
+                    [
+                        InlineKeyboardButton(t["btn_compress"], callback_data="pdfed:cmp"),
+                        InlineKeyboardButton(t["btn_ocr"], callback_data="pdfed:ocr"),
+                    ],
+                    [
+                        InlineKeyboardButton(t["btn_to_txt"], callback_data="pdfed:txt"),
+                        InlineKeyboardButton(t["btn_to_epub"], callback_data="pdfed:epub"),
+                    ],
+                    [InlineKeyboardButton(t["btn_watermark"], callback_data="pdfed:wm")],
+                    [InlineKeyboardButton(t["btn_clear"], callback_data="pdfed:clr")],
+                ]
+            )
 
     rows.append(
         [
@@ -282,6 +360,20 @@ def _pdf_editor_action_keyboard(lang: str, session: dict | None = None) -> Inlin
         ]
     )
     return InlineKeyboardMarkup(rows)
+
+
+def _pdf_editor_translate_lang_keyboard(lang: str) -> InlineKeyboardMarkup:
+    t = _pdf_editor_texts(lang)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(t["btn_lang_uz"], callback_data="pdfed:trl:uz"),
+                InlineKeyboardButton(t["btn_lang_en"], callback_data="pdfed:trl:en"),
+                InlineKeyboardButton(t["btn_lang_ru"], callback_data="pdfed:trl:ru"),
+            ],
+            [InlineKeyboardButton(t["btn_cancel"], callback_data="pdfed:cancel")],
+        ]
+    )
 
 
 async def _pdf_editor_send_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
@@ -474,6 +566,203 @@ def _pdf_editor_extract_text_blocking(pdf_bytes: bytes, lang: str, max_chars: in
         return extracted
 
 
+def _pdf_editor_strip_markup(raw: str) -> str:
+    s = str(raw or "")
+    s = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", s)
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</(p|div|li|tr|h[1-6])>", "\n", s)
+    s = re.sub(r"(?is)<[^>]+>", " ", s)
+    s = html.unescape(s)
+    s = s.replace("\r", "")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _pdf_editor_decode_text_bytes(data: bytes, max_chars: int = 500000) -> str:
+    blob = bytes(data or b"")
+    if not blob:
+        return ""
+    for enc in ("utf-8", "utf-16", "utf-16le", "utf-16be", "cp1251", "latin-1"):
+        try:
+            txt = blob.decode(enc)
+            return txt[:max_chars]
+        except Exception:
+            continue
+    return blob.decode("utf-8", errors="ignore")[:max_chars]
+
+
+def _pdf_editor_extract_docx_text_blocking(docx_bytes: bytes, max_chars: int = 500000) -> str:
+    out_parts: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+        names = [n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")]
+        for name in names:
+            base = os.path.basename(name)
+            if base != "document.xml" and not base.startswith(("header", "footer", "footnotes", "endnotes")):
+                continue
+            raw = zf.read(name).decode("utf-8", errors="ignore")
+            raw = re.sub(r"</w:p>", "\n", raw)
+            raw = re.sub(r"<w:br\s*/>", "\n", raw)
+            chunks = re.findall(r"<w:t[^>]*>(.*?)</w:t>", raw, flags=re.DOTALL)
+            if chunks:
+                text = html.unescape("".join(chunks))
+                text = re.sub(r"\n{3,}", "\n\n", text)
+                if text.strip():
+                    out_parts.append(text.strip())
+
+    return "\n\n".join(out_parts)[:max_chars].strip()
+
+
+def _pdf_editor_extract_epub_text_blocking(epub_bytes: bytes, max_chars: int = 500000) -> str:
+    parts: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(epub_bytes)) as zf:
+        names = [n for n in zf.namelist() if n.lower().endswith((".xhtml", ".html", ".htm", ".xml"))]
+        for name in sorted(names):
+            try:
+                raw = zf.read(name).decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            text = _pdf_editor_strip_markup(raw)
+            if text:
+                parts.append(text)
+            if sum(len(x) for x in parts) >= max_chars:
+                break
+    return "\n\n".join(parts)[:max_chars].strip()
+
+
+def _pdf_editor_extract_doc_text_blocking(doc_bytes: bytes, max_chars: int = 500000) -> str:
+    bin_name = "antiword" if shutil.which("antiword") else "catdoc" if shutil.which("catdoc") else ""
+    if not bin_name:
+        raise RuntimeError("doc-tools-missing")
+
+    with tempfile.TemporaryDirectory(prefix="pdfed_doc_") as td:
+        path = os.path.join(td, "in.doc")
+        with open(path, "wb") as f:
+            f.write(doc_bytes)
+
+        run = safe_subprocess.run(
+            [bin_name, path],
+            timeout_s=120,
+            max_output_chars=max_chars + 4000,
+            text=True,
+        )
+        if run.returncode != 0:
+            raise RuntimeError("doc-extract-failed")
+        text = str(run.stdout or "").strip()
+        if not text:
+            raise RuntimeError("doc-extract-empty")
+        return text[:max_chars]
+
+
+def _pdf_editor_extract_any_text_blocking(file_bytes: bytes, file_name: str, lang: str, max_chars: int = 500000) -> str:
+    ext = _pdf_editor_file_ext(file_name)
+    if ext == ".pdf":
+        return _pdf_editor_extract_text_blocking(file_bytes, lang, max_chars)
+    if ext in {".docx"}:
+        return _pdf_editor_extract_docx_text_blocking(file_bytes, max_chars)
+    if ext in {".epub"}:
+        return _pdf_editor_extract_epub_text_blocking(file_bytes, max_chars)
+    if ext in {".doc"}:
+        return _pdf_editor_extract_doc_text_blocking(file_bytes, max_chars)
+    if ext in _TRANSLATOR_TEXTISH_EXTS:
+        text = _pdf_editor_decode_text_bytes(file_bytes, max_chars=max_chars)
+        if ext in {".html", ".htm", ".xml"}:
+            text = _pdf_editor_strip_markup(text)
+        elif ext == ".rtf":
+            text = re.sub(r"\\[a-z]+-?\d* ?", " ", text)
+            text = re.sub(r"[{}]", "", text)
+            text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+    raise RuntimeError("translator-unsupported-format")
+
+
+def _pdf_editor_split_translation_chunks(text: str, max_chars: int) -> list[str]:
+    s = str(text or "").strip()
+    if not s:
+        return []
+
+    max_chars = max(500, min(4500, int(max_chars or 3200)))
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", s) if p.strip()]
+    if not paragraphs:
+        paragraphs = [s]
+
+    chunks: list[str] = []
+    current = ""
+
+    def flush() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    def add_piece(piece: str) -> None:
+        nonlocal current
+        piece = piece.strip()
+        if not piece:
+            return
+
+        candidate = f"{current}\n\n{piece}" if current else piece
+        if len(candidate) <= max_chars:
+            current = candidate
+            return
+
+        flush()
+        if len(piece) <= max_chars:
+            current = piece
+            return
+
+        sentences = [x.strip() for x in re.split(r"(?<=[\.!?])\s+", piece) if x.strip()]
+        if not sentences:
+            sentences = [piece]
+
+        for sent in sentences:
+            if len(sent) <= max_chars:
+                cand = f"{current} {sent}".strip() if current else sent
+                if len(cand) <= max_chars:
+                    current = cand
+                else:
+                    flush()
+                    current = sent
+                continue
+
+            for i in range(0, len(sent), max_chars):
+                part = sent[i : i + max_chars].strip()
+                if not part:
+                    continue
+                if current:
+                    flush()
+                chunks.append(part)
+
+    for para in paragraphs:
+        add_piece(para)
+    flush()
+    return chunks
+
+
+def _pdf_editor_translate_text_blocking(text: str, target_lang: str, source_lang: str, ui_lang: str) -> str:
+    translator_fn = globals().get("_ai_tool_translate_with_source_retry_blocking")
+    if not callable(translator_fn):
+        raise RuntimeError("translator-unavailable")
+
+    max_chunk = int(os.getenv("PDF_TRANSLATOR_CHUNK_CHARS", "3200") or "3200")
+    chunks = _pdf_editor_split_translation_chunks(text, max_chunk)
+    if not chunks:
+        return ""
+
+    out_parts: list[str] = []
+    for chunk in chunks:
+        translated = translator_fn(
+            chunk,
+            target_lang,
+            source_lang,
+            source_explicit=False,
+            ui_lang=ui_lang,
+        )
+        cleaned = str(translated or "").strip()
+        if cleaned:
+            out_parts.append(cleaned)
+
+    return "\n\n".join(out_parts).strip()
 def _pdf_editor_ocr_pdf_blocking(pdf_bytes: bytes, lang: str) -> bytes | None:
     if not shutil.which("ocrmypdf"):
         return None
@@ -657,12 +946,23 @@ def _pdf_editor_register_sent_pdf(session: dict, sent_msg, fallback_name: str):
     )
 
 
-async def _pdf_editor_start_session_from_message(target_message, update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
+async def _pdf_editor_start_session_from_message(
+    target_message,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    lang: str,
+    mode: str = "editor",
+):
     _pdf_editor_clear_session(context)
+    mode = str(mode or "editor")
+    if mode not in {"editor", "translator"}:
+        mode = "editor"
+
     session = {
         "active": True,
         "user_id": update.effective_user.id if update.effective_user else None,
         "phase": "ready",
+        "mode": mode,
         "file": None,
         "expires_at": time.time() + 3600,
     }
@@ -670,16 +970,26 @@ async def _pdf_editor_start_session_from_message(target_message, update: Update,
 
     t = _pdf_editor_texts(lang)
     uid = update.effective_user.id if update.effective_user else None
+    start_text = t["start"] if mode == "editor" else t["btn_translate"] + "\n" + t["prompt_send_file"]
     sent = await _send_with_retry(
         lambda: target_message.reply_text(
-            t["start"],
-            reply_markup=_main_menu_keyboard(lang, "other", uid),
+            start_text,
+            reply_markup=_main_menu_keyboard(lang, "ai_tools" if mode == "translator" else "other", uid),
         )
     )
     if sent:
         session["prompt_chat_id"] = sent.chat_id
         session["prompt_message_id"] = sent.message_id
         _pdf_editor_save_session(context, session)
+
+
+async def _pdf_editor_start_translation_session_from_message(
+    target_message,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    lang: str,
+):
+    await _pdf_editor_start_session_from_message(target_message, update, context, lang, mode="translator")
 
 
 async def _pdf_editor_handle_media_input(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> bool:
@@ -697,12 +1007,21 @@ async def _pdf_editor_handle_media_input(update: Update, context: ContextTypes.D
         await update.message.reply_text(t["expired"])
         return True
 
-    info = _pdf_editor_extract_pdf_info(update.message)
-    if not info:
-        if getattr(update.message, "document", None):
-            await update.message.reply_text(t["not_pdf"])
-            return True
-        return False
+    mode = str(session.get("mode") or "editor")
+    if mode == "translator":
+        info = _pdf_editor_extract_translator_file_info(update.message)
+        if not info:
+            if getattr(update.message, "document", None):
+                await update.message.reply_text(t["not_supported_translator"])
+                return True
+            return False
+    else:
+        info = _pdf_editor_extract_pdf_info(update.message)
+        if not info:
+            if getattr(update.message, "document", None):
+                await update.message.reply_text(t["not_pdf"])
+                return True
+            return False
 
     size = int(info.get("file_size") or 0)
     if size > _pdf_editor_max_bytes():
@@ -714,7 +1033,15 @@ async def _pdf_editor_handle_media_input(update: Update, context: ContextTypes.D
     _pdf_editor_save_session(context, session)
 
     await update.message.reply_text(t["source_set"].format(name=info.get("file_name") or "file.pdf"))
-    await _pdf_editor_send_actions(update, context, lang)
+
+    mode = str(session.get("mode") or "editor")
+    if mode == "translator":
+        await update.message.reply_text(
+            t["ask_translate_lang"],
+            reply_markup=_pdf_editor_translate_lang_keyboard(lang),
+        )
+    else:
+        await _pdf_editor_send_actions(update, context, lang)
     return True
 
 
@@ -835,6 +1162,86 @@ async def _pdf_editor_op_to_epub(update: Update, context: ContextTypes.DEFAULT_T
         return False
 
 
+async def _pdf_editor_op_translate(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, target_lang: str):
+    session = _pdf_editor_get_session(context)
+    if not session:
+        return False
+    t = _pdf_editor_texts(lang)
+
+    if target_lang not in {"uz", "en", "ru"}:
+        await _pdf_editor_target_message(update).reply_text(t["failed"])
+        return False
+
+    file_bytes, src = await _pdf_editor_get_current_bytes(context, session)
+    if not file_bytes:
+        await _pdf_editor_target_message(update).reply_text(t["no_source"])
+        return False
+
+    status = await _send_with_retry(lambda: _pdf_editor_target_message(update).reply_text(t["translating"]))
+    try:
+        text = await run_blocking(
+            _pdf_editor_extract_any_text_blocking,
+            file_bytes,
+            str(src.get("name") or "file"),
+            lang,
+            500000,
+        )
+        if not str(text or "").strip():
+            raise RuntimeError("translate-empty")
+
+        translated = await run_blocking(_pdf_editor_translate_text_blocking, text, target_lang, lang, lang)
+        if not str(translated or "").strip():
+            raise RuntimeError("translate-empty")
+
+        base = _pdf_editor_sanitize_name(str(src.get("name") or "file"), fallback="file")
+        stamp = _pdf_editor_now_stamp()
+
+        txt_name = f"{base}_translated_{target_lang}_{stamp}.txt"
+        sent_txt = await _pdf_editor_send_text_file(update, translated, txt_name, t["caption_translated_txt"])
+        sent_any = bool(sent_txt)
+
+        try:
+            epub_title = f"{base}_translated_{target_lang}"[:80]
+            epub_bytes = await run_blocking(_pdf_editor_build_epub_blocking, epub_title, translated, target_lang)
+            target = _pdf_editor_target_message(update)
+            bio = io.BytesIO(epub_bytes)
+            bio.name = f"{epub_title}_{stamp}.epub"
+            sent_epub = await _send_with_retry(lambda: target.reply_document(document=bio, caption=t["caption_translated_epub"]))
+            sent_any = bool(sent_epub) or sent_any
+        except Exception:
+            logger.info("pdf translator epub build failed", exc_info=True)
+
+        if status:
+            try:
+                await status.edit_text(t["translate_done"].format(lang=target_lang.upper()))
+            except Exception:
+                pass
+
+        await _pdf_editor_send_actions(update, context, lang)
+        return sent_any
+    except Exception as e:
+        logger.warning("pdf translator failed: %s", e, exc_info=True)
+        msg = (
+            t["translate_unavailable"]
+            if "translator-unavailable" in str(e)
+            else t["doc_tools_missing"]
+            if "doc-tools-missing" in str(e)
+            else t["not_supported_translator"]
+            if "translator-unsupported-format" in str(e)
+            else t["translate_empty"]
+            if "translate-empty" in str(e)
+            else t["failed"]
+        )
+        if status:
+            try:
+                await status.edit_text(msg)
+            except Exception:
+                pass
+        else:
+            await _pdf_editor_target_message(update).reply_text(msg)
+        return False
+
+
 async def _pdf_editor_op_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
     session = _pdf_editor_get_session(context)
     if not session:
@@ -951,9 +1358,11 @@ async def _pdf_editor_handle_text_input(update: Update, context: ContextTypes.DE
 
     raw = (update.message.text or "").strip()
     if raw.lower() in {"cancel", "stop", "/cancel"}:
+        mode = str(session.get("mode") or "editor")
         _pdf_editor_clear_session(context)
         uid = update.effective_user.id if update.effective_user else None
-        await update.message.reply_text(t["cancelled"], reply_markup=_main_menu_keyboard(lang, "other", uid))
+        section = "ai_tools" if mode == "translator" else "other"
+        await update.message.reply_text(t["cancelled"], reply_markup=_main_menu_keyboard(lang, section, uid))
         return True
 
     phase = str(session.get("phase") or "ready")
@@ -968,9 +1377,16 @@ async def _pdf_editor_handle_text_input(update: Update, context: ContextTypes.DE
         return True
 
     if not _pdf_editor_current_file(session):
-        await update.message.reply_text(t["prompt_send_pdf"])
+        prompt_key = "prompt_send_file" if str(session.get("mode") or "editor") == "translator" else "prompt_send_pdf"
+        await update.message.reply_text(t[prompt_key])
     else:
-        await _pdf_editor_send_actions(update, context, lang)
+        if str(session.get("mode") or "editor") == "translator":
+            await update.message.reply_text(
+                t["ask_translate_lang"],
+                reply_markup=_pdf_editor_translate_lang_keyboard(lang),
+            )
+        else:
+            await _pdf_editor_send_actions(update, context, lang)
     return True
 
 
@@ -997,6 +1413,32 @@ async def pdf_editor_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update_user_info(update, context)
     await _pdf_editor_start_session_from_message(update.message, update, context, lang)
+
+
+async def pdf_translator_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    if not update.message:
+        return
+
+    if update.effective_user and is_blocked(update.effective_user.id):
+        await update.message.reply_text(MESSAGES[lang]["blocked"])
+        return
+    if update.effective_user and await is_stopped_user(update.effective_user.id):
+        return
+
+    limited, wait_s = spam_check_message(update, context)
+    if limited:
+        await update.message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+        return
+
+    translator_fn = globals().get("_ai_tool_translate_with_source_retry_blocking")
+    if not callable(translator_fn):
+        t = _pdf_editor_texts(lang)
+        await update.message.reply_text(t["translate_unavailable"])
+        return
+
+    await update_user_info(update, context)
+    await _pdf_editor_start_translation_session_from_message(update.message, update, context, lang)
 
 
 async def handle_pdf_editor_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1027,21 +1469,25 @@ async def handle_pdf_editor_callback(update: Update, context: ContextTypes.DEFAU
     data = str(query.data or "")
 
     if data == "pdfed:cancel":
+        mode = str(session.get("mode") or "editor")
         _pdf_editor_clear_session(context)
         await safe_answer(query, t["cancelled"])
         uid = query.from_user.id if query.from_user else None
+        section = "ai_tools" if mode == "translator" else "other"
         try:
-            await query.message.reply_text(t["cancelled"], reply_markup=_main_menu_keyboard(lang, "other", uid))
+            await query.message.reply_text(t["cancelled"], reply_markup=_main_menu_keyboard(lang, section, uid))
         except Exception:
             pass
         return
 
     if data == "pdfed:complete":
+        mode = str(session.get("mode") or "editor")
         _pdf_editor_clear_session(context)
         await safe_answer(query, t["completed"])
         uid = query.from_user.id if query.from_user else None
+        section = "ai_tools" if mode == "translator" else "other"
         try:
-            await query.message.reply_text(t["completed"], reply_markup=_main_menu_keyboard(lang, "other", uid))
+            await query.message.reply_text(t["completed"], reply_markup=_main_menu_keyboard(lang, section, uid))
         except Exception:
             pass
         return
@@ -1079,6 +1525,27 @@ async def handle_pdf_editor_callback(update: Update, context: ContextTypes.DEFAU
 
     if data == "pdfed:ocr":
         await _pdf_editor_op_ocr(update, context, lang)
+        return
+
+    if data == "pdfed:tr":
+        try:
+            await query.message.reply_text(
+                t["ask_translate_lang"],
+                reply_markup=_pdf_editor_translate_lang_keyboard(lang),
+            )
+        except Exception:
+            pass
+        return
+
+    if data.startswith("pdfed:trl:"):
+        target_lang = data.rsplit(":", 1)[-1].strip().lower()
+        if target_lang not in {"uz", "en", "ru"}:
+            try:
+                await query.message.reply_text(t["failed"])
+            except Exception:
+                pass
+            return
+        await _pdf_editor_op_translate(update, context, lang, target_lang)
         return
 
     if data == "pdfed:wm":
