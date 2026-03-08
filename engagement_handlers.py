@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any
 
 import safe_subprocess
@@ -51,8 +52,25 @@ async def _can_show_delete_button(update: Update, user_id: int | None) -> bool:
 
 
 def _invalidate_top_caches(context: ContextTypes.DEFAULT_TYPE) -> None:
+    cache_delete_fn = globals().get("cache_delete")
+    cache_clear_pattern_fn = globals().get("cache_clear_pattern")
+    if callable(cache_delete_fn):
+        try:
+            cache_delete_fn("top:books:entries")
+        except Exception:
+            pass
+    if callable(cache_clear_pattern_fn):
+        try:
+            cache_clear_pattern_fn("top_results:*")
+            cache_clear_pattern_fn("top:users:*")
+        except Exception:
+            pass
     try:
         context.application.bot_data.pop("top_entries_cache", None)
+    except Exception:
+        pass
+    try:
+        context.application.bot_data.pop("top_users_cache", None)
     except Exception:
         pass
     try:
@@ -69,6 +87,67 @@ async def _edit_progress_or_reply(progress_message, target_message, text: str, r
         except Exception:
             pass
     await target_message.reply_text(text, reply_markup=reply_markup)
+
+
+def _top_users_cache_key(limit: int) -> str:
+    try:
+        ns = str(globals().get("SEARCH_CACHE_NS", os.getenv("SEARCH_CACHE_NS", "v1")) or "v1")
+    except Exception:
+        ns = "v1"
+    return (
+        f"top:users:{ns}:limit={int(limit)}"
+        f":s={int(COIN_SEARCH)}:d={int(COIN_DOWNLOAD)}:r={int(COIN_REACTION)}"
+        f":f={int(COIN_FAVORITE)}:ref={int(COIN_REFERRAL)}"
+    )
+
+
+def _top_users_cache_ttl() -> int:
+    try:
+        return max(5, int(globals().get("TOP_USERS_CACHE_TTL", os.getenv("TOP_USERS_CACHE_TTL", "45"))))
+    except Exception:
+        return 45
+
+
+def _get_cached_top_users(context: ContextTypes.DEFAULT_TYPE, limit: int) -> list[dict] | None:
+    cache_get_fn = globals().get("cache_get")
+    if callable(cache_get_fn):
+        try:
+            payload = cache_get_fn(_top_users_cache_key(limit))
+            if isinstance(payload, dict):
+                payload = payload.get("entries")
+            if isinstance(payload, list):
+                return payload
+        except Exception:
+            pass
+
+    local_cache = context.application.bot_data.get("top_users_cache")
+    if not isinstance(local_cache, dict):
+        return None
+    if int(local_cache.get("limit") or 0) != int(limit):
+        return None
+    ts = float(local_cache.get("ts") or 0)
+    if (time.time() - ts) > _top_users_cache_ttl():
+        return None
+    entries = local_cache.get("entries")
+    if isinstance(entries, list):
+        return entries
+    return None
+
+
+def _set_cached_top_users(context: ContextTypes.DEFAULT_TYPE, limit: int, entries: list[dict]) -> None:
+    cache_set_fn = globals().get("cache_set")
+    ttl = _top_users_cache_ttl()
+    if callable(cache_set_fn):
+        try:
+            cache_set_fn(_top_users_cache_key(limit), {"entries": entries}, ttl=ttl)
+        except Exception:
+            pass
+
+    context.application.bot_data["top_users_cache"] = {
+        "entries": entries,
+        "limit": int(limit),
+        "ts": time.time(),
+    }
 
 
 async def handle_user_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,15 +258,20 @@ async def top_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         progress_message = None
     try:
-        entries = await run_blocking(
-            db_get_top_users,
-            TOP_USERS_LIMIT * 2,
-            COIN_SEARCH,
-            COIN_DOWNLOAD,
-            COIN_REACTION,
-            COIN_FAVORITE,
-            COIN_REFERRAL,
-        )
+        cache_limit = TOP_USERS_LIMIT * 2
+        entries = _get_cached_top_users(context, cache_limit)
+        if entries is None:
+            entries = await run_blocking(
+                db_get_top_users,
+                cache_limit,
+                COIN_SEARCH,
+                COIN_DOWNLOAD,
+                COIN_REACTION,
+                COIN_FAVORITE,
+                COIN_REFERRAL,
+            )
+            if entries:
+                _set_cached_top_users(context, cache_limit, entries)
         if not entries:
             await _edit_progress_or_reply(progress_message, target_message, MESSAGES[lang]["top_users_empty"])
             return
@@ -214,15 +298,20 @@ async def handle_top_users_toggle_callback(update: Update, context: ContextTypes
     action = (query.data or "").split(":", 1)[1] if ":" in (query.data or "") else ""
     limit = TOP_USERS_LIMIT * 2 if action == "more" else TOP_USERS_LIMIT
     try:
-        entries = await run_blocking(
-            db_get_top_users,
-            TOP_USERS_LIMIT * 2,
-            COIN_SEARCH,
-            COIN_DOWNLOAD,
-            COIN_REACTION,
-            COIN_FAVORITE,
-            COIN_REFERRAL,
-        )
+        cache_limit = TOP_USERS_LIMIT * 2
+        entries = _get_cached_top_users(context, cache_limit)
+        if entries is None:
+            entries = await run_blocking(
+                db_get_top_users,
+                cache_limit,
+                COIN_SEARCH,
+                COIN_DOWNLOAD,
+                COIN_REACTION,
+                COIN_FAVORITE,
+                COIN_REFERRAL,
+            )
+            if entries:
+                _set_cached_top_users(context, cache_limit, entries)
         if not entries:
             await safe_answer(query, MESSAGES[lang]["top_users_empty"], show_alert=True)
             return

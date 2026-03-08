@@ -157,7 +157,7 @@
       <rect x="668" y="746" rx="10" ry="10" width="286" height="36" fill="#1a2944" stroke="#2e4a75"/>
       <rect x="966" y="746" rx="10" ry="10" width="266" height="36" fill="#1a2944" stroke="#2e4a75"/>
       <text x="684" y="769" class="row">📝 AI Quiz Generator</text>
-      <text x="982" y="769" class="row">🖼️ AI Image Generator</text>
+      <text x="982" y="769" class="row">🎵 AI Music Generator</text>
 
       <rect x="668" y="810" rx="10" ry="10" width="564" height="38" fill="#22324f" stroke="#466390"/>
       <text x="684" y="834" class="row">⬅️ Back (returns to Main Menu)</text>

@@ -351,13 +351,14 @@ _BRIDGE_DB_SYMBOLS_COUNT = len(_BRIDGE_DB_SYMBOLS)
 
 # Import cache for performance
 try:
-    from cache import cache_result, cache_get, cache_set, cache_delete, get_redis_client
+    from cache import cache_result, cache_get, cache_set, cache_delete, cache_clear_pattern, get_redis_client
 except ImportError:
     logger.warning("Cache module not available")
     cache_result = lambda *args, **kwargs: lambda f: f  # No-op decorator
     cache_get = lambda k: None
     cache_set = lambda k, v, ttl=300: False
     cache_delete = lambda k: False
+    cache_clear_pattern = lambda p: 0
     get_redis_client = lambda: None
 import pdf_maker as _pdf_maker_mod
 import pdf_editor as _pdf_editor
@@ -959,6 +960,10 @@ SPAM_CB_WINDOW = 10
 SPAM_CB_BLOCK = 10
 TOP_CACHE_TTL = 60
 AUDIT_CACHE_TTL = 30
+BOOK_SEARCH_RESULT_CACHE_TTL = max(10, int(os.getenv("BOOK_SEARCH_RESULT_CACHE_TTL", "120") or "120"))
+MOVIE_SEARCH_RESULT_CACHE_TTL = max(10, int(os.getenv("MOVIE_SEARCH_RESULT_CACHE_TTL", "180") or "180"))
+TOP_USERS_CACHE_TTL = max(5, int(os.getenv("TOP_USERS_CACHE_TTL", "45") or "45"))
+SEARCH_CACHE_NS = (os.getenv("SEARCH_CACHE_NS", "v1") or "v1").strip()
 try:
     THREAD_POOL_WORKERS = max(4, int(os.getenv("THREAD_POOL_WORKERS", "50")))
 except Exception:
@@ -3469,12 +3474,6 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
         _ai_tool_mode_clear_session(context)
         cancelled = True
 
-    ai_image_session = _ai_image_get_session(context)
-    if ai_image_session and (not user_id or ai_image_session.get("user_id") in {None, user_id}):
-        await _edit_prompt_if_any(ai_image_session)
-        _ai_image_clear_session(context)
-        cancelled = True
-
     # Cancel audiobook adding flow if active
     pending_abook = context.user_data.get("pending_abook")
     if pending_abook and (not user_id or True):  # Audiobook flow is user-specific
@@ -3591,16 +3590,6 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         }
         await _ai_tool_mode_start_session_from_message(update.message, update, context, lang, mode_map[action])
         return True
-    if action == "ai_image":
-        context.user_data["main_menu_section"] = "ai_tools"
-        await update.message.reply_text(
-            m.get(
-                "menu_ai_image_coming_soon",
-                "🖼️ AI Image Generator will be added soon. Thanks for your patience.",
-            ),
-            reply_markup=_main_menu_keyboard(lang, "ai_tools", user_id),
-        )
-        return True
     if action == "back":
         prev = str(context.user_data.get("main_menu_section") or "main")
         if prev in {"admin_maintenance", "admin_duplicates", "admin_tasks", "admin_uploads"}:
@@ -3646,7 +3635,7 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         await movie_upload_command(update, context)
         return True
     if action == "video_downloader":
-        context.user_data["main_menu_section"] = "other"
+        context.user_data["main_menu_section"] = "video_downloader"
         await _video_dl_start_session_from_message(update.message, update, context, lang)
         return True
     if action == "audio_converter":
@@ -4031,7 +4020,6 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ai_quiz_generated",
             "ai_music_generated",
             "ai_pdf_created",
-            "ai_image_generated",
         ]
         counters = await run_blocking(db_get_counters, counter_keys)
 
@@ -4142,7 +4130,6 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- Quiz generated: {counters.get('ai_quiz_generated', 0)}",
             f"- Music generated: {counters.get('ai_music_generated', 0)}",
             f"- PDF created: {counters.get('ai_pdf_created', 0)}",
-            f"- Image generated: {counters.get('ai_image_generated', 0)}",
         ]
 
         lines += [
@@ -5024,15 +5011,6 @@ _ai_chat_builtin_reply = _ai_tools._ai_chat_builtin_reply
 _ai_chat_ollama_reply_blocking = _ai_tools._ai_chat_ollama_reply_blocking
 _ai_chat_start_session_from_message = _ai_tools._ai_chat_start_session_from_message
 _ai_chat_handle_text_input = _ai_tools._ai_chat_handle_text_input
-_AI_IMAGE_SESSION_KEY = _ai_tools._AI_IMAGE_SESSION_KEY
-_ai_image_texts = _ai_tools._ai_image_texts
-_ai_image_clear_session = _ai_tools._ai_image_clear_session
-_ai_image_get_session = _ai_tools._ai_image_get_session
-_ai_image_save_session = _ai_tools._ai_image_save_session
-_ai_image_generate_local_sd_blocking = _ai_tools._ai_image_generate_local_sd_blocking
-_ai_image_send_results = _ai_tools._ai_image_send_results
-_ai_image_start_session_from_message = _ai_tools._ai_image_start_session_from_message
-_ai_image_handle_text_input = _ai_tools._ai_image_handle_text_input
 
 
 # Video downloader extracted module bridge

@@ -96,7 +96,6 @@ def build_help_text(
             f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — matndan PDF tayyorlaydi.",
             f"{m.get('menu_ai_quiz', '📝 AI quiz generator')} — mavzu bo‘yicha Telegram quiz savollar yaratadi.",
             f"{m.get('menu_ai_music', '🎵 AI music generator')} — prompt bo‘yicha instrumental musiqa yaratadi (lokal).",
-            f"{m.get('menu_ai_image', '🖼️ AI rasm yaratish')} — hozircha tez orada qo‘shiladi.",
         ]
         other_lines = [
             f"{m.get('menu_top_books', '🔥 Top kitoblar')} — eng mashhur kitoblar.",
@@ -136,7 +135,6 @@ def build_help_text(
             f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — создание PDF из текста.",
             f"{m.get('menu_ai_quiz', '📝 AI генератор викторины')} — создаёт Telegram quiz-вопросы по теме.",
             f"{m.get('menu_ai_music', '🎵 AI генератор музыки')} — создаёт инструментальную музыку по prompt (локально).",
-            f"{m.get('menu_ai_image', '🖼️ Генератор изображений AI')} — пока будет добавлен позже.",
         ]
         other_lines = [
             f"{m.get('menu_top_books', '🔥 Топ книг')} — самые популярные книги.",
@@ -176,7 +174,6 @@ def build_help_text(
             f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — create a PDF from text.",
             f"{m.get('menu_ai_quiz', '📝 AI Quiz Generator')} — generate Telegram quiz questions from a topic.",
             f"{m.get('menu_ai_music', '🎵 AI Music Generator')} — generate instrumental music from a prompt (local).",
-            f"{m.get('menu_ai_image', '🖼️ AI Image Generator')} — will be added soon.",
         ]
         other_lines = [
             f"{m.get('menu_top_books', '🔥 Top Books')} — most popular books.",
@@ -240,7 +237,6 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_pdf_editor": "PDF siqish, OCR, TXT/EPUB va suv belgisi.",
             "menu_ai_quiz": "mavzu bo'yicha Telegram quiz savollar yaratadi.",
             "menu_ai_music": "prompt bo'yicha instrumental musiqa yaratadi (lokal).",
-            "menu_ai_image": "hozircha tez orada qo'shiladi.",
             "menu_top_books": "eng mashhur kitoblar.",
             "menu_movie_upload": "kinolarni saqlash uchun yuborish.",
             "menu_favorites": "saqlangan kitoblar.",
@@ -265,7 +261,6 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_pdf_editor": "сжатие PDF, OCR, TXT/EPUB и водяной знак.",
             "menu_ai_quiz": "создаёт Telegram quiz-вопросы по теме.",
             "menu_ai_music": "создаёт инструментальную музыку по prompt (локально).",
-            "menu_ai_image": "пока будет добавлен позже.",
             "menu_top_books": "самые популярные книги.",
             "menu_movie_upload": "отправка фильмов для сохранения.",
             "menu_favorites": "сохранённые книги.",
@@ -290,7 +285,6 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_pdf_editor": "compress PDF, OCR, TXT/EPUB, and watermark.",
             "menu_ai_quiz": "generate Telegram quiz questions from a topic.",
             "menu_ai_music": "generate instrumental music from a prompt (local).",
-            "menu_ai_image": "will be added soon.",
             "menu_top_books": "most popular books.",
             "menu_movie_upload": "send movies for storage.",
             "menu_favorites": "saved books.",
@@ -342,7 +336,6 @@ def main_menu_text_action(
         "menu_ai_email_writer": "ai_email_writer",
         "menu_ai_quiz": "ai_quiz",
         "menu_ai_music": "ai_music",
-        "menu_ai_image": "ai_image",
         "menu_back": "back",
     }
     for lang_key in ("uz", "ru", "en"):

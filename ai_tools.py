@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
+import struct
 import time
 import urllib.parse
 import urllib.request
 import uuid
+import wave
 from threading import Lock
 from typing import Any, Awaitable, Callable
 
@@ -1297,6 +1301,41 @@ def _ai_tool_quiz_count_inline_keyboard(selected: int | None = None) -> InlineKe
     return InlineKeyboardMarkup([row])
 
 
+def _ai_tool_quiz_interval_inline_keyboard(selected: int | None = None) -> InlineKeyboardMarkup:
+    row = []
+    for n in _AI_QUIZ_INTERVAL_CHOICES:
+        label = f"✅ {n}s" if int(selected or -1) == n else f"{n}s"
+        row.append(InlineKeyboardButton(label, callback_data=f"aitool:quizinterval:{n}"))
+    return InlineKeyboardMarkup([row])
+
+
+def _ai_tool_music_duration_inline_keyboard(lang_ui: str, selected: int | None = None) -> InlineKeyboardMarkup:
+    msgs = _ai_tool_mode_texts(lang_ui)
+    options = [
+        (_AI_MUSIC_DURATION_CHOICES[0], msgs.get("music_duration_quick", "⚡ Quick")),
+        (_AI_MUSIC_DURATION_CHOICES[1], msgs.get("music_duration_standard", "🎧 Standard")),
+        (_AI_MUSIC_DURATION_CHOICES[2], msgs.get("music_duration_long", "🎼 Long")),
+    ]
+    row = []
+    for seconds, label in options:
+        text_label = f"{label} ({seconds}s)"
+        if int(selected or 0) == int(seconds):
+            text_label = f"✅ {text_label}"
+        row.append(InlineKeyboardButton(text_label, callback_data=f"aitool:musicdur:{seconds}"))
+    return InlineKeyboardMarkup([row])
+
+
+def _ai_tool_music_style_inline_keyboard(lang_ui: str, selected: str | None = None) -> InlineKeyboardMarkup:
+    selected_key = str(selected or "").lower()
+    row = []
+    for style_key in _AI_MUSIC_STYLE_CHOICES:
+        label = _ai_tool_music_style_label(style_key, lang_ui)
+        if style_key == selected_key:
+            label = f"✅ {label}"
+        row.append(InlineKeyboardButton(label, callback_data=f"aitool:musicstyle:{style_key}"))
+    return InlineKeyboardMarkup([row])
+
+
 def _ai_tool_quiz_extract_json_array(text: str) -> list | None:
     raw = str(text or "").strip()
     if not raw:
@@ -1604,6 +1643,91 @@ def _ai_quiz_cancel_tokens(bot_data: dict) -> set:
     return bot_data.setdefault("ai_quiz_cancel_tokens", set())
 
 
+def _ai_music_cancel_tokens(bot_data: dict) -> set:
+    return bot_data.setdefault("ai_music_cancel_tokens", set())
+
+
+async def _ai_tool_quiz_send_polls(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    lang_ui: str,
+    topic: str,
+    questions: list[dict],
+    interval_s: int = 0,
+):
+    msgs = _ai_tool_mode_texts(lang_ui if lang_ui in {"uz", "ru", "en"} else "en")
+    cleaned: list[dict] = []
+    for idx, q in enumerate(list(questions or []), start=1):
+        q_text = str(q.get("question") or f"Question {idx}").strip()[:300]
+        opts = [str(x).strip()[:100] for x in list(q.get("options") or [])[:4] if str(x).strip()]
+        if len(opts) < 2:
+            continue
+        while len(opts) < 4:
+            opts.append(f"Option {len(opts)+1}")
+        try:
+            correct = int(q.get("correct_option_id", 0))
+        except Exception:
+            correct = 0
+        if correct < 0 or correct >= len(opts):
+            correct = 0
+        cleaned.append({
+            "question": q_text,
+            "options": opts,
+            "correct_option_id": correct,
+            "explanation": str(q.get("explanation") or "").strip()[:180],
+        })
+    if not cleaned:
+        raise RuntimeError("quiz_empty")
+
+    interval_s = max(0, min(120, int(interval_s or 0)))
+    run_id = uuid.uuid4().hex
+    poll_map = _ai_quiz_poll_map(context.application.bot_data)
+    runs = _ai_quiz_runs(context.application.bot_data)
+    runs[run_id] = {
+        "chat_id": int(chat_id),
+        "user_id": int(user_id or 0),
+        "total": len(cleaned),
+        "answered": 0,
+        "correct": 0,
+        "poll_ids": [],
+        "answered_poll_ids": set(),
+        "lang_ui": lang_ui,
+        "topic": str(topic or "Quiz")[:200],
+        "created_at": time.time(),
+    }
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=msgs["quiz_ready_intro"].format(topic=str(topic or "Quiz")[:120], count=len(cleaned)),
+    )
+    for idx, q in enumerate(cleaned, start=1):
+        sent = await context.bot.send_poll(
+            chat_id=chat_id,
+            question=q["question"],
+            options=q["options"],
+            type="quiz",
+            correct_option_id=int(q["correct_option_id"]),
+            explanation=q.get("explanation") or None,
+            is_anonymous=False,
+        )
+        poll = getattr(sent, "poll", None)
+        poll_id = str(getattr(poll, "id", "") or "")
+        if poll_id:
+            poll_map[poll_id] = {
+                "run_id": run_id,
+                "user_id": int(user_id or 0),
+                "correct_option_id": int(q["correct_option_id"]),
+            }
+            runs[run_id]["poll_ids"].append(poll_id)
+        if interval_s > 0 and idx < len(cleaned):
+            await asyncio.sleep(interval_s)
+
+    if not runs[run_id]["poll_ids"]:
+        runs.pop(run_id, None)
+        raise RuntimeError("quiz_poll_send_failed")
+
+
 def _ai_quiz_cleanup_stale(bot_data: dict, *, max_age_s: int = 6 * 3600) -> None:
     now = time.time()
     sets = _ai_quiz_sets(bot_data)
@@ -1671,6 +1795,31 @@ def _my_quiz_list_keyboard(
     if nav:
         rows.append(nav)
     return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("·", callback_data="myquiz:none")]])
+
+
+def _my_quiz_source_label(source_kind: str, lang_ui: str) -> str:
+    key = str(source_kind or "topic").lower()
+    if lang_ui == "uz":
+        return {"topic": "mavzu", "prompt": "prompt", "text": "matn", "pdf": "PDF"}.get(key, key or "mavzu")
+    if lang_ui == "ru":
+        return {"topic": "тема", "prompt": "prompt", "text": "текст", "pdf": "PDF"}.get(key, key or "тема")
+    return {"topic": "topic", "prompt": "prompt", "text": "text", "pdf": "PDF"}.get(key, key or "topic")
+
+
+def _my_quiz_list_text(lang_ui: str, quizzes: list[dict], page: int, total: int) -> str:
+    msgs = _ai_tool_mode_texts(lang_ui)
+    pages = max(1, (int(total) + _MY_QUIZ_PAGE_SIZE - 1) // _MY_QUIZ_PAGE_SIZE)
+    lines = [
+        msgs["my_quiz_title"].format(page=page + 1, pages=pages, total=int(total)),
+        msgs["my_quiz_open_prompt"],
+    ]
+    base = int(page) * _MY_QUIZ_PAGE_SIZE
+    for idx, q in enumerate(list(quizzes or []), start=1):
+        name = str(q.get("quiz_name") or "AI Quiz Test")[:80]
+        count = int(q.get("question_count") or 0)
+        source_kind = _my_quiz_source_label(str(q.get("source_kind") or "topic"), lang_ui)
+        lines.append(f"{base + idx}. {name} · {count}Q · {source_kind}")
+    return "\n".join(lines)
 
 
 def _my_quiz_detail_keyboard(lang_ui: str, quiz_id: str, page: int) -> InlineKeyboardMarkup:
@@ -2264,231 +2413,6 @@ async def _ai_chat_handle_text_input(update: Update, context: ContextTypes.DEFAU
     return True
 
 
-_AI_IMAGE_SESSION_KEY = "ai_image_session"
-
-
-def _ai_image_texts(lang: str) -> dict[str, str]:
-    if lang == "uz":
-        return {
-            "greeting": (
-                "🖼️ AI rasm yaratish\n\n"
-                "Rasm uchun prompt yuboring.\n"
-                "Masalan: `cyberpunk city at night, rain, neon lights`\n\n"
-                "Matn yuboring, men lokal model orqali rasm yarataman."
-            ),
-            "thinking": "🖼️ Rasm yaratilmoqda...",
-            "done": "✅ Rasm tayyor.",
-            "cancelled": "AI rasm yaratish yopildi.",
-            "expired": "AI rasm sessiyasi tugadi. Pastdagi `AI Tools` menyusidan qayta oching.",
-            "empty": "Iltimos, prompt yuboring.",
-            "too_long": "Prompt juda uzun. Iltimos, qisqaroq yozing.",
-            "unavailable": "⚠️ Lokal rasm generatori hozir mavjud emas. Keyinroq urinib ko‘ring.",
-            "failed": "⚠️ Rasm yaratishda xatolik yuz berdi. Keyinroq qayta urinib ko‘ring.",
-            "caption": "🖼️ AI rasm",
-        }
-    if lang == "ru":
-        return {
-            "greeting": (
-                "🖼️ Генератор изображений AI\n\n"
-                "Отправьте prompt для изображения.\n"
-                "Например: `cyberpunk city at night, rain, neon lights`\n\n"
-                "Отправьте текст, и я сгенерирую изображение на локальной модели."
-            ),
-            "thinking": "🖼️ Генерирую изображение...",
-            "done": "✅ Изображение готово.",
-            "cancelled": "Генерация AI-изображений закрыта.",
-            "expired": "Сессия генерации изображений истекла. Снова откройте её через `AI Tools`.",
-            "empty": "Пожалуйста, отправьте prompt.",
-            "too_long": "Prompt слишком длинный. Пожалуйста, сократите его.",
-            "unavailable": "⚠️ Локальный генератор изображений сейчас недоступен. Попробуйте позже.",
-            "failed": "⚠️ Не удалось сгенерировать изображение. Попробуйте позже.",
-            "caption": "🖼️ AI изображение",
-        }
-    return {
-        "greeting": (
-            "🖼️ AI Image Generator\n\n"
-            "Send an image prompt.\n"
-            "Example: `cyberpunk city at night, rain, neon lights`\n\n"
-            "Send text and I’ll generate an image with a local model."
-        ),
-        "thinking": "🖼️ Generating image...",
-        "done": "✅ Image ready.",
-        "cancelled": "AI image generation closed.",
-        "expired": "AI image session expired. Please open it again from `AI Tools`.",
-        "empty": "Please send a prompt.",
-        "too_long": "Prompt is too long. Please shorten it.",
-        "unavailable": "⚠️ Local image generator is unavailable right now. Please try again later.",
-        "failed": "⚠️ Image generation failed. Please try again later.",
-        "caption": "🖼️ AI image",
-    }
-
-
-def _ai_image_clear_session(context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop(_AI_IMAGE_SESSION_KEY, None)
-
-
-def _ai_image_get_session(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
-    raw = context.user_data.get(_AI_IMAGE_SESSION_KEY)
-    return raw if isinstance(raw, dict) else None
-
-
-def _ai_image_save_session(context: ContextTypes.DEFAULT_TYPE, session: dict):
-    context.user_data[_AI_IMAGE_SESSION_KEY] = dict(session)
-
-
-def _ai_image_generate_local_sd_blocking(prompt: str) -> tuple[list[bytes], dict]:
-    base_url = os.getenv("AI_IMAGE_SD_API_URL", "http://127.0.0.1:7860").rstrip("/")
-    timeout_s = float(os.getenv("AI_IMAGE_TIMEOUT", "180"))
-    width = max(256, min(1280, int(os.getenv("AI_IMAGE_WIDTH", "768"))))
-    height = max(256, min(1280, int(os.getenv("AI_IMAGE_HEIGHT", "768"))))
-    steps = max(10, min(80, int(os.getenv("AI_IMAGE_STEPS", "28"))))
-    cfg = max(1.0, min(20.0, float(os.getenv("AI_IMAGE_CFG", "7"))))
-    count = max(1, min(3, int(os.getenv("AI_IMAGE_COUNT", "1"))))
-    sampler = os.getenv("AI_IMAGE_SAMPLER", "DPM++ 2M Karras")
-    negative_prompt = os.getenv(
-        "AI_IMAGE_NEGATIVE_PROMPT",
-        "low quality, blurry, deformed, extra fingers, watermark, text",
-    )
-    checkpoint = os.getenv("AI_IMAGE_SD_CHECKPOINT", "").strip()
-    payload = {
-        "prompt": (prompt or "").strip()[:1200],
-        "negative_prompt": negative_prompt,
-        "steps": steps,
-        "cfg_scale": cfg,
-        "width": width,
-        "height": height,
-        "sampler_name": sampler,
-        "batch_size": count,
-        "n_iter": 1,
-    }
-    if checkpoint:
-        payload["override_settings"] = {"sd_model_checkpoint": checkpoint}
-        payload["override_settings_restore_afterwards"] = True
-    req = urllib.request.Request(
-        f"{base_url}/sdapi/v1/txt2img",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    images_raw = (data or {}).get("images") or []
-    out: list[bytes] = []
-    for item in images_raw:
-        raw = str(item or "").strip()
-        if not raw:
-            continue
-        if "," in raw and raw.lower().startswith("data:image"):
-            raw = raw.split(",", 1)[1]
-        try:
-            out.append(base64.b64decode(raw))
-        except Exception:
-            continue
-    if not out:
-        raise RuntimeError("empty image response")
-    return out, {"backend": "sdwebui", "count": len(out), "width": width, "height": height}
-
-
-async def _ai_image_send_results(update: Update, images: list[bytes], caption: str, lang_ui: str) -> bool:
-    target_message = update.message or (update.callback_query.message if update.callback_query else None)
-    if not target_message:
-        return False
-    sent_any = False
-    for idx, img in enumerate(images):
-        bio = io.BytesIO(img)
-        bio.name = f"ai_image_{idx+1}.png"
-        try:
-            await _send_with_retry(
-                lambda bio=bio, cap=(caption if idx == 0 else None): target_message.reply_photo(
-                    photo=bio,
-                    caption=cap,
-                    reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", target_message.chat_id),
-                )
-            )
-            sent_any = True
-        except Exception as e:
-            logger.error("Failed to send ai image result: %s", e)
-    return sent_any
-
-
-async def _ai_image_start_session_from_message(target_message, update: Update, context: ContextTypes.DEFAULT_TYPE, lang_ui: str):
-    _ai_image_clear_session(context)
-    session = {
-        "user_id": update.effective_user.id if update.effective_user else None,
-        "active": True,
-        "expires_at": time.time() + 3600,
-    }
-    _ai_image_save_session(context, session)
-    msgs = _ai_image_texts(lang_ui)
-    uid = update.effective_user.id if update.effective_user else None
-    sent = await _send_with_retry(lambda: target_message.reply_text(msgs["greeting"], reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid)))
-    if sent:
-        session["prompt_chat_id"] = sent.chat_id
-        session["prompt_message_id"] = sent.message_id
-        _ai_image_save_session(context, session)
-
-
-async def _ai_image_handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_ui: str) -> bool:
-    if not update.message or not update.message.text:
-        return False
-    session = _ai_image_get_session(context)
-    if not session or not bool(session.get("active")):
-        return False
-    if update.effective_user and session.get("user_id") and int(session.get("user_id")) != int(update.effective_user.id):
-        return False
-    msgs = _ai_image_texts(lang_ui)
-    if time.time() > float(session.get("expires_at", 0) or 0):
-        _ai_image_clear_session(context)
-        uid = update.effective_user.id if update.effective_user else None
-        await update.message.reply_text(msgs["expired"], reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
-        return True
-    prompt = (update.message.text or "").strip()
-    if prompt.lower() in {"cancel", "stop"}:
-        _ai_image_clear_session(context)
-        uid = update.effective_user.id if update.effective_user else None
-        await update.message.reply_text(msgs["cancelled"], reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
-        return True
-    if not prompt:
-        await update.message.reply_text(msgs["empty"])
-        return True
-    if len(prompt) > 1200:
-        await update.message.reply_text(msgs["too_long"])
-        return True
-
-    session["expires_at"] = time.time() + 3600
-    _ai_image_save_session(context, session)
-    status = await _send_with_retry(lambda: update.message.reply_text(msgs["thinking"]))
-    try:
-        images, meta = await run_blocking_heavy(_ai_image_generate_local_sd_blocking, prompt)
-    except Exception as e:
-        logger.info("ai_image local generator unavailable/failure: %s", e)
-        fail_text = msgs["unavailable"] if any(k in str(e).lower() for k in ["urlopen", "connection", "refused", "timed out", "404"]) else msgs["failed"]
-        if status:
-            try:
-                await status.edit_text(fail_text)
-            except Exception:
-                pass
-        else:
-            await update.message.reply_text(fail_text)
-        return True
-
-    caption = msgs["caption"]
-    wh = f"{meta.get('width')}x{meta.get('height')}" if meta.get("width") and meta.get("height") else ""
-    if wh:
-        caption += f"\n📐 {wh}"
-    short_prompt = " ".join(prompt.split())
-    if short_prompt:
-        caption += f"\n📝 {short_prompt[:200]}"
-    sent_any = await _ai_image_send_results(update, images, caption, lang_ui)
-    if sent_any:
-        _ai_schedule_counter_increment(context, "ai_image_generated", 1)
-    if status:
-        try:
-            await status.edit_text(msgs["done"] if sent_any else MESSAGES[lang_ui]["error"])
-        except Exception:
-            pass
-    return True
-
 
 def _ai_tool_grammar_fix_blocking(user_text: str, reply_lang_hint: str) -> str:
     prompt = (
@@ -2516,6 +2440,53 @@ def _ai_tool_email_writer_blocking(user_text: str, reply_lang_hint: str) -> str:
     return _ai_chat_postprocess_reply(out, user_text)
 
 
+def _ai_tool_music_generate_wav_blocking(prompt: str, duration_s: int, style_key: str) -> bytes:
+    duration_s = max(5, min(60, int(duration_s or 15)))
+    style = str(style_key or "lofi").lower()
+    sample_rate = 22050
+    total_samples = int(sample_rate * duration_s)
+    seed = hashlib.sha256(f"{style}|{prompt}".encode("utf-8", errors="ignore")).digest()
+    base = 150.0 + float(seed[0] % 180)
+    shifts = [0.0, 1.26, 1.5, 1.89]
+    if style == "romantic":
+        shifts = [0.0, 1.25, 1.6, 2.0]
+    elif style == "calm":
+        shifts = [0.0, 1.2, 1.4, 1.7]
+    elif style == "epic":
+        shifts = [0.0, 1.33, 1.78, 2.24]
+    beat_len = {"lofi": 0.80, "romantic": 0.68, "calm": 1.10, "epic": 0.46}.get(style, 0.8)
+    gain = {"lofi": 0.33, "romantic": 0.34, "calm": 0.28, "epic": 0.38}.get(style, 0.32)
+
+    pcm = bytearray()
+    for i in range(total_samples):
+        t = i / sample_rate
+        seg = int(t / beat_len) % 4
+        f = base * shifts[seg]
+        wobble = 1.0 + 0.01 * math.sin(2.0 * math.pi * 0.9 * t)
+        s1 = math.sin(2.0 * math.pi * (f * wobble) * t)
+        s2 = math.sin(2.0 * math.pi * (f * 0.5) * t)
+        s3 = math.sin(2.0 * math.pi * (f * 2.0) * t)
+        sample = 0.62 * s1 + 0.22 * s2 + 0.16 * s3
+        if style == "epic":
+            sample += 0.10 * math.sin(2.0 * math.pi * 55.0 * t)
+        elif style == "lofi":
+            sample += 0.03 * math.sin(2.0 * math.pi * 3.0 * t)
+
+        fade_in = min(1.0, t / 0.25)
+        fade_out = min(1.0, max(0.0, (duration_s - t) / 0.45))
+        env = min(fade_in, fade_out)
+        sample = max(-1.0, min(1.0, sample * gain * env))
+        pcm.extend(struct.pack("<h", int(sample * 32767.0)))
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(bytes(pcm))
+    return buf.getvalue()
+
+
 async def _ai_tool_mode_start_session_from_message(
     target_message,
     update: Update,
@@ -2534,9 +2505,20 @@ async def _ai_tool_mode_start_session_from_message(
     }
     if mode == "translator":
         session["target_lang"] = "en"
+    elif mode == "quiz":
+        session["quiz_count"] = int(_AI_QUIZ_COUNT_CHOICES[1])
+        session["quiz_interval_s"] = int(_AI_QUIZ_INTERVAL_CHOICES[0])
+        session["quiz_source_kind"] = "topic"
+    elif mode == "music":
+        session["music_kind"] = "sound"
+        session["music_duration_s"] = int(_AI_MUSIC_DURATION_CHOICES[1])
+        session["music_style"] = _AI_MUSIC_STYLE_CHOICES[0]
     _ai_tool_mode_save_session(context, session)
+
+    msgs = _ai_tool_mode_texts(lang_ui)
     prompt_text = _ai_tool_mode_prompt(mode, lang_ui)
     uid = update.effective_user.id if update.effective_user else None
+
     if mode == "translator":
         await _send_with_retry(
             lambda: target_message.reply_text(
@@ -2546,8 +2528,46 @@ async def _ai_tool_mode_start_session_from_message(
         )
         await _send_with_retry(
             lambda: target_message.reply_text(
-                _ai_tool_mode_texts(lang_ui).get("translator_pick_target_short", "Select target language"),
+                msgs.get("translator_pick_target_short", "Select target language"),
                 reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
+            )
+        )
+    elif mode == "quiz":
+        await _send_with_retry(
+            lambda: target_message.reply_text(
+                msgs.get("quiz_prompt_topic", prompt_text),
+                reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
+            )
+        )
+        await _send_with_retry(
+            lambda: target_message.reply_text(
+                msgs.get("quiz_choose_count", "Choose question count").format(topic="Quiz"),
+                reply_markup=_ai_tool_quiz_count_inline_keyboard(int(session.get("quiz_count") or 5)),
+            )
+        )
+        await _send_with_retry(
+            lambda: target_message.reply_text(
+                msgs.get("quiz_choose_interval", "Choose interval"),
+                reply_markup=_ai_tool_quiz_interval_inline_keyboard(int(session.get("quiz_interval_s") or 0)),
+            )
+        )
+    elif mode == "music":
+        await _send_with_retry(
+            lambda: target_message.reply_text(
+                _ai_tool_music_prompt_text(lang_ui, str(session.get("music_kind") or "sound")),
+                reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
+            )
+        )
+        await _send_with_retry(
+            lambda: target_message.reply_text(
+                msgs.get("music_choose_duration", "Choose duration"),
+                reply_markup=_ai_tool_music_duration_inline_keyboard(lang_ui, int(session.get("music_duration_s") or 15)),
+            )
+        )
+        await _send_with_retry(
+            lambda: target_message.reply_text(
+                msgs.get("music_style_choose_first", "Choose style"),
+                reply_markup=_ai_tool_music_style_inline_keyboard(lang_ui, str(session.get("music_style") or "lofi")),
             )
         )
     else:
@@ -2695,7 +2715,163 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                 await update.message.reply_text(msgs["failed"])
         return True
 
-    # Other modes are handled by dedicated flows or callbacks.
+    if mode == "quiz":
+        if not user_text:
+            await update.message.reply_text(msgs.get("quiz_send_topic_first", msgs["empty"]))
+            return True
+        count = max(1, min(10, int(session.get("quiz_count") or 5)))
+        interval_s = max(0, min(120, int(session.get("quiz_interval_s") or 0)))
+        source_kind = str(session.get("quiz_source_kind") or "topic")
+        source_text = user_text[:500]
+        session["quiz_source_text"] = source_text
+        gen_token = uuid.uuid4().hex
+        session["quiz_generation_token"] = gen_token
+        _ai_tool_mode_save_session(context, session)
+        status = await _send_with_retry(lambda: update.message.reply_text(msgs.get("quiz_generating", msgs["thinking"])))
+        try:
+            questions = await run_blocking_heavy(
+                _ai_tool_quiz_generate_blocking,
+                source_kind,
+                source_text,
+                count,
+                lang_ui,
+            )
+            cancel_set = _ai_quiz_cancel_tokens(context.application.bot_data)
+            if gen_token in cancel_set:
+                cancel_set.discard(gen_token)
+                if status:
+                    try:
+                        await status.edit_text(msgs["cancelled"])
+                    except Exception:
+                        pass
+                return True
+
+            quiz_id = uuid.uuid4().hex
+            quiz_name = f"AI Quiz: {source_text[:80]}" if source_text else "AI Quiz Test"
+            if callable(_db_save_user_quiz) and update.effective_user:
+                await run_blocking(
+                    _db_save_user_quiz,
+                    quiz_id,
+                    int(update.effective_user.id),
+                    quiz_name,
+                    source_kind,
+                    source_text,
+                    lang_ui,
+                    interval_s,
+                    questions,
+                )
+
+            _ai_quiz_sets(context.application.bot_data)[quiz_id] = {
+                "quiz_id": quiz_id,
+                "quiz_name": quiz_name,
+                "topic": source_text,
+                "questions": questions,
+                "lang_ui": lang_ui,
+                "count": len(questions),
+                "interval_s": interval_s,
+                "created_at": time.time(),
+                "created_chat_id": int(update.effective_chat.id if update.effective_chat else 0),
+            }
+            _ai_quiz_cleanup_stale(context.application.bot_data)
+
+            minutes = max(1, int(round(len(questions) * 1.5)))
+            card_caption = msgs["quiz_card_caption"].format(
+                name=quiz_name[:120],
+                topic=source_text[:120] or "Quiz",
+                count=len(questions),
+                minutes=minutes,
+                interval=interval_s,
+            )
+            bot_username = getattr(getattr(context, "bot", None), "username", None)
+            if status:
+                try:
+                    await status.edit_text(msgs["quiz_card_ready"].format(topic=source_text[:120] or "Quiz"))
+                except Exception:
+                    pass
+            await update.message.reply_text(
+                card_caption,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=_ai_tool_quiz_card_inline_keyboard(
+                    lang_ui=lang_ui,
+                    quiz_id=quiz_id,
+                    bot_username=bot_username,
+                    topic=source_text,
+                    count=len(questions),
+                ),
+            )
+            _ai_schedule_counter_increment(context, "ai_quiz_generated", 1)
+        except Exception as e:
+            logger.exception("ai quiz generation failed: %s", e)
+            if status:
+                try:
+                    await status.edit_text(msgs["failed"])
+                except Exception:
+                    pass
+            else:
+                await update.message.reply_text(msgs["failed"])
+        return True
+
+    if mode == "music":
+        if not user_text:
+            await update.message.reply_text(msgs.get("music_prompt_hint", msgs["empty"]))
+            return True
+        duration_s = max(5, min(60, int(session.get("music_duration_s") or _AI_MUSIC_DURATION_CHOICES[1])))
+        style_key = str(session.get("music_style") or _AI_MUSIC_STYLE_CHOICES[0]).lower()
+        if style_key not in _AI_MUSIC_STYLE_CHOICES:
+            style_key = _AI_MUSIC_STYLE_CHOICES[0]
+        gen_token = uuid.uuid4().hex
+        session["music_generation_token"] = gen_token
+        _ai_tool_mode_save_session(context, session)
+        status = await _send_with_retry(lambda: update.message.reply_text(msgs.get("music_generating", msgs["thinking"])))
+        try:
+            wav_bytes = await run_blocking_heavy(_ai_tool_music_generate_wav_blocking, user_text, duration_s, style_key)
+            cancel_set = _ai_music_cancel_tokens(context.application.bot_data)
+            if gen_token in cancel_set:
+                cancel_set.discard(gen_token)
+                if status:
+                    try:
+                        await status.edit_text(msgs["cancelled"])
+                    except Exception:
+                        pass
+                return True
+
+            style_label = _ai_tool_music_style_label(style_key, lang_ui)
+            caption = msgs.get("music_caption", "🎵 AI music\n⏱️ {seconds}s\n📝 {prompt}").format(
+                seconds=duration_s,
+                prompt=user_text[:140],
+            ) + f"\n🎨 {style_label}"
+
+            audio_bio = io.BytesIO(wav_bytes)
+            audio_bio.name = "ai_music.wav"
+            await _send_with_retry(
+                lambda: update.message.reply_audio(
+                    audio=audio_bio,
+                    caption=caption,
+                    title="AI Music",
+                    performer="SmartAIToolsBot",
+                    reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
+                )
+            )
+            if status:
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
+            _ai_schedule_counter_increment(context, "ai_music_generated", 1)
+        except Exception as e:
+            logger.exception("ai music generation failed: %s", e)
+            fail_text = msgs.get("music_failed", msgs["failed"])
+            if status:
+                try:
+                    await status.edit_text(fail_text)
+                except Exception:
+                    pass
+            else:
+                await update.message.reply_text(fail_text)
+        return True
+
+    # Unknown or not implemented mode.
     return False
 
 
@@ -2706,9 +2882,17 @@ async def handle_ai_tools_callback(update: Update, context: ContextTypes.DEFAULT
     lang_ui = str(context.user_data.get("language") or "en")
     if lang_ui not in {"uz", "ru", "en"}:
         lang_ui = "en"
+    msgs = _ai_tool_mode_texts(lang_ui)
+
     data = str(query.data or "")
     parts = data.split(":")
-    if len(parts) >= 3 and parts[1] == "trgt":
+    if len(parts) < 2 or parts[0] != "aitool":
+        await safe_answer(query)
+        return
+
+    action = parts[1]
+
+    if action == "trgt" and len(parts) >= 3:
         target = str(parts[2]).lower()
         if target not in {"uz", "ru", "en"}:
             await safe_answer(query)
@@ -2724,7 +2908,6 @@ async def handle_ai_tools_callback(update: Update, context: ContextTypes.DEFAULT
             }
         )
         _ai_tool_mode_save_session(context, session)
-        msgs = _ai_tool_mode_texts(lang_ui)
         await safe_answer(
             query,
             msgs.get("translator_target_set", "Target language set: {target}").format(
@@ -2740,5 +2923,187 @@ async def handle_ai_tools_callback(update: Update, context: ContextTypes.DEFAULT
             pass
         return
 
-    # Keep callbacks graceful for currently unsupported actions in this compact compatibility layer.
+    if action == "quizcount" and len(parts) >= 3:
+        try:
+            count = int(parts[2])
+        except Exception:
+            count = 5
+        count = max(1, min(10, count))
+        session = _ai_tool_mode_get_session(context) or {}
+        session.update(
+            {
+                "mode": "quiz",
+                "active": True,
+                "quiz_count": count,
+                "user_id": query.from_user.id if query.from_user else None,
+                "expires_at": time.time() + 3600,
+            }
+        )
+        _ai_tool_mode_save_session(context, session)
+        await safe_answer(query, msgs.get("quiz_choose_interval", "Choose interval")[:180], show_alert=False)
+        try:
+            await query.edit_message_reply_markup(reply_markup=_ai_tool_quiz_count_inline_keyboard(count))
+        except Exception:
+            pass
+        return
+
+    if action == "quizinterval" and len(parts) >= 3:
+        try:
+            interval_s = int(parts[2])
+        except Exception:
+            interval_s = 0
+        interval_s = max(0, min(120, interval_s))
+        session = _ai_tool_mode_get_session(context) or {}
+        session.update(
+            {
+                "mode": "quiz",
+                "active": True,
+                "quiz_interval_s": interval_s,
+                "user_id": query.from_user.id if query.from_user else None,
+                "expires_at": time.time() + 3600,
+            }
+        )
+        _ai_tool_mode_save_session(context, session)
+        await safe_answer(
+            query,
+            msgs.get("quiz_interval_set", "Interval set: {seconds}s").format(seconds=interval_s)[:180],
+            show_alert=False,
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=_ai_tool_quiz_interval_inline_keyboard(interval_s))
+        except Exception:
+            pass
+        return
+
+    if action == "musicdur" and len(parts) >= 3:
+        try:
+            duration_s = int(parts[2])
+        except Exception:
+            duration_s = _AI_MUSIC_DURATION_CHOICES[1]
+        if duration_s not in _AI_MUSIC_DURATION_CHOICES:
+            duration_s = _AI_MUSIC_DURATION_CHOICES[1]
+        session = _ai_tool_mode_get_session(context) or {}
+        session.update(
+            {
+                "mode": "music",
+                "active": True,
+                "music_duration_s": duration_s,
+                "user_id": query.from_user.id if query.from_user else None,
+                "expires_at": time.time() + 3600,
+            }
+        )
+        _ai_tool_mode_save_session(context, session)
+        await safe_answer(
+            query,
+            msgs.get("music_duration_set", "Duration selected: {seconds}s").format(seconds=duration_s)[:180],
+            show_alert=False,
+        )
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_ai_tool_music_duration_inline_keyboard(lang_ui, duration_s)
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "musicstyle" and len(parts) >= 3:
+        style_key = str(parts[2]).lower()
+        if style_key not in _AI_MUSIC_STYLE_CHOICES:
+            await safe_answer(query)
+            return
+        session = _ai_tool_mode_get_session(context) or {}
+        session.update(
+            {
+                "mode": "music",
+                "active": True,
+                "music_style": style_key,
+                "user_id": query.from_user.id if query.from_user else None,
+                "expires_at": time.time() + 3600,
+            }
+        )
+        _ai_tool_mode_save_session(context, session)
+        await safe_answer(
+            query,
+            msgs.get("music_style_set", "Style selected: {style}").format(
+                style=_ai_tool_music_style_label(style_key, lang_ui)
+            )[:180],
+            show_alert=False,
+        )
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_ai_tool_music_style_inline_keyboard(lang_ui, style_key)
+            )
+        except Exception:
+            pass
+        return
+
+    if action in {"quizstart", "quizgroup", "quizshare"} and len(parts) >= 3:
+        quiz_id = str(parts[2] or "").strip()
+        quiz = _ai_quiz_sets(context.application.bot_data).get(quiz_id)
+        if not quiz and callable(_db_get_user_quiz):
+            try:
+                db_quiz = await run_blocking(_db_get_user_quiz, quiz_id, None)
+            except Exception:
+                db_quiz = None
+            if db_quiz:
+                quiz = {
+                    "quiz_id": quiz_id,
+                    "quiz_name": db_quiz.get("quiz_name") or "AI Quiz Test",
+                    "topic": db_quiz.get("source_preview") or db_quiz.get("quiz_name") or "Quiz",
+                    "questions": list(db_quiz.get("questions") or []),
+                    "lang_ui": db_quiz.get("lang_ui") or lang_ui,
+                    "count": int(db_quiz.get("question_count") or len(db_quiz.get("questions") or [])),
+                    "interval_s": int(db_quiz.get("interval_s") or 0),
+                    "created_at": time.time(),
+                }
+                _ai_quiz_sets(context.application.bot_data)[quiz_id] = quiz
+
+        if not quiz:
+            await safe_answer(query, msgs.get("quiz_card_expired", "Quiz expired")[:180], show_alert=True)
+            return
+
+        if action == "quizgroup":
+            await safe_answer(query, msgs.get("quiz_group_hint", "Forward to group")[:180], show_alert=True)
+            return
+
+        if action == "quizshare":
+            try:
+                target_chat_id = query.message.chat_id if query.message else update.effective_chat.id
+                await _my_quiz_send_shareable_card(context, target_chat_id, {
+                    "id": quiz_id,
+                    "quiz_name": quiz.get("quiz_name") or "AI Quiz Test",
+                    "source_preview": quiz.get("topic") or "Quiz",
+                    "question_count": int(quiz.get("count") or len(quiz.get("questions") or [])),
+                    "interval_s": int(quiz.get("interval_s") or 0),
+                    "questions": list(quiz.get("questions") or []),
+                }, lang_ui)
+                await safe_answer(query, msgs.get("quiz_share_hint", "Shared")[:180], show_alert=False)
+            except Exception:
+                logger.exception("quiz share callback failed")
+                await safe_answer(query)
+            return
+
+        try:
+            chat_id = query.message.chat_id if query.message else update.effective_chat.id
+            await _ai_tool_quiz_send_polls(
+                context=context,
+                chat_id=int(chat_id),
+                user_id=int(query.from_user.id if query.from_user else 0),
+                lang_ui=str(quiz.get("lang_ui") or lang_ui),
+                topic=str(quiz.get("topic") or "Quiz"),
+                questions=list(quiz.get("questions") or []),
+                interval_s=int(quiz.get("interval_s") or 0),
+            )
+            if callable(_db_mark_user_quiz_started):
+                try:
+                    await run_blocking(_db_mark_user_quiz_started, quiz_id)
+                except Exception:
+                    logger.exception("quiz mark started failed")
+            await safe_answer(query)
+        except Exception:
+            logger.exception("quiz start callback failed")
+            await safe_answer(query, msgs.get("failed", "Failed")[:180], show_alert=True)
+        return
+
     await safe_answer(query)
+

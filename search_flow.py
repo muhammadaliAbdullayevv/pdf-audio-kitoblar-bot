@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -23,13 +24,106 @@ logger = logging.getLogger(__name__)
 
 # Import Redis cache for performance
 try:
-    from cache import cache_get, cache_set, cache_delete
+    from cache import cache_get, cache_set, cache_delete, cache_clear_pattern
     REDIS_CACHE_AVAILABLE = True
 except ImportError:
     REDIS_CACHE_AVAILABLE = False
     cache_get = lambda k: None
     cache_set = lambda k, v, ttl=300: False
     cache_delete = lambda k: False
+    cache_clear_pattern = lambda p: 0
+
+
+def _ttl_value(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        raw = globals().get(name, None)
+        if raw is None:
+            raw = os.getenv(name, str(default))
+        return max(minimum, int(raw))
+    except Exception:
+        return max(minimum, int(default))
+
+
+def _search_cache_namespace() -> str:
+    return str(globals().get("SEARCH_CACHE_NS", os.getenv("SEARCH_CACHE_NS", "v1")) or "v1")
+
+
+def _query_fingerprint(query: str) -> str:
+    text = str(query or "").strip().lower()
+    if not text:
+        return "empty"
+    norm_fn = globals().get("normalize")
+    if callable(norm_fn):
+        try:
+            normalized = str(norm_fn(text)).strip().lower()
+            if normalized:
+                text = normalized
+        except Exception:
+            pass
+    text = re.sub(r"\s+", " ", text).strip()
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _book_search_entries_key(query: str) -> str:
+    ns = _search_cache_namespace()
+    return f"search:books:entries:{ns}:{_query_fingerprint(query)}"
+
+
+def _movie_search_entries_key(query: str) -> str:
+    ns = _search_cache_namespace()
+    return f"search:movies:entries:{ns}:{_query_fingerprint(query)}"
+
+
+def get_cached_book_search_entries(query: str) -> list[dict[str, str]] | None:
+    if not REDIS_CACHE_AVAILABLE:
+        return None
+    payload = cache_get(_book_search_entries_key(query))
+    if isinstance(payload, dict):
+        payload = payload.get("entries")
+    if not isinstance(payload, list):
+        return None
+    entries: list[dict[str, str]] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("id") or "").strip()
+        title = str(row.get("title") or "").strip()
+        if rid and title:
+            entries.append({"id": rid, "title": title})
+    return entries or None
+
+
+def set_cached_book_search_entries(query: str, entries: list[dict[str, str]]) -> None:
+    if not REDIS_CACHE_AVAILABLE or not entries:
+        return
+    ttl = _ttl_value("BOOK_SEARCH_RESULT_CACHE_TTL", 120, minimum=10)
+    cache_set(_book_search_entries_key(query), {"entries": entries}, ttl=ttl)
+
+
+def get_cached_movie_search_entries(query: str) -> list[dict[str, str]] | None:
+    if not REDIS_CACHE_AVAILABLE:
+        return None
+    payload = cache_get(_movie_search_entries_key(query))
+    if isinstance(payload, dict):
+        payload = payload.get("entries")
+    if not isinstance(payload, list):
+        return None
+    entries: list[dict[str, str]] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("id") or "").strip()
+        title = str(row.get("title") or "").strip()
+        if rid and title:
+            entries.append({"id": rid, "title": title})
+    return entries or None
+
+
+def set_cached_movie_search_entries(query: str, entries: list[dict[str, str]]) -> None:
+    if not REDIS_CACHE_AVAILABLE or not entries:
+        return
+    ttl = _ttl_value("MOVIE_SEARCH_RESULT_CACHE_TTL", 180, minimum=10)
+    cache_set(_movie_search_entries_key(query), {"entries": entries}, ttl=ttl)
 
 
 def configure(deps: dict[str, Any]) -> None:
@@ -236,6 +330,15 @@ def get_top_cache(context: ContextTypes.DEFAULT_TYPE, query_id: str):
 
 
 def get_cached_top_entries(context: ContextTypes.DEFAULT_TYPE):
+    if REDIS_CACHE_AVAILABLE:
+        cached = cache_get("top:books:entries")
+        if isinstance(cached, dict):
+            cached_entries = cached.get("entries")
+            if isinstance(cached_entries, list):
+                return cached_entries
+        elif isinstance(cached, list):
+            return cached
+
     cache = context.application.bot_data.get("top_entries_cache")
     if not cache:
         return None
@@ -245,6 +348,10 @@ def get_cached_top_entries(context: ContextTypes.DEFAULT_TYPE):
 
 
 def set_cached_top_entries(context: ContextTypes.DEFAULT_TYPE, entries: list):
+    if REDIS_CACHE_AVAILABLE:
+        ttl = _ttl_value("TOP_CACHE_TTL", 60, minimum=5)
+        cache_set("top:books:entries", {"entries": entries}, ttl=ttl)
+
     context.application.bot_data["top_entries_cache"] = {
         "entries": entries,
         "ts": time.time(),
@@ -252,6 +359,9 @@ def set_cached_top_entries(context: ContextTypes.DEFAULT_TYPE, entries: list):
 
 
 def invalidate_top_caches(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if REDIS_CACHE_AVAILABLE:
+        cache_delete("top:books:entries")
+        cache_clear_pattern("top_results:*")
     try:
         context.application.bot_data.pop("top_entries_cache", None)
     except Exception:
@@ -263,6 +373,16 @@ def invalidate_top_caches(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def get_cached_audit_report(context: ContextTypes.DEFAULT_TYPE, lang: str):
+    if REDIS_CACHE_AVAILABLE:
+        cache_key = f"audit:report:{lang}"
+        payload = cache_get(cache_key)
+        if isinstance(payload, dict):
+            text = payload.get("text")
+            if isinstance(text, str) and text.strip():
+                return text
+        elif isinstance(payload, str) and payload.strip():
+            return payload
+
     cache = context.application.bot_data.get("audit_cache", {})
     entry = cache.get(lang)
     if not entry:
@@ -273,6 +393,10 @@ def get_cached_audit_report(context: ContextTypes.DEFAULT_TYPE, lang: str):
 
 
 def set_cached_audit_report(context: ContextTypes.DEFAULT_TYPE, lang: str, text: str):
+    if REDIS_CACHE_AVAILABLE and text:
+        ttl = _ttl_value("AUDIT_CACHE_TTL", 30, minimum=5)
+        cache_set(f"audit:report:{lang}", {"text": text}, ttl=ttl)
+
     cache = context.application.bot_data.setdefault("audit_cache", {})
     cache[lang] = {"text": text, "ts": time.time()}
 
@@ -1806,9 +1930,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await _ai_tool_mode_handle_text_input(update, context, lang):
             return
 
-        if await _ai_image_handle_text_input(update, context, lang):
-            return
-
         if await _video_dl_handle_text_input(update, context, lang):
             return
 
@@ -1888,12 +2009,15 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _schedule_bg_task(context, _record_movie_search_analytics())
 
             entries: list[dict[str, str]] = []
+            cached_movie_entries = get_cached_movie_search_entries(movie_query)
+            if cached_movie_entries:
+                entries = cached_movie_entries[:MAX_SEARCH_RESULTS]
 
             cleaned_movie_query = normalize(movie_query).lower()
             translit_movie_query = transliterate_to_latin(cleaned_movie_query) if cleaned_movie_query else ""
 
             # Prefer ES movie index for better search quality; fallback to DB when needed.
-            if cleaned_movie_query and es_available():
+            if not entries and cleaned_movie_query and es_available():
                 es_results = await run_blocking(search_movies_es, cleaned_movie_query, MAX_SEARCH_RESULTS)
                 if translit_movie_query and translit_movie_query != cleaned_movie_query:
                     es_results += await run_blocking(search_movies_es, translit_movie_query, MAX_SEARCH_RESULTS)
@@ -1931,6 +2055,8 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "id": mid,
                             "title": title,
                         })
+                if entries:
+                    set_cached_movie_search_entries(movie_query, entries)
             entries = entries[:MAX_SEARCH_RESULTS]
 
             if not entries:
@@ -2015,14 +2141,16 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         translit_query = transliterate_to_latin(cleaned_query)
 
+        entries = get_cached_book_search_entries(query) or []
+        entries = entries[:MAX_SEARCH_RESULTS]
         results = []
 
         # --- Search in ES if available ---
-        if es_available():
+        if not entries and es_available():
             results += await run_blocking(search_es, cleaned_query)  # raw Cyrillic or Latin
             if translit_query != cleaned_query:
                 results += await run_blocking(search_es, translit_query)  # transliterated Latin
-        else:
+        elif not entries:
             books = await run_blocking(load_books)
             # --- Fallback: local substring search ---
             results += [(b, 1.0, b.get("id")) for b in books if cleaned_query in b["book_name"].lower()]
@@ -2030,17 +2158,20 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 results += [(b, 1.0, b.get("id")) for b in books if translit_query in b["book_name"].lower()]
 
         # ✅ Deduplicate by UUID and build entries
-        unique_matches = {}
-        for book, score, es_id in results:
-            book_id = str(book.get("id") or es_id).strip() if book else None
-            if not book_id:
-                continue
-            title = get_result_title(book)
-            if book_id not in unique_matches or score > unique_matches[book_id]["score"]:
-                unique_matches[book_id] = {"id": book_id, "title": title, "score": score}
+        if not entries:
+            unique_matches = {}
+            for book, score, es_id in results:
+                book_id = str(book.get("id") or es_id).strip() if book else None
+                if not book_id:
+                    continue
+                title = get_result_title(book)
+                if book_id not in unique_matches or score > unique_matches[book_id]["score"]:
+                    unique_matches[book_id] = {"id": book_id, "title": title, "score": score}
 
-        entries = sorted(unique_matches.values(), key=lambda e: e["score"], reverse=True)
-        entries = entries[:MAX_SEARCH_RESULTS]
+            entries = sorted(unique_matches.values(), key=lambda e: e["score"], reverse=True)
+            entries = entries[:MAX_SEARCH_RESULTS]
+            if entries:
+                set_cached_book_search_entries(query, entries)
 
         if not entries:
             if es_available():

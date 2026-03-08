@@ -1,70 +1,114 @@
 # SmartAIToolsBot
 
-Telegram bot for searching and delivering books/audiobooks, with multilingual UI, dynamic menus, AI tools (local Ollama/NLLB), TTS, PDF Maker, admin control, and a beta video downloader.
+SmartAIToolsBot is a menu-first Telegram bot that combines a digital library, movie lookup, audiobook flow, AI utilities, media tools, and admin operations in one backend.
 
-## What This Bot Does
+## 1. Backend Architecture
 
-- Search books (DB + optional Elasticsearch) with inline pagination and download buttons
-- Search movies (DB + optional Elasticsearch) with book-like result flow
-- Deliver books from cached Telegram `file_id` or local files
-- Store audiobook parts in a dedicated Telegram channel (optional) and keep `channel_id`/`channel_message_id` in DB
-- Dynamic menu-first UX (Uzbek / English / Russian)
-- AI tools menu:
-  - AI Chat (local Ollama)
-  - AI Translator (NLLB-200 local backend with optional Ollama fallback)
-  - AI Grammar Fix
-  - AI Email Writer
-- Text to Voice (Edge TTS + optional AI text polishing)
-- PDF Maker (step-by-step wizard, text-only PDF output, optional AI font-size selection)
-- Audio Editor, PDF Editor, and Sticker Tools in Other Functions
-- Favorites, reactions, top books/users, profile, requests
-- Admin Control (reply-keyboard panel, no slash-command dependency for routine admin tasks)
-- Beta Video Downloader (YouTube/Instagram public links)
-- Name Meanings menu scaffold (coming soon)
-- Bot profile texts (description/about) are synced per language (`en`, `uz`, `ru`) on startup
+### 1.1 High-level topology
 
-## Current UX (Important)
+```mermaid
+graph TD
+  U[Telegram Users] --> TG[Telegram Cloud]
+  TG --> API[Local Telegram Bot API Optional]
+  API --> APP[Python Bot App PTB]
+  TG --> APP
 
-This bot is **menu-first**.
+  APP --> DB[(PostgreSQL)]
+  APP --> ES[(Elasticsearch Optional)]
+  APP --> OLL[Ollama Optional]
+  APP --> NLLB[NLLB Local Transformers Optional]
 
-- Most user features are accessed via dynamic reply-keyboard menus
-- Slash commands are kept minimal / fallback
-- Public users keep personal commands in command menu:
-  - `/start`, `/language`
-  - `/myprofile`, `/favorite`
-  - `/request`, `/requests`
-  - `/my_quiz`
-- Upload commands are **not** in public command menu; they are scoped to admin/owner command menus.
+  APP --> CH_BOOKS[Books Upload Channels]
+  APP --> CH_AUDIO[Audio Upload Channel]
+  APP --> CH_VIDEO[Video Upload Channel]
 
-### Group Chat Behavior
+  APP --> FFMPEG[ffmpeg]
+  APP --> EDGE[edge-tts]
+  APP --> YTDLP[yt-dlp]
+  APP --> REMBG[rembg Optional]
+```
 
-- In groups, command list is limited to:
-  - `/start`
-  - `/language`
-- Group users can search books by sending a **reply message** with a book name (reply-to-message search)
-- The bot avoids noisy "tap Search Books first" prompts in groups
+### 1.2 Runtime model
 
-### Bot Profile Text Localization
+- Bot runtime: `python-telegram-bot` polling application.
+- Startup behavior:
+  - Initializes DB pool and schema.
+  - Checks optional Elasticsearch connectivity.
+  - Registers handlers and callback routes.
+  - Syncs unindexed books/movies from DB to ES.
+  - Applies command scopes per chat type and language.
+- Single instance protection:
+  - A lock file is used to avoid duplicate long-polling instances.
+- Production orchestration:
+  - `SmartAIToolsBot-stack.target` runs both local Bot API and bot service together.
 
-- On startup, bot calls Telegram APIs to set:
-  - `setMyDescription`
-  - `setMyShortDescription`
-- Current language payloads are defined in `BOT_PROFILE_TEXTS` inside `bot.py`
-- Default + language-specific entries are synced for `en`, `uz`, `ru`
+### 1.3 Core backend services
 
-## Main Menus
+- Source of truth: PostgreSQL.
+- Search accelerator: Elasticsearch (`books` + `movies` indices).
+- AI backends:
+  - Ollama for chat/grammar/email/parts of AI tooling.
+  - NLLB (Transformers) for translator backend.
+  - Hybrid translator mode (NLLB + optional Ollama recheck).
+- Media tools:
+  - `ffmpeg` for audio/sticker/video conversions.
+  - `edge-tts` for natural TTS.
+  - `rembg` optional for sticker background removal.
 
-### Main Menu
+## 2. Feature Catalog
+
+| Feature | Status | Backend |
+|---|---|---|
+| Book search + delivery | Active | PostgreSQL + Elasticsearch optional |
+| Movie search + delivery | Active | PostgreSQL + Elasticsearch optional |
+| Audiobook parts per book | Active | PostgreSQL + Telegram channel storage |
+| Upload books | Active | Telegram + PostgreSQL + ES async indexing |
+| Upload movies | Active | Telegram + PostgreSQL + ES async indexing |
+| Favorites / reactions / top lists | Active | PostgreSQL analytics tables |
+| AI Chat | Active | Ollama |
+| AI Translator | Active | Hybrid/NLLB/Ollama |
+| AI Grammar Fix | Active | Ollama |
+| AI Email Writer | Active | Ollama |
+| AI Quiz Generator | Active | Ollama + quiz persistence |
+| AI Music Generator | Active | local flow in AI module |
+| AI PDF Maker | Active | reportlab + optional Ollama style logic |
+| AI PDF Translator | Active | pdf_editor + AI translator backend |
+| Text to Voice | Active | edge-tts + ffmpeg + optional Ollama polish |
+| Audio Editor | Active | ffmpeg |
+| PDF Editor | Active | pypdf/reportlab + OCR path |
+| Sticker Tools | Active | ffmpeg + optional rembg |
+| Video downloader (YouTube/Instagram) | Active (beta limits) | yt-dlp + ffmpeg |
+| Name meanings | Coming soon scaffold | DB schema ready + menu placeholder |
+
+## 3. Update Handling Flow
+
+1. Telegram update arrives (message/callback/command).
+2. Global guards run first:
+   - paused guard
+   - anti-spam guard
+   - blocked/stopped checks
+3. Routed by handler type:
+   - Command handlers
+   - Callback query handlers
+   - Text message routing (`search_books` pipeline + mode handlers)
+4. Operations execute using DB-first persistence.
+5. Heavy work is offloaded with background tasks where appropriate (indexing, cleanup, async jobs).
+
+## 4. Menu UX Architecture
+
+### 4.1 Main Menu
+
 - `🔎 Search Books`
 - `🎬 Search Movies`
 - `🤖 AI Tools`
 - `🎙️ Text to Voice`
-- `⬇️ Insta Youtub` (beta)
+- `⬇️ Insta Youtub`
 - `🌙 Ramadan Duas`
 - `🛠️ Other Functions`
-- `🛠 Admin Control` (admin/owner only; shown in the first row)
+- `🛠 Admin Control` (admin/owner only)
 
-### AI Tools Menu
+### 4.2 AI Tools Menu
+
 - `💬 Chat with AI`
 - `🌐 AI Translator`
 - `✍️ AI Grammar Fix`
@@ -73,9 +117,9 @@ This bot is **menu-first**.
 - `🎵 AI Music Generator`
 - `🤖 AI PDF Maker`
 - `🌐📄 AI PDF Translator`
-- `🖼️ AI Image Generator` (currently coming soon)
 
-### Other Functions Menu
+### 4.3 Other Functions Menu
+
 - `🔥 Top Books`
 - `🏆 Top Users`
 - `🎛️ Audio Editor`
@@ -86,177 +130,287 @@ This bot is **menu-first**.
 - `❓ Help`
 
 Notes:
-- `My Profile`, `Favorites`, and `Request Book` are available from slash commands.
-- Upload actions are command-based (`/upload`, `/movie_upload`) for admin/allowed users.
+- `My Profile`, `Favorites`, `Request Book` are command-menu based now.
+- Upload actions are command-based (`/upload`, `/movie_upload`).
 
-## AI Tools (Current Behavior)
+## 5. Complete Command Reference
 
-### AI Chat
-- Uses local Ollama model
-- Replies in the language of the user message (content language), not just UI language
-- Has built-in smart replies for bot identity/owner questions
-- Friendly content-based style with cleanup (no raw encoded links garbage)
-- Active mode keyboard shows status + `Change AI Tool` / `Exit AI Tool`
+The bot registers 35 command handlers.
 
-### AI Translator
-- Primary backend: `NLLB-200` (local)
-- Optional fallback: Ollama
-- Recommended input format (best accuracy):
-  - `uz>en: Assalomu alaykum`
-- Quick format (target only):
-  - `en: Assalomu alaykum`
-- Active mode keyboard shows status + `Change AI Tool` / `Exit AI Tool`
+### 5.1 Private user command menu (default scope)
 
-### AI Grammar Fix
-- Fixes grammar/spelling/punctuation
-- Keeps the same language and meaning
-- Active mode keyboard shows status + `Change AI Tool` / `Exit AI Tool`
+These are shown to normal users in private chats via command scopes:
 
-### AI Email Writer
-- Drafts polite emails/letters in user language
-- Active mode keyboard shows status + `Change AI Tool` / `Exit AI Tool`
+- `/start`
+- `/language`
+- `/myprofile`
+- `/favorite`
+- `/request`
+- `/requests`
+- `/my_quiz`
 
-## Video Downloader (Beta)
+### 5.2 Public commands callable but hidden from default command menu
 
-### Supported sources
-- YouTube (public links)
-- Instagram (public links)
+These commands are implemented and available, but intentionally not shown in the default user command list:
 
-### Current beta limits
-- **Max file size:** `15 MB`
-- **Per-user limit:** `3 successful downloads total` (test mode)
-- After quota is reached, bot replies with a test-mode availability message
+| Command | Purpose | Access check |
+|---|---|---|
+| `/help` | Full usage guide | Public |
+| `/pdf_maker` | AI PDF Maker wizard | Public |
+| `/pdf_editor` | PDF editor session | Public |
+| `/text_to_voice` | TTS wizard | Public |
+| `/sticker_tools` | Sticker tools session | Public |
+| `/ramazon` | Ramadan duas | Public |
+| `/top` | Top books | Public |
+| `/top_users` | Top users | Public |
+| `/mystats` | Personal stats | Public |
+| `/movie_upload` | Enter movie upload mode | `is_allowed(user_id)` required for activation |
 
-### Flow
-1. User opens `⬇️ Insta Youtub` from the main menu
-2. Sends a public link
-3. Bot checks metadata and sends preview card (thumbnail + title/channel + qualities/sizes)
-4. Inline quality buttons appear (dynamic, based on available formats)
-5. Bot downloads in background and updates progress
-6. Bot sends video/audio to Telegram
+### 5.3 Group command scopes
 
-### Notes
-- Large links are rejected early with a friendly "send a smaller video" message
-- `MP3` button sends audio, video quality buttons send video
-- `Trim` is placeholder (coming soon)
-- `Preview` resends the preview card
+- Group (all users) scope command list:
+  - `/start`
+  - `/language`
+- Group admins scope command list:
+  - `/group_read_start`
+  - `/group_read_status`
+  - `/group_read_end`
 
-## Upload Flow (Current)
+Group-reading command behavior:
+- `/group_read_start`: group-only + group-admin required.
+- `/group_read_status`: group-only, no admin required.
+- `/group_read_end`: group-only + group-admin required.
 
-- `/upload` enables **book** upload mode for allowed users/admins
-- `/movie_upload` enables **movie** upload mode for allowed users/admins
-- For each file, user-facing status is sent once:
-  - `Saved ...`
-  - `Duplicate ...`
-- No extra `Indexed ...` message is sent to chat
-- DB save happens first, Elasticsearch indexing runs in background
-- Indexing state is tracked in DB (`upload_receipts.status`, `books.indexed`)
-- Set `UPLOAD_NO_STATUS_EDITS=1` to avoid "loading" edits and send reply-only status messages
-- ES bulk indexing queue flushes when either threshold is hit:
-  - `UPLOAD_ES_BULK_SIZE` (default `100`)
-  - `UPLOAD_ES_BULK_IDLE_TIMEOUT_SEC` (default `10`)
+### 5.4 Admin/operator commands
 
-## Text to Voice (TTS)
+| Command | Purpose | Effective access |
+|---|---|---|
+| `/upload` | Book upload mode | Admin-only wrapper (`_is_admin_user`) |
+| `/admin` | Admin control panel | `_is_admin_user` |
+| `/smoke` | Smoke checklist | Admin-only wrapper |
+| `/db_dupes` | DB duplicate cleanup preview/task | `_is_admin_user` |
+| `/es_dupes` | ES duplicate cleanup preview/task | `_is_admin_user` |
+| `/dupes_status` | Duplicate cleanup status | `_is_admin_user` |
+| `/cancel_task` | Cancel background task | `_is_admin_user` |
+| `/user` | User search/admin actions | `_is_admin_user` |
+| `/pause_bot` | Pause public interactions | `_is_admin_user` |
+| `/resume_bot` | Resume public interactions | `_is_admin_user` |
+| `/upload_local_books` | Local bulk upload job | `_is_admin_user` |
+| `/broadcast` | Broadcast message to all users | Admin wrapper + internal `ADMIN_ID` check |
+| `/audit` | Audit/metrics report | `ADMIN_ID` check |
+| `/prune` | Remove blocked/unreachable users | `ADMIN_ID` check |
+| `/missing` | Missing-file preview/cleanup | `ADMIN_ID` check |
 
-- Step-by-step UI via inline buttons (language/voice/gender/tone/speed/output)
-- Cleaner UI (reduced instruction clutter)
-- `AI Voice Booster` toggle (renamed from generic AI toggle)
-- Improved language auto-detection behavior (less false Uzbek detection on English text)
-- Uses local `edge_tts` + `ffmpeg`
+Important:
+- `_is_admin_user` means `user_id in {ADMIN_ID, OWNER_ID}`.
+- A subset of legacy admin commands still check `ADMIN_ID` directly; set `TELEGRAM_ADMIN_ID` correctly for main operator access.
 
-## PDF Maker
+## 6. Permissions and Rights Model
 
-- Step-by-step wizard:
-  1. PDF name
-  2. Style (`AI Style` / `Simple`)
-  3. Paper (`A4` / `Letter`)
-  4. Orientation (`Portrait` / `Landscape`)
-  5. Continue
-  6. Send text
-- Output is **text-only PDF** (no title/date/header/footer inside the PDF body)
-- `AI Style` can auto-select a more readable body font size (Ollama + heuristic fallback)
+### 6.1 User state gates
 
-## Admin Control
+Every major flow checks these states:
 
-Admin UX is reply-keyboard based (not inline panel), and available only to admin/owner users.
+- `blocked` users are denied.
+- `stopped` users are ignored.
+- anti-spam cooldowns apply for high-frequency actions.
 
-Examples of actions inside Admin Control:
-- Search users (name / username / full or partial user ID)
-- Upload books/movies via `/upload` and `/movie_upload` (admin-scoped command menu)
-- Audit report
-- Pause / Resume bot
-- Prune users
-- Missing files preview / confirm cleanup
-- Duplicate previews / status (DB + ES)
-- Cancel background tasks
-- Local bulk upload tools (`all`, `missing`, `unique`, `large`, `status`)
+### 6.2 Role gates
 
-### Owner command visibility
-Owner/admin command menu is scoped and includes upload commands (`/upload`, `/movie_upload`), while public users do not see these upload commands.
+- Admin user: `_is_admin_user(user_id)`.
+- Owner user: `_is_owner_user(user_id)`.
+- Group admin: `_is_group_admin_user()` for group-reading moderation commands.
 
-## Modular Code Layout (Current)
+### 6.3 Upload rights
 
-The bot was refactored out of a single large file into feature modules. `bot.py` now mainly wires modules together and provides shared utilities.
+- Book upload command (`/upload`) is wrapped as admin-only.
+- Movie upload command (`/movie_upload`) uses `is_allowed(user_id)` to activate mode.
+- Unauthorized upload attempts trigger upload-help request flow.
 
-- `bot.py` - app bootstrap, handler registration, shared utilities, module bridges
-- `config.py` - environment config loading
-- `db.py` - PostgreSQL schema + queries
-- `language.py` - localized message dictionary
-- `menu_ui.py` - menu text parsing/help/admin labels
-- `menus.py` - dynamic menu keyboard and menu text builders
-- `admin_tools.py` - admin menu routing + admin prompt handlers
-- `admin_runtime.py` - admin runtime commands/callbacks (audit, dupes, tasks, user search, local uploads)
-- `search_flow.py` - book search flow + paging + selection callbacks
-- `tts_tools.py` - Text-to-Voice feature
-- `pdf_maker.py` - PDF Maker feature
-- `ai_tools.py` - AI Chat / Translator / Grammar / Email / AI image placeholders
-- `video_downloader.py` - video downloader beta feature
-- `engagement_handlers.py` - favorites/reactions/top/summary/delete callbacks
-- `user_interactions.py` - requests/profile/help/favorites user commands and callbacks
-- `upload_flow.py` - upload commands and file/photo upload processing
+### 6.4 Command scope delivery
 
-## Requirements
+Command menus are synced by scopes:
 
-### Core
-- Python `3.12+` (project currently uses `venv312`)
-- PostgreSQL
-- Telegram bot token
+- `BotCommandScopeDefault`: minimal user menu in private chats.
+- `BotCommandScopeAllGroupChats`: `/start`, `/language`.
+- `BotCommandScopeAllChatAdministrators`: group reading commands.
+- `BotCommandScopeChat(chat_id=...)`: admin/owner scoped command menu.
 
-### Optional (recommended)
-- Elasticsearch 8.x (faster search)
-- Ollama (AI tools / PDF/TTS enhancements)
+## 7. Search Architecture
 
-### Python packages
-Core packages are in `requirements.txt`:
-- `python-telegram-bot==20.7`
-- `psycopg2-binary`
-- `elasticsearch==8.15.0`
-- `rapidfuzz`
-- `python-dotenv`
-- plus others in the file
+### 7.1 Books
 
-Additional optional dependencies used by features (install as needed):
-- `transliterate` (if your code path uses transliteration package imports)
-- `reportlab` (PDF rendering)
-- `pypdf` (PDF text extraction)
-- `edge-tts` (TTS)
-- `torch`, `transformers`, `sentencepiece`, `safetensors` (NLLB translator)
+- Input text enters `search_books` pipeline.
+- Query normalization + transliteration path.
+- If ES available: `multi_match` fuzzy search on `book_name`, `display_name`.
+- If ES unavailable: DB/local fallback search.
+- Results are deduplicated by stable UUID and paginated via inline buttons.
+- Not-found path offers request creation with callback button.
 
-## Quick Start (Manual)
+### 7.2 Movies
 
-```bash
-cd ~/Documents/SmartAIToolsBot
-python3 -m venv venv312
-source venv312/bin/activate
-pip install -r requirements.txt
-# Optional feature deps:
-# pip install reportlab pypdf edge-tts transliterate torch transformers sentencepiece safetensors
-python3 bot.py
-```
+- Movie mode is toggled by `Search Movies` menu action.
+- Search uses normalized/transliterated query.
+- ES movie index preferred with weighted fields:
+  - `movie_name`, `display_name`, `search_text`, `genre`, `movie_lang`, `country`, `rating`, `release_year_text`, `caption_text`.
+- DB fallback is used when ES is unavailable or has no hits.
+- Results are paginated and selected similarly to books.
 
-## Environment Variables (`.env`)
+### 7.3 Group behavior
 
-### Required
+- In groups, book search is reply-driven to avoid noise.
+- The bot ignores normal group text unless it is a reply to bot message.
+
+## 8. Upload and Indexing Architecture
+
+### 8.1 Book uploads
+
+- Activation: `/upload` (admin-only wrapper).
+- Media ingestion writes to DB first.
+- User feedback is final-state oriented (`Saved`/`Duplicate`) without extra index spam.
+- ES indexing is asynchronous through queue worker:
+  - flush by batch size (`UPLOAD_ES_BULK_SIZE`)
+  - flush by idle timeout (`UPLOAD_ES_BULK_IDLE_TIMEOUT_SEC`)
+
+### 8.2 Movie uploads
+
+- Activation: `/movie_upload` (allowed users).
+- Supports video/document/animation sources.
+- Parses caption metadata (title/year/genre/language/country/rating) with multilingual patterns.
+- Stores canonical movie record in DB and indexes in ES.
+- Requires valid `VIDEO_UPLOAD_CHANNEL_ID` for channel-backed storage flow.
+
+### 8.3 Audiobooks
+
+- Audiobook parts are stored in `audio_book_parts` with optional channel pointers.
+- Per-book audiobook add/listen/delete operations are callback-driven.
+- Owner/admin can see moderation controls (including request counters where applicable).
+
+### 8.4 Startup sync jobs
+
+On startup:
+
+- `sync_unindexed_books()`
+- `sync_unindexed_movies()`
+
+These backfill ES for items saved in DB but not indexed yet.
+
+## 9. AI and Media Backend Details
+
+### 9.1 AI Translator backend modes
+
+`AI_TRANSLATOR_BACKEND` supports:
+
+- `hybrid` (default): NLLB primary + optional Ollama recheck/fallback.
+- `nllb`: local NLLB only (with optional fallback if enabled).
+- `ollama`: Ollama-only translation.
+
+Hybrid controls:
+
+- `AI_TRANSLATOR_FALLBACK_OLLAMA`
+- `AI_TRANSLATOR_HYBRID_RECHECK_ALWAYS`
+
+### 9.2 Text to Voice
+
+- Wizard-based session with voice/gender/tone/speed/output mode.
+- Uses `edge-tts` + `ffmpeg`.
+- Optional Ollama polishing can refine input text before synthesis.
+
+### 9.3 Audio Editor
+
+- Converts between voice and MP3.
+- Supports cut ranges using `mm:ss-mm:ss` style.
+- Supports rename.
+- Supports MP3 cover attachment (`ffmpeg`).
+- Final `Complete` action sends transformed output.
+
+### 9.4 PDF Editor / AI PDF Translator
+
+Editor operations include:
+
+- Compress PDF
+- OCR extraction
+- Export to TXT
+- Export to EPUB
+- Watermark
+- AI translation for supported file types (`.pdf`, `.epub`, `.docx`, `.doc`, `.txt`, `.md`, `.markdown`)
+
+### 9.5 Sticker Tools
+
+- Static sticker conversion
+- Video sticker conversion
+- Background removal (`rembg`, optional)
+
+### 9.6 Video Downloader (beta)
+
+- Supports public YouTube and Instagram URLs.
+- Quality picker with preview card.
+- `VIDEO_DL_MAX_MB` hard-capped to 15 MB in current logic.
+- Current per-user test quota: 3 successful downloads.
+
+## 10. Data Architecture (PostgreSQL + Elasticsearch)
+
+### 10.1 PostgreSQL tables (complete)
+
+| Table | Purpose | Key fields |
+|---|---|---|
+| `schema_migrations` | schema version history | `version`, `applied_at` |
+| `users` | user identity + state | `id`, `blocked`, `allowed`, `language` |
+| `removed_users` | removed/blocked archive | user identity snapshot + `removed_at` |
+| `books` | canonical book records | `id`, `book_name`, `file_id`, `path`, `indexed`, `downloads`, `searches` |
+| `movies` | canonical movie records | `id`, `movie_name`, media fields, metadata, `indexed` |
+| `audio_books` | audiobook root per book | `id`, `book_id`, `part_count`, counters |
+| `audio_book_parts` | audiobook parts/media pointers | `audio_book_id`, `file_id`, `channel_id`, `channel_message_id` |
+| `upload_receipts` | upload pipeline state tracking | `status`, `saved_to_db`, `saved_to_es`, timestamps |
+| `book_requests` | user book requests lifecycle | `query`, `status`, admin-note fields |
+| `upload_requests` | user upload-access requests | `status`, admin-note fields |
+| `book_reactions` | per-user book reactions | `book_id`, `user_id`, `reaction` |
+| `user_favorites` | favorite books | `user_id`, `book_id`, `ts` |
+| `user_favorite_awards` | favorite reward tracking | `user_id`, `book_id` |
+| `user_reaction_awards` | reaction reward tracking | `user_id`, `book_id` |
+| `user_recents` | recent interactions | `user_id`, `book_id`, `ts` |
+| `user_quizzes` | saved/generated quizzes | `user_id`, `questions_json`, `share_count` |
+| `book_summaries` | generated summaries cache | `book_id`, `lang`, `mode`, `summary_text` |
+| `analytics_daily` | daily totals | `day`, `searches`, `buttons` |
+| `analytics_daily_users` | per-user daily totals | `day`, `user_id`, counters |
+| `analytics_counters` | lifetime counters | `key`, `value` |
+| `name_meanings` | future feature scaffold | multilingual name/meaning/origin fields |
+
+### 10.2 Elasticsearch indexes
+
+- `books` index: search acceleration for books.
+- `movies` index: search acceleration for movies (`MOVIES_ES_INDEX`, default `movies`).
+
+PostgreSQL remains source of truth; ES is derivative and rebuildable.
+
+## 11. Module Map
+
+| Module | Responsibility |
+|---|---|
+| `bot.py` | bootstrap, handler registration, shared bridges, startup orchestration |
+| `config.py` | `.env` loading and core IDs/channels |
+| `db.py` | schema + all DB operations |
+| `command_sync.py` | per-scope Telegram command synchronization |
+| `menus.py` | reply keyboard layouts |
+| `menu_ui.py` | menu text parsing, help text, admin labels |
+| `search_flow.py` | text search pipeline, book/movie pagination, audiobook callbacks |
+| `upload_flow.py` | upload modes, file ingestion, ES queue worker |
+| `admin_tools.py` | admin menu action dispatch + prompt handling |
+| `admin_runtime.py` | admin commands, tasks, duplicate cleanup, local bulk upload |
+| `user_interactions.py` | requests, profile, favorites, user callbacks |
+| `engagement_handlers.py` | top lists, favorites, reactions, summaries |
+| `ai_tools.py` | AI chat/translator/grammar/email/quiz/music/image placeholders |
+| `pdf_maker.py` | text-to-PDF wizard |
+| `pdf_editor.py` | PDF/file editor + AI translator flow |
+| `audio_converter.py` | audio edit/convert/cut/cover flow |
+| `tts_tools.py` | TTS wizard and generation |
+| `sticker_tools.py` | sticker conversion + optional bg removal |
+| `video_downloader.py` | YouTube/Instagram downloader flow |
+
+## 12. Environment Variables
+
+## 12.1 Required
+
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_OWNER_ID`
 - `DB_NAME`
@@ -265,36 +419,42 @@ python3 bot.py
 - `DB_HOST`
 - `DB_PORT`
 
-### Core Optional (bot only)
+## 12.2 Core optional
+
 - `TELEGRAM_ADMIN_ID`
 - `REQUEST_CHAT_ID`
 - `UPLOAD_CHANNEL_ID`
 - `UPLOAD_CHANNEL_IDS` (comma-separated)
-- `AUDIO_UPLOAD_CHANNEL_ID` (audiobook media storage channel)
-- `VIDEO_UPLOAD_CHANNEL_ID` (reserved for video storage flow)
+- `AUDIO_UPLOAD_CHANNEL_ID`
+- `VIDEO_UPLOAD_CHANNEL_ID`
+- `MOVIES_ES_INDEX` (default `movies`)
 
-### Upload Flow Tuning
-- `UPLOAD_NO_STATUS_EDITS` (`1` = no "loading" edit; reply-only final status)
-- `UPLOAD_ES_BULK_SIZE` (ES bulk queue flush size, default `100`)
-- `UPLOAD_ES_BULK_IDLE_TIMEOUT_SEC` (ES bulk queue max wait, default `10`)
-- `UPLOAD_SKIP_NAME_DUP_CHECK` (`1` disables extra duplicate check by normalized name)
-- `UPLOAD_SKIP_REQUEST_NOTIFY` (`1` disables request-match notifications)
+## 12.3 Upload tuning
+
+- `UPLOAD_NO_STATUS_EDITS`
+- `UPLOAD_ES_BULK_SIZE`
+- `UPLOAD_ES_BULK_IDLE_TIMEOUT_SEC`
+- `UPLOAD_SKIP_NAME_DUP_CHECK`
+- `UPLOAD_SKIP_REQUEST_NOTIFY`
 - `UPLOAD_FANOUT_RETRY_MAX`
 - `UPLOAD_FANOUT_SEND_DELAY_SEC`
 - `UPLOAD_FANOUT_RETRY_JITTER_SEC`
 
-### Self-Hosted Telegram Bot API (Optional)
-- `TELEGRAM_BOT_API_BASE_URL` (example: `http://127.0.0.1:8081`)
-- `TELEGRAM_BOT_API_BASE_FILE_URL` (optional; if empty, code derives `/file/bot` from base URL)
-- `TELEGRAM_BOT_API_LOCAL_MODE` (`1` for local mode)
+## 12.4 Self-hosted Telegram Bot API (optional)
 
-### Search / Elasticsearch
+- `TELEGRAM_BOT_API_BASE_URL`
+- `TELEGRAM_BOT_API_BASE_FILE_URL`
+- `TELEGRAM_BOT_API_LOCAL_MODE`
+
+## 12.5 Search / Elasticsearch
+
 - `ES_URL`
 - `ES_USER`
 - `ES_PASS`
 - `ES_CA_CERT`
 
-### Coins / Rankings
+## 12.6 Coins / rankings
+
 - `COIN_SEARCH`
 - `COIN_DOWNLOAD`
 - `COIN_REACTION`
@@ -302,7 +462,8 @@ python3 bot.py
 - `COIN_REFERRAL`
 - `TOP_USERS_LIMIT`
 
-### Ollama / AI Tools
+## 12.7 Ollama and AI tools
+
 - `OLLAMA_URL`
 - `AI_CHAT_OLLAMA_MODEL`
 - `AI_CHAT_OLLAMA_TIMEOUT`
@@ -312,50 +473,58 @@ python3 bot.py
 - `PDF_MAKER_OLLAMA_MODEL`
 - `PDF_MAKER_OLLAMA_TIMEOUT`
 
-### AI Translator (NLLB)
-- `AI_TRANSLATOR_BACKEND` (`nllb` or `ollama`)
-- `AI_TRANSLATOR_NLLB_MODEL` (example: `facebook/nllb-200-distilled-600M`)
-- `AI_TRANSLATOR_NLLB_DEVICE` (`cpu` recommended on low-VRAM systems)
-- `AI_TRANSLATOR_NLLB_LOCAL_ONLY` (`0/1`)
+## 12.8 AI translator (NLLB / hybrid)
+
+- `AI_TRANSLATOR_BACKEND` (`hybrid`, `nllb`, `ollama`)
+- `AI_TRANSLATOR_NLLB_MODEL`
+- `AI_TRANSLATOR_NLLB_DEVICE`
+- `AI_TRANSLATOR_NLLB_LOCAL_ONLY`
 - `AI_TRANSLATOR_NLLB_MAX_INPUT_TOKENS`
 - `AI_TRANSLATOR_NLLB_MAX_NEW_TOKENS`
-- `AI_TRANSLATOR_FALLBACK_OLLAMA` (`0/1`)
+- `AI_TRANSLATOR_FALLBACK_OLLAMA`
+- `AI_TRANSLATOR_HYBRID_RECHECK_ALWAYS`
 
-### AI Image (future/local backend integration placeholder)
-- `AI_IMAGE_SD_API_URL`
-- `AI_IMAGE_SD_CHECKPOINT`
-- `AI_IMAGE_WIDTH`
-- `AI_IMAGE_HEIGHT`
-- `AI_IMAGE_STEPS`
-- `AI_IMAGE_CFG`
-- `AI_IMAGE_SAMPLER`
-- `AI_IMAGE_COUNT`
-- `AI_IMAGE_TIMEOUT`
+## 12.9 Video downloader
 
-### Video Downloader (beta)
-- `VIDEO_DL_MAX_MB`
-  - Current code hard-caps this to `15 MB` during test mode
+- `VIDEO_DL_MAX_MB` (currently capped to 15 MB in code)
 
-## NLLB Translator Setup (Local)
+## 13. Setup and Run
 
-Recommended for this bot:
-- `AI_TRANSLATOR_BACKEND=nllb`
-- `AI_TRANSLATOR_NLLB_MODEL=facebook/nllb-200-distilled-600M`
-- `AI_TRANSLATOR_NLLB_DEVICE=cpu`
+### 13.1 Manual run
 
-Example install (inside `venv312`):
 ```bash
-pip install torch transformers sentencepiece safetensors
+cd ~/Documents/SmartAIToolsBot
+python3 -m venv venv312
+source venv312/bin/activate
+pip install -r requirements.txt
+python3 bot.py
 ```
 
-## systemd (Recommended Production Run)
+### 13.2 Optional dependencies by feature
 
-Recommended production setup uses the stack target:
+```bash
+# PDF/TTS/Translator extras
+pip install reportlab pypdf edge-tts transliterate torch transformers sentencepiece safetensors
+
+# Sticker background remove
+pip install rembg
+```
+
+System packages often needed:
+
+- `ffmpeg`
+- for `.doc` extraction in PDF translator/editor: `antiword` or `catdoc`
+
+## 14. systemd Production Setup
+
+Recommended services:
+
 - `SmartAIToolsBot.service` (local Telegram Bot API)
-- `SmartAIToolsBot-bot.service` (main bot app)
-- `SmartAIToolsBot-stack.target` (starts/stops both together)
+- `SmartAIToolsBot-bot.service` (main bot)
+- `SmartAIToolsBot-stack.target` (full stack target)
 
 Common commands:
+
 ```bash
 sudo systemctl enable --now SmartAIToolsBot-stack.target
 sudo systemctl restart SmartAIToolsBot-stack.target
@@ -363,121 +532,93 @@ sudo systemctl status SmartAIToolsBot-stack.target SmartAIToolsBot.service Smart
 sudo journalctl -fu SmartAIToolsBot.service -fu SmartAIToolsBot-bot.service -l
 ```
 
-### Important: avoid duplicate bot instances
-If two instances run with the same token, Telegram long polling fails with:
-- `Conflict: terminated by other getUpdates request`
+Wi-Fi dispatcher integration:
 
-Only one of these should run:
-- manual `python bot.py`
-- `systemctl SmartAIToolsBot-bot.service`
-- `systemctl SmartAIToolsBot-stack.target`
-
-### Wi-Fi driven start/stop (NetworkManager dispatcher)
-
-Repository script:
-- `systemd/SmartAIToolsBot-nm-dispatcher.sh`
-
-Install hook (as root):
 ```bash
 sudo install -m 0755 systemd/SmartAIToolsBot-nm-dispatcher.sh /etc/NetworkManager/dispatcher.d/90-smartaitoolsbot
 sudo systemctl enable --now NetworkManager-dispatcher.service
-```
-
-Behavior:
-- Wi-Fi disconnected: stop bot + local Bot API once
-- Wi-Fi reconnected after disconnect: restart bot + local Bot API once
-- Duplicate events in same connectivity state: no action
-
-Useful checks:
-```bash
 sudo journalctl -t smartaitoolsbot-dispatcher -f -l
-sudo systemctl status SmartAIToolsBot-stack.target SmartAIToolsBot.service SmartAIToolsBot-bot.service --no-pager
 ```
 
-## VS Code Setup (Recommended)
+## 15. Live Logs and Diagnostics
 
-Set the project interpreter to `venv312` so editor diagnostics match runtime:
+Bot logs:
 
-`.vscode/settings.json`
-```json
-{
-  "python.defaultInterpreterPath": "/home/muhammadaliabdullayev/Documents/SmartAIToolsBot/venv312/bin/python3"
-}
+```bash
+sudo journalctl -u SmartAIToolsBot-bot.service -f -o short-precise
 ```
 
-## Search and Delivery Notes
+Stack logs:
 
-- Queries are normalized and deduplicated by stable UUID
-- Elasticsearch is used when available; DB/local fallback exists
-- Inline result pagination and numbered selection buttons are used
-- Book delivery prefers Telegram `file_id`, then falls back to local file path
+```bash
+sudo journalctl -fu SmartAIToolsBot.service -fu SmartAIToolsBot-bot.service -l
+```
 
-## Data / Storage
+Quick command scope sanity check (admin/private/group):
 
-- PostgreSQL is the source of truth
-- Elasticsearch is an optional fast-search index
-- `downloads/` stores local book files
-- Telegram `file_id` caching reduces re-uploads
-- `upload_receipts` tracks upload pipeline states (`received`, `saved_db`, `indexed`, `duplicate`, `index_failed`, etc.)
-- `books` stores optional storage pointers (`storage_chat_id`, `storage_message_id`)
-- `movies` stores movie media pointers/metadata and indexing state
-- `audio_book_parts` stores optional channel source pointers (`channel_id`, `channel_message_id`)
-- `name_meanings` table exists as schema scaffold for future name-meaning feature
+```bash
+python3 - <<'PY'
+from command_sync import get_public_commands_for_menu, get_group_commands, get_group_admin_commands, get_admin_commands
+print('public:', [c.command for c in get_public_commands_for_menu('en')])
+print('group:', [c.command for c in get_group_commands('en')])
+print('group_admin:', [c.command for c in get_group_admin_commands('en')])
+print('admin:', [c.command for c in get_admin_commands('en')])
+PY
+```
 
-## Troubleshooting
+## 16. Troubleshooting
 
-### Bot says "Conflict: terminated by other getUpdates request"
-You have more than one bot process/service running.
+### 16.1 Conflict: terminated by other getUpdates request
+
+Cause: multiple bot instances with same token.
 
 Check:
+
 ```bash
 ps -ef | grep '[p]ython.*bot.py'
-systemctl --user list-units --type=service | grep -Ei 'smartai|bot|telegram'
 sudo systemctl status SmartAIToolsBot-bot.service
 ```
 
-### systemd service fails but manual run works
-Your service may be using a different virtual environment.
+### 16.2 Service works manually but not in systemd
 
-Check:
+Check `ExecStart` python path and `EnvironmentFile`:
+
 ```bash
 sudo systemctl cat SmartAIToolsBot-bot.service
 ```
-Verify `ExecStart` points to `venv312`.
 
-### `Failed to restart ... service: Unit ... is masked`
-The unit is masked and cannot start/restart until unmasked.
+### 16.3 Unit is masked
 
-Fix:
 ```bash
 sudo systemctl unmask SmartAIToolsBot.service SmartAIToolsBot-bot.service
 sudo systemctl daemon-reload
 sudo systemctl restart SmartAIToolsBot-stack.target
 ```
 
-### Upload shows "processing/loading" too long
-- Set `UPLOAD_NO_STATUS_EDITS=1` to avoid edit-based loading status
-- Confirm DB write + ES worker activity in logs:
+### 16.4 Upload appears stuck at loading
+
+- Set `UPLOAD_NO_STATUS_EDITS=1`.
+- Watch logs while uploading:
+
 ```bash
 sudo journalctl -u SmartAIToolsBot-bot.service -f -l
 ```
 
-### Video Downloader works for small files but not big files
-Expected in current beta:
-- 15 MB max size
-- 3 downloads per user (test mode)
+### 16.5 Reactions do not appear
 
-### Pylance shows `... is not defined` in extracted modules
-Some modules use runtime dependency injection (`configure(globals())`).
-These can be editor warnings, not runtime errors.
+If `setMessageReaction` is unsupported by your local Bot API server version, reactions may silently fallback.
 
-## Security Notes
+### 16.6 Movie upload says VIDEO_UPLOAD_CHANNEL_ID not configured
 
-- Never commit `.env`
-- Restrict admin access to owner/admin IDs only
-- Keep DB and Elasticsearch credentials private
-- Use local-only (`127.0.0.1`) for internal services when possible
+Set a valid channel ID in `.env`, ensure bot is admin in that channel, then restart service.
 
-## Project Status
+## 17. Security Notes
 
-The bot is actively customized and optimized for menu-based UX, multilingual users, and local AI tooling. The codebase is modularized, but continued cleanup/testing is still recommended as features evolve.
+- Never commit `.env`.
+- Keep DB/ES credentials private.
+- Restrict admin IDs to trusted operators.
+- Prefer localhost binding for internal services.
+
+## 18. Current Status
+
+The codebase is modular and production-usable for current features, with active development on new capabilities (for example, full Name Meanings feature activation and further AI/media tooling).

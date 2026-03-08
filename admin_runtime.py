@@ -285,7 +285,6 @@ async def smoke_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         tts_ok = False
     ollama_url = str(os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
-    sd_url = str(os.getenv("AI_IMAGE_SD_API_URL", "http://127.0.0.1:7860")).rstrip("/")
 
     def mark(ok: bool) -> str:
         return "✅" if ok else "⚠️"
@@ -298,7 +297,6 @@ async def smoke_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"{mark(pdf_ok)} PDF Maker deps (reportlab): {'ready' if pdf_ok else 'missing'}",
         f"{mark(tts_ok)} TTS deps (edge-tts + ffmpeg): {'ready' if tts_ok else 'missing'}",
         f"🤖 Ollama URL: {ollama_url}",
-        f"🖼️ AI image backend URL: {sd_url}",
         "──────────",
         "Manual checks",
         "1. `/start` -> greeting + main menu shows once",

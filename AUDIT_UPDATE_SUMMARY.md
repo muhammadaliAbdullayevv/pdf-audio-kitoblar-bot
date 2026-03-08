@@ -89,7 +89,6 @@
   - `ai_quiz_generated`
   - `ai_music_generated`
   - `ai_pdf_created`
-  - `ai_image_generated`
 
 ## 📊 What the Audit Command Now Shows
 

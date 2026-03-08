@@ -63,10 +63,8 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
         return {
             "start": (
                 "🎬 Video yuklab olish\n\n"
-                "YouTube yoki Instagram havolasini yuboring.\n"
-                "Masalan: https://youtu.be/...\n\n"
-                "⚠️ Faqat ommaviy (public) havolalar bilan ishlang.\n"
-                "🧪 Beta: ayrim linklar/platforma formatlari ishlamasligi mumkin."
+                "YouTube, Instagram, Facebook, X yoki TikTok havolasini yuboring.\n"
+                "Masalan: https://youtu.be/..."
             ),
             "checking": "🔎 Havola tekshirilmoqda...",
             "choose_quality": "👇 Format/sifatni tanlang:",
@@ -76,8 +74,8 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
             "cancelled": "Video yuklab olish bekor qilindi.",
             "expired": "Sessiya tugadi. Pastdagi menyudan Video Downloader bo‘limini qayta tanlang.",
             "empty": "Iltimos, havola yuboring.",
-            "invalid_url": "❌ Noto‘g‘ri havola. Faqat YouTube yoki Instagram public link yuboring.",
-            "unsupported": "⚠️ Bu platforma hozir qo‘llab-quvvatlanmaydi. YouTube yoki Instagram link yuboring.",
+            "invalid_url": "❌ Noto‘g‘ri havola. YouTube/Instagram/Facebook/X/TikTok public link yuboring.",
+            "unsupported": "⚠️ Bu platforma hozir qo‘llab-quvvatlanmaydi. YouTube/Instagram/Facebook/X/TikTok link yuboring.",
             "tools_missing": "⚠️ `yt-dlp` topilmadi. Serverda o‘rnatish kerak.",
             "ffmpeg_missing": "⚠️ Audio yuklab olish uchun `ffmpeg` kerak.",
             "metadata_failed": "⚠️ Havola ma'lumotlarini olib bo‘lmadi. Linkni tekshirib qayta urinib ko‘ring.",
@@ -119,10 +117,8 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
         return {
             "start": (
                 "🎬 Загрузка видео\n\n"
-                "Отправьте ссылку YouTube или Instagram.\n"
-                "Например: https://youtu.be/...\n\n"
-                "⚠️ Используйте только публичные ссылки.\n"
-                "🧪 Бета: некоторые ссылки/форматы платформ могут не работать."
+                "Отправьте ссылку YouTube, Instagram, Facebook, X или TikTok.\n"
+                "Например: https://youtu.be/..."
             ),
             "checking": "🔎 Проверяю ссылку...",
             "choose_quality": "👇 Выберите формат/качество:",
@@ -132,8 +128,8 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
             "cancelled": "Загрузка видео отменена.",
             "expired": "Сессия истекла. Снова откройте Video Downloader через меню ниже.",
             "empty": "Пожалуйста, отправьте ссылку.",
-            "invalid_url": "❌ Неверная ссылка. Отправьте публичную ссылку YouTube или Instagram.",
-            "unsupported": "⚠️ Эта платформа пока не поддерживается. Отправьте ссылку YouTube или Instagram.",
+            "invalid_url": "❌ Неверная ссылка. Отправьте публичную ссылку YouTube/Instagram/Facebook/X/TikTok.",
+            "unsupported": "⚠️ Эта платформа пока не поддерживается. Отправьте ссылку YouTube, Instagram, Facebook, X или TikTok.",
             "tools_missing": "⚠️ `yt-dlp` не найден. Его нужно установить на сервере.",
             "ffmpeg_missing": "⚠️ Для загрузки аудио нужен `ffmpeg`.",
             "metadata_failed": "⚠️ Не удалось получить данные по ссылке. Проверьте ссылку и попробуйте снова.",
@@ -174,10 +170,8 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
     return {
         "start": (
             "🎬 Video Downloader\n\n"
-            "Send a YouTube or Instagram link.\n"
-            "Example: https://youtu.be/...\n\n"
-            "⚠️ Use public links only.\n"
-            "🧪 Beta: some links/platform formats may fail."
+            "Send a YouTube, Instagram, Facebook, X, or TikTok link.\n"
+            "Example: https://youtu.be/..."
         ),
         "checking": "🔎 Checking link...",
         "choose_quality": "👇 Choose format/quality:",
@@ -187,8 +181,8 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
         "cancelled": "Video downloader cancelled.",
         "expired": "Session expired. Please open Video Downloader again from the menu below.",
         "empty": "Please send a link.",
-        "invalid_url": "❌ Invalid link. Please send a public YouTube or Instagram link.",
-        "unsupported": "⚠️ This platform is not supported yet. Send a YouTube or Instagram link.",
+        "invalid_url": "❌ Invalid link. Please send a public YouTube/Instagram/Facebook/X/TikTok link.",
+        "unsupported": "⚠️ This platform is not supported yet. Send a YouTube, Instagram, Facebook, X, or TikTok link.",
         "tools_missing": "⚠️ `yt-dlp` is missing on the server.",
         "ffmpeg_missing": "⚠️ `ffmpeg` is required for audio download.",
         "metadata_failed": "⚠️ Could not read link metadata. Please check the link and try again.",
@@ -251,10 +245,18 @@ def _video_dl_supported_url(url: str) -> tuple[bool, str | None]:
     host = (parsed.netloc or "").lower().split(":")[0]
     if host.startswith("www."):
         host = host[4:]
-    if host in {"youtube.com", "m.youtube.com", "youtu.be"}:
+
+    if host in {"youtube.com", "m.youtube.com", "youtu.be"} or host.endswith(".youtube.com"):
         return True, "youtube"
-    if host in {"instagram.com", "www.instagram.com"}:
+    if host in {"instagram.com", "m.instagram.com"} or host.endswith(".instagram.com"):
         return True, "instagram"
+    if host in {"facebook.com", "m.facebook.com", "fb.watch"} or host.endswith(".facebook.com"):
+        return True, "facebook"
+    if host in {"x.com", "twitter.com", "mobile.twitter.com", "t.co"} or host.endswith(".x.com") or host.endswith(".twitter.com"):
+        return True, "x"
+    if host in {"tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"} or host.endswith(".tiktok.com"):
+        return True, "tiktok"
+
     return False, None
 
 
@@ -838,11 +840,9 @@ async def _video_dl_start_session_from_message(target_message, update: Update, c
             "expires_at": time.time() + 1800,
         }
         _video_dl_save_session(context, session)
-        uid = update.effective_user.id if update.effective_user else None
         sent = await _send_with_retry(
             lambda: target_message.reply_text(
                 _video_dl_texts(lang)["start"],
-                reply_markup=_main_menu_keyboard(lang, "other", uid),
             )
         )
         if sent:

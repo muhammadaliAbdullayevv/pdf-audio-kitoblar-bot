@@ -64,7 +64,6 @@ try:
             'ai_quiz_generated': 0,
             'ai_music_generated': 0,
             'ai_pdf_created': 0,
-            'ai_image_generated': 0,
         }
     }
     
