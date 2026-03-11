@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -14,6 +15,11 @@ import safe_subprocess
 from telegram import Update
 from telegram.ext import ContextTypes
 
+try:
+    from telegram import ReactionTypeEmoji
+except Exception:
+    ReactionTypeEmoji = None  # type: ignore
+
 MESSAGES: dict[str, dict[str, str]] = {}
 logger = logging.getLogger(__name__)
 
@@ -23,6 +29,118 @@ def configure(deps: dict[str, Any]) -> None:
         if k.startswith('__') and k.endswith('__'):
             continue
         globals()[k] = v
+
+
+def _callback_reaction_state_key(query) -> str | None:
+    msg = getattr(query, "message", None)
+    chat = getattr(msg, "chat", None) if msg else None
+    message_id = getattr(msg, "message_id", None) if msg else None
+    user = getattr(query, "from_user", None)
+    user_id = getattr(user, "id", None) if user else None
+    if not chat or not message_id:
+        return None
+    return f"{chat.id}:{message_id}:{user_id or 0}"
+
+
+def _reserve_callback_reaction_seq(query, context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, int]:
+    key = _callback_reaction_state_key(query)
+    if key is None:
+        return None, 0
+    app = getattr(context, "application", None)
+    bot_data = getattr(app, "bot_data", None) if app else None
+    if not isinstance(bot_data, dict):
+        return key, 0
+    state = bot_data.setdefault("_callback_reaction_seq", {})
+    if not isinstance(state, dict):
+        state = {}
+        bot_data["_callback_reaction_seq"] = state
+    seq = int(state.get(key, 0) or 0) + 1
+    state[key] = seq
+    return key, seq
+
+
+def _is_callback_reaction_latest(context: ContextTypes.DEFAULT_TYPE, state_key: str, state_seq: int) -> bool:
+    app = getattr(context, "application", None)
+    bot_data = getattr(app, "bot_data", None) if app else None
+    if not isinstance(bot_data, dict):
+        return True
+    state = bot_data.get("_callback_reaction_seq")
+    if not isinstance(state, dict):
+        return True
+    return int(state.get(state_key, 0) or 0) == int(state_seq)
+
+
+async def _send_reaction_for_callback_message(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    emoji: str,
+    *,
+    state_key: str | None = None,
+    state_seq: int = 0,
+) -> bool:
+    msg = getattr(query, "message", None)
+    chat = getattr(msg, "chat", None) if msg else None
+    bot = getattr(context, "bot", None)
+    message_id = getattr(msg, "message_id", None) if msg else None
+    if not msg or not chat or not bot or not emoji or not message_id:
+        return False
+
+    if state_key is not None and state_seq > 0 and not _is_callback_reaction_latest(context, state_key, state_seq):
+        return False
+
+    if hasattr(bot, "set_message_reaction") and ReactionTypeEmoji is not None:
+        try:
+            await bot.set_message_reaction(
+                chat_id=chat.id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+                is_big=False,
+            )
+            return True
+        except Exception as e:
+            logger.debug("callback reaction (native) failed: %s", e)
+
+    try:
+        reaction_payload = json.dumps([{"type": "emoji", "emoji": emoji}], ensure_ascii=False)
+        await bot._post(
+            "setMessageReaction",
+            data={
+                "chat_id": chat.id,
+                "message_id": message_id,
+                "reaction": reaction_payload,
+                "is_big": False,
+            },
+        )
+        return True
+    except Exception as e:
+        logger.debug("callback reaction (raw) failed: %s", e)
+        return False
+
+
+async def _send_callback_reaction_with_fallbacks(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    emojis: tuple[str, ...] | list[str],
+    *,
+    state_key: str | None = None,
+    state_seq: int = 0,
+) -> bool:
+    seen: set[str] = set()
+    for emoji in emojis:
+        e = str(emoji or "").strip()
+        if not e or e in seen:
+            continue
+        seen.add(e)
+        sent = await _send_reaction_for_callback_message(
+            query,
+            context,
+            e,
+            state_key=state_key,
+            state_seq=state_seq,
+        )
+        if sent:
+            return True
+    return False
 
 
 async def _can_show_delete_button(update: Update, user_id: int | None) -> bool:
@@ -438,6 +556,8 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
 
+    reaction_state_key, reaction_state_seq = _reserve_callback_reaction_seq(query, context)
+
     book = await run_blocking(db_get_book_by_id, book_id)
     title = get_result_title(book) if book else book_id
 
@@ -447,23 +567,34 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
             await run_blocking(remove_favorite, query.from_user.id, book_id)
             await run_blocking(db_increment_counter, "favorite_removed", 1)
             msg = MESSAGES[lang]["unfavorited"]
+            callback_reactions = ("😢", "💔", "❤️")
         else:
             await run_blocking(add_favorite, query.from_user.id, book_id, title)
             await run_blocking(db_increment_counter, "favorite_added", 1)
             await run_blocking(db_award_favorite_action, query.from_user.id, book_id)
             msg = MESSAGES[lang]["favorited"]
+            callback_reactions = ("🤩",)
     elif action == "add":
         await run_blocking(add_favorite, query.from_user.id, book_id, title)
         await run_blocking(db_increment_counter, "favorite_added", 1)
         await run_blocking(db_award_favorite_action, query.from_user.id, book_id)
         msg = MESSAGES[lang]["favorited"]
+        callback_reactions = ("🤩",)
     elif action == "remove":
         await run_blocking(remove_favorite, query.from_user.id, book_id)
         await run_blocking(db_increment_counter, "favorite_removed", 1)
         msg = MESSAGES[lang]["unfavorited"]
+        callback_reactions = ("😢", "💔", "❤️")
     else:
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
+    await _send_callback_reaction_with_fallbacks(
+        query,
+        context,
+        callback_reactions,
+        state_key=reaction_state_key,
+        state_seq=reaction_state_seq,
+    )
     _invalidate_top_caches(context)
 
     try:
@@ -534,15 +665,37 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
         await safe_answer(query, "Error", show_alert=True)
         return
 
+    reaction_emojis = {
+        "whale": ("❤️", "🐳"),
+        "berry": ("😍", "🍓", "❤️"),
+        "like": ("🥰", "👍", "❤️"),
+        "dislike": ("😒", "💔"),
+    }.get(reaction, ("❤️",))
+    reaction_state_key, reaction_state_seq = _reserve_callback_reaction_seq(query, context)
+
     try:
         old_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
         if old_reaction == reaction:
+            await _send_callback_reaction_with_fallbacks(
+                query,
+                context,
+                reaction_emojis,
+                state_key=reaction_state_key,
+                state_seq=reaction_state_seq,
+            )
             await safe_answer(query)
             return
 
         await run_blocking(db_set_book_reaction, query.from_user.id, book_id, reaction)
         await run_blocking(db_increment_counter, f"reaction_{reaction}", 1)
         await run_blocking(db_award_reaction_action, query.from_user.id, book_id)
+        await _send_callback_reaction_with_fallbacks(
+            query,
+            context,
+            reaction_emojis,
+            state_key=reaction_state_key,
+            state_seq=reaction_state_seq,
+        )
         _invalidate_top_caches(context)
         stats = await run_blocking(db_get_book_stats, book_id)
         downloads = stats.get("downloads", 0)
@@ -1377,13 +1530,7 @@ async def handle_delete_book_callback(update: Update, context: ContextTypes.DEFA
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
 
-    now = time.time()
-    pending = context.user_data.get("pending_delete")
-    if not pending or pending.get("book_id") != book_id or now > pending.get("expires_at", 0):
-        context.user_data["pending_delete"] = {"book_id": book_id, "expires_at": now + 15}
-        await safe_answer(query, MESSAGES[lang]["delete_confirm"], show_alert=True)
-        return
-
+    # One-tap delete: remove stale confirmation state from older flow and continue.
     context.user_data.pop("pending_delete", None)
 
     book = await run_blocking(db_get_book_by_id, book_id)

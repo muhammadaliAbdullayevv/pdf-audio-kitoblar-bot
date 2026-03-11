@@ -50,10 +50,15 @@ async def _unconfigured_send_with_retry(*args, **kwargs):
     raise RuntimeError("ai_tools module is not configured")
 
 
+async def _unconfigured_safe_answer(*args, **kwargs):
+    raise RuntimeError("ai_tools module is not configured")
+
+
 run_blocking: Callable[..., Awaitable[Any]] = _unconfigured_run_blocking
 run_blocking_heavy: Callable[..., Awaitable[Any]] = _unconfigured_run_blocking_heavy
 _send_with_retry: Callable[..., Awaitable[Any]] = _unconfigured_send_with_retry
 _main_menu_keyboard: Callable[..., Any] = _unconfigured_main_menu_keyboard
+safe_answer: Callable[..., Awaitable[Any]] = _unconfigured_safe_answer
 _db_save_user_quiz = None
 _db_get_user_quiz = None
 _db_list_user_quizzes = None
@@ -78,6 +83,7 @@ def configure(
     run_blocking_fn,
     send_with_retry_fn,
     main_menu_keyboard_fn,
+    safe_answer_fn=None,
     run_blocking_heavy_fn=None,
     db_save_user_quiz_fn=None,
     db_get_user_quiz_fn=None,
@@ -88,7 +94,7 @@ def configure(
     db_increment_user_quiz_share_count_fn=None,
     db_increment_counter_fn=None,
 ) -> None:
-    global MESSAGES, logger, run_blocking, run_blocking_heavy, _send_with_retry, _main_menu_keyboard
+    global MESSAGES, logger, run_blocking, run_blocking_heavy, _send_with_retry, _main_menu_keyboard, safe_answer
     global _db_save_user_quiz, _db_get_user_quiz, _db_list_user_quizzes, _db_count_user_quizzes
     global _db_delete_user_quiz, _db_mark_user_quiz_started, _db_increment_user_quiz_share_count, _db_increment_counter
     MESSAGES = messages
@@ -97,6 +103,7 @@ def configure(
     run_blocking_heavy = run_blocking_heavy_fn or run_blocking_fn
     _send_with_retry = send_with_retry_fn
     _main_menu_keyboard = main_menu_keyboard_fn
+    safe_answer = safe_answer_fn or _unconfigured_safe_answer
     _db_save_user_quiz = db_save_user_quiz_fn
     _db_get_user_quiz = db_get_user_quiz_fn
     _db_list_user_quizzes = db_list_user_quizzes_fn
@@ -499,6 +506,7 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
                 "en: Assalomu alaykum\n"
                 "uz>en: Assalomu alaykum"
             ),
+            "translator_setup_text": "🌐 AI tarjimon\n\n1) 🎯 Target til: {target}\n2) ✍️ Tarjima qilinadigan matnni yuboring.\n\nMasalan: uz>en: Assalomu alaykum",
             "prompt_grammar": (
                 "✍️ AI grammatika tuzatish\n\n"
                 "Matn yuboring. Men:\n"
@@ -526,6 +534,7 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
             "music_running_hint": "🎵 Musiqa hali yaratilmoqda. Kuting yoki AI toolni almashtiring.",
             "music_done": "✅ Musiqa tayyor.",
             "music_caption": "🎵 AI musiqa (instrumental)\n⏱️ {seconds}s\n📝 {prompt}",
+            "music_setup_text": "🎵 AI musiqa generator\n\n1) 🎨 Uslub: {style}\n2) ⏱️ Davomiylik: {seconds} soniya\n3) ✍️ Endi prompt yuboring.",
             "music_unavailable": "⚠️ Lokal musiqa generatori hozir mavjud emas. Model/dependensiyalarni tekshiring.",
             "music_failed": "⚠️ Musiqa yaratib bo‘lmadi. Promptni soddalashtirib qayta urinib ko‘ring.",
             "music_mode_sound": "🎵 Sound Music",
@@ -553,6 +562,7 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
             "quiz_input_saved": "✅ Qabul qilindi. Endi savollar sonini tanlang.",
             "quiz_choose_count": "🔢 Nechta savol kerak?\nManba: {topic}",
             "quiz_choose_interval": "⏱️ Savollar orasidagi vaqtni tanlang (sekund).",
+            "quiz_setup_text": "📝 AI quiz generator\n\n1) 🔢 Savollar soni: {count}\n2) ⏱️ Savollar oralig‘i: {interval} sek\n3) ✍️ Endi quiz mavzusini yuboring.",
             "quiz_invalid_interval": "⚠️ Vaqt 0-120 sekund oralig‘ida bo‘lsin.",
             "quiz_interval_set": "✅ Interval: {seconds} sek.",
             "quiz_delay_note": "⏱️ Savollar oralig‘i: {seconds} sek.",
@@ -633,6 +643,7 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
                 "en: Assalomu alaykum\n"
                 "uz>en: Assalomu alaykum"
             ),
+            "translator_setup_text": "🌐 AI переводчик\n\n1) 🎯 Целевой язык: {target}\n2) ✍️ Отправьте текст для перевода.\n\nПример: uz>en: Assalomu alaykum",
             "prompt_grammar": (
                 "✍️ AI исправление грамматики\n\n"
                 "Отправьте текст. Я:\n"
@@ -660,6 +671,7 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
             "music_running_hint": "🎵 Музыка ещё генерируется. Подождите или смените AI-инструмент.",
             "music_done": "✅ Музыка готова.",
             "music_caption": "🎵 AI музыка (инструментал)\n⏱️ {seconds}s\n📝 {prompt}",
+            "music_setup_text": "🎵 AI генератор музыки\n\n1) 🎨 Стиль: {style}\n2) ⏱️ Длительность: {seconds} сек\n3) ✍️ Теперь отправьте prompt.",
             "music_unavailable": "⚠️ Локальный генератор музыки недоступен. Проверьте модель/зависимости.",
             "music_failed": "⚠️ Не удалось сгенерировать музыку. Попробуйте упростить prompt.",
             "music_mode_sound": "🎵 Sound Music",
@@ -687,6 +699,7 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
             "quiz_input_saved": "✅ Получено. Теперь выберите количество вопросов.",
             "quiz_choose_count": "🔢 Сколько вопросов нужно?\nИсточник: {topic}",
             "quiz_choose_interval": "⏱️ Выберите интервал между вопросами (секунды).",
+            "quiz_setup_text": "📝 AI Quiz Generator\n\n1) 🔢 Количество вопросов: {count}\n2) ⏱️ Интервал между вопросами: {interval} сек\n3) ✍️ Теперь отправьте тему викторины.",
             "quiz_invalid_interval": "⚠️ Интервал должен быть от 0 до 120 секунд.",
             "quiz_interval_set": "✅ Интервал: {seconds} сек.",
             "quiz_delay_note": "⏱️ Интервал между вопросами: {seconds} сек.",
@@ -766,6 +779,7 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
             "en: Assalomu alaykum\n"
             "uz>en: Assalomu alaykum"
         ),
+        "translator_setup_text": "🌐 AI Translator\n\n1) 🎯 Target language: {target}\n2) ✍️ Send text to translate.\n\nExample: uz>en: Assalomu alaykum",
         "prompt_grammar": (
             "✍️ AI Grammar Fix\n\n"
             "Send text. I will:\n"
@@ -793,6 +807,7 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
         "music_running_hint": "🎵 Music is still generating. Please wait or change the AI tool.",
         "music_done": "✅ Music ready.",
         "music_caption": "🎵 AI music (instrumental)\n⏱️ {seconds}s\n📝 {prompt}",
+        "music_setup_text": "🎵 AI Music Generator\n\n1) 🎨 Style: {style}\n2) ⏱️ Duration: {seconds}s\n3) ✍️ Now send your prompt text.",
         "music_unavailable": "⚠️ Local music generator is unavailable. Check the model/dependencies.",
         "music_failed": "⚠️ Music generation failed. Try a simpler prompt.",
         "music_mode_sound": "🎵 Sound Music",
@@ -820,6 +835,7 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
         "quiz_input_saved": "✅ Received. Now choose the number of questions.",
         "quiz_choose_count": "🔢 How many questions do you want?\nSource: {topic}",
         "quiz_choose_interval": "⏱️ Choose the time between questions (seconds).",
+        "quiz_setup_text": "📝 AI Quiz Generator\n\n1) 🔢 Questions count: {count}\n2) ⏱️ Interval between questions: {interval}s\n3) ✍️ Now send the quiz topic.",
         "quiz_invalid_interval": "⚠️ Interval must be between 0 and 120 seconds.",
         "quiz_interval_set": "✅ Interval set: {seconds}s.",
         "quiz_delay_note": "⏱️ Time between questions: {seconds}s.",
@@ -903,6 +919,39 @@ def _ai_tool_music_prompt_text(lang: str, music_kind: str = "sound") -> str:
 def _ai_tool_music_style_label(style_key: str, lang: str) -> str:
     msgs = _ai_tool_mode_texts(lang)
     return msgs.get(f"music_style_{style_key}", style_key.title())
+
+
+def _ai_tool_music_setup_text(lang: str, style_key: str, duration_s: int) -> str:
+    msgs = _ai_tool_mode_texts(lang)
+    template = msgs.get(
+        "music_setup_text",
+        "🎵 AI Music Generator\n\n1) 🎨 Style: {style}\n2) ⏱️ Duration: {seconds}s\n3) ✍️ Now send your prompt text.",
+    )
+    return template.format(
+        style=_ai_tool_music_style_label(style_key, lang),
+        seconds=max(5, min(60, int(duration_s or _AI_MUSIC_DURATION_CHOICES[1]))),
+    )
+
+
+def _ai_tool_translator_setup_text(lang: str, target_lang: str) -> str:
+    msgs = _ai_tool_mode_texts(lang)
+    template = msgs.get(
+        "translator_setup_text",
+        "🌐 AI Translator\n\n1) 🎯 Target language: {target}\n2) ✍️ Send text to translate.",
+    )
+    return template.format(target=_ai_tool_lang_label(target_lang, lang))
+
+
+def _ai_tool_quiz_setup_text(lang: str, count: int, interval_s: int) -> str:
+    msgs = _ai_tool_mode_texts(lang)
+    template = msgs.get(
+        "quiz_setup_text",
+        "📝 AI Quiz Generator\n\n1) 🔢 Questions count: {count}\n2) ⏱️ Interval between questions: {interval}s\n3) ✍️ Now send the quiz topic.",
+    )
+    return template.format(
+        count=max(1, min(10, int(count or _AI_QUIZ_COUNT_CHOICES[1]))),
+        interval=max(0, min(120, int(interval_s or _AI_QUIZ_INTERVAL_CHOICES[0]))),
+    )
 
 
 def _ai_tool_lang_label(lang_key: str, ui_lang: str) -> str:
@@ -1309,6 +1358,12 @@ def _ai_tool_quiz_interval_inline_keyboard(selected: int | None = None) -> Inlin
     return InlineKeyboardMarkup([row])
 
 
+def _ai_tool_quiz_setup_inline_keyboard(selected_count: int | None = None, selected_interval: int | None = None) -> InlineKeyboardMarkup:
+    count_rows = _ai_tool_quiz_count_inline_keyboard(selected_count).inline_keyboard
+    interval_rows = _ai_tool_quiz_interval_inline_keyboard(selected_interval).inline_keyboard
+    return InlineKeyboardMarkup([*count_rows, *interval_rows])
+
+
 def _ai_tool_music_duration_inline_keyboard(lang_ui: str, selected: int | None = None) -> InlineKeyboardMarkup:
     msgs = _ai_tool_mode_texts(lang_ui)
     options = [
@@ -1334,6 +1389,16 @@ def _ai_tool_music_style_inline_keyboard(lang_ui: str, selected: str | None = No
             label = f"✅ {label}"
         row.append(InlineKeyboardButton(label, callback_data=f"aitool:musicstyle:{style_key}"))
     return InlineKeyboardMarkup([row])
+
+
+def _ai_tool_music_setup_inline_keyboard(
+    lang_ui: str,
+    selected_style: str | None = None,
+    selected_duration: int | None = None,
+) -> InlineKeyboardMarkup:
+    duration_rows = _ai_tool_music_duration_inline_keyboard(lang_ui, selected_duration).inline_keyboard
+    style_rows = _ai_tool_music_style_inline_keyboard(lang_ui, selected_style).inline_keyboard
+    return InlineKeyboardMarkup([*duration_rows, *style_rows])
 
 
 def _ai_tool_quiz_extract_json_array(text: str) -> list | None:
@@ -2520,54 +2585,37 @@ async def _ai_tool_mode_start_session_from_message(
     uid = update.effective_user.id if update.effective_user else None
 
     if mode == "translator":
+        target_lang = str(session.get("target_lang") or "en").lower()
+        if target_lang not in {"uz", "ru", "en"}:
+            target_lang = "en"
         await _send_with_retry(
             lambda: target_message.reply_text(
-                prompt_text,
-                reply_markup=_ai_tool_translator_target_inline_keyboard(lang_ui, session.get("target_lang")),
-            )
-        )
-        await _send_with_retry(
-            lambda: target_message.reply_text(
-                msgs.get("translator_pick_target_short", "Select target language"),
-                reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
+                _ai_tool_translator_setup_text(lang_ui, target_lang),
+                reply_markup=_ai_tool_translator_target_inline_keyboard(lang_ui, target_lang),
             )
         )
     elif mode == "quiz":
+        selected_count = max(1, min(10, int(session.get("quiz_count") or _AI_QUIZ_COUNT_CHOICES[1])))
+        selected_interval = max(0, min(120, int(session.get("quiz_interval_s") or _AI_QUIZ_INTERVAL_CHOICES[0])))
         await _send_with_retry(
             lambda: target_message.reply_text(
-                msgs.get("quiz_prompt_topic", prompt_text),
-                reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
-            )
-        )
-        await _send_with_retry(
-            lambda: target_message.reply_text(
-                msgs.get("quiz_choose_count", "Choose question count").format(topic="Quiz"),
-                reply_markup=_ai_tool_quiz_count_inline_keyboard(int(session.get("quiz_count") or 5)),
-            )
-        )
-        await _send_with_retry(
-            lambda: target_message.reply_text(
-                msgs.get("quiz_choose_interval", "Choose interval"),
-                reply_markup=_ai_tool_quiz_interval_inline_keyboard(int(session.get("quiz_interval_s") or 0)),
+                _ai_tool_quiz_setup_text(lang_ui, selected_count, selected_interval),
+                reply_markup=_ai_tool_quiz_setup_inline_keyboard(selected_count, selected_interval),
             )
         )
     elif mode == "music":
+        selected_duration = int(session.get("music_duration_s") or _AI_MUSIC_DURATION_CHOICES[1])
+        selected_style = str(session.get("music_style") or _AI_MUSIC_STYLE_CHOICES[0]).lower()
+        if selected_style not in _AI_MUSIC_STYLE_CHOICES:
+            selected_style = _AI_MUSIC_STYLE_CHOICES[0]
         await _send_with_retry(
             lambda: target_message.reply_text(
-                _ai_tool_music_prompt_text(lang_ui, str(session.get("music_kind") or "sound")),
-                reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
-            )
-        )
-        await _send_with_retry(
-            lambda: target_message.reply_text(
-                msgs.get("music_choose_duration", "Choose duration"),
-                reply_markup=_ai_tool_music_duration_inline_keyboard(lang_ui, int(session.get("music_duration_s") or 15)),
-            )
-        )
-        await _send_with_retry(
-            lambda: target_message.reply_text(
-                msgs.get("music_style_choose_first", "Choose style"),
-                reply_markup=_ai_tool_music_style_inline_keyboard(lang_ui, str(session.get("music_style") or "lofi")),
+                _ai_tool_music_setup_text(lang_ui, selected_style, selected_duration),
+                reply_markup=_ai_tool_music_setup_inline_keyboard(
+                    lang_ui,
+                    selected_style=selected_style,
+                    selected_duration=selected_duration,
+                ),
             )
         )
     else:
@@ -2908,19 +2956,19 @@ async def handle_ai_tools_callback(update: Update, context: ContextTypes.DEFAULT
             }
         )
         _ai_tool_mode_save_session(context, session)
-        await safe_answer(
-            query,
-            msgs.get("translator_target_set", "Target language set: {target}").format(
-                target=_ai_tool_lang_label(target, lang_ui)
-            ),
-            show_alert=False,
-        )
+        await safe_answer(query)
         try:
-            await query.edit_message_reply_markup(
-                reply_markup=_ai_tool_translator_target_inline_keyboard(lang_ui, target)
+            await query.edit_message_text(
+                _ai_tool_translator_setup_text(lang_ui, target),
+                reply_markup=_ai_tool_translator_target_inline_keyboard(lang_ui, target),
             )
         except Exception:
-            pass
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=_ai_tool_translator_target_inline_keyboard(lang_ui, target)
+                )
+            except Exception:
+                pass
         return
 
     if action == "quizcount" and len(parts) >= 3:
@@ -2940,11 +2988,23 @@ async def handle_ai_tools_callback(update: Update, context: ContextTypes.DEFAULT
             }
         )
         _ai_tool_mode_save_session(context, session)
-        await safe_answer(query, msgs.get("quiz_choose_interval", "Choose interval")[:180], show_alert=False)
+        await safe_answer(query)
         try:
-            await query.edit_message_reply_markup(reply_markup=_ai_tool_quiz_count_inline_keyboard(count))
+            interval_s = max(0, min(120, int(session.get("quiz_interval_s") or _AI_QUIZ_INTERVAL_CHOICES[0])))
+            await query.edit_message_text(
+                _ai_tool_quiz_setup_text(lang_ui, count, interval_s),
+                reply_markup=_ai_tool_quiz_setup_inline_keyboard(count, interval_s),
+            )
         except Exception:
-            pass
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=_ai_tool_quiz_setup_inline_keyboard(
+                        count,
+                        int(session.get("quiz_interval_s") or _AI_QUIZ_INTERVAL_CHOICES[0]),
+                    )
+                )
+            except Exception:
+                pass
         return
 
     if action == "quizinterval" and len(parts) >= 3:
@@ -2964,15 +3024,23 @@ async def handle_ai_tools_callback(update: Update, context: ContextTypes.DEFAULT
             }
         )
         _ai_tool_mode_save_session(context, session)
-        await safe_answer(
-            query,
-            msgs.get("quiz_interval_set", "Interval set: {seconds}s").format(seconds=interval_s)[:180],
-            show_alert=False,
-        )
+        await safe_answer(query)
         try:
-            await query.edit_message_reply_markup(reply_markup=_ai_tool_quiz_interval_inline_keyboard(interval_s))
+            count = max(1, min(10, int(session.get("quiz_count") or _AI_QUIZ_COUNT_CHOICES[1])))
+            await query.edit_message_text(
+                _ai_tool_quiz_setup_text(lang_ui, count, interval_s),
+                reply_markup=_ai_tool_quiz_setup_inline_keyboard(count, interval_s),
+            )
         except Exception:
-            pass
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=_ai_tool_quiz_setup_inline_keyboard(
+                        int(session.get("quiz_count") or _AI_QUIZ_COUNT_CHOICES[1]),
+                        interval_s,
+                    )
+                )
+            except Exception:
+                pass
         return
 
     if action == "musicdur" and len(parts) >= 3:
@@ -2993,17 +3061,30 @@ async def handle_ai_tools_callback(update: Update, context: ContextTypes.DEFAULT
             }
         )
         _ai_tool_mode_save_session(context, session)
-        await safe_answer(
-            query,
-            msgs.get("music_duration_set", "Duration selected: {seconds}s").format(seconds=duration_s)[:180],
-            show_alert=False,
-        )
+        await safe_answer(query)
         try:
-            await query.edit_message_reply_markup(
-                reply_markup=_ai_tool_music_duration_inline_keyboard(lang_ui, duration_s)
+            style_key = str(session.get("music_style") or _AI_MUSIC_STYLE_CHOICES[0]).lower()
+            if style_key not in _AI_MUSIC_STYLE_CHOICES:
+                style_key = _AI_MUSIC_STYLE_CHOICES[0]
+            await query.edit_message_text(
+                _ai_tool_music_setup_text(lang_ui, style_key, duration_s),
+                reply_markup=_ai_tool_music_setup_inline_keyboard(
+                    lang_ui,
+                    selected_style=style_key,
+                    selected_duration=duration_s,
+                ),
             )
         except Exception:
-            pass
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=_ai_tool_music_setup_inline_keyboard(
+                        lang_ui,
+                        selected_style=str(session.get("music_style") or _AI_MUSIC_STYLE_CHOICES[0]),
+                        selected_duration=duration_s,
+                    )
+                )
+            except Exception:
+                pass
         return
 
     if action == "musicstyle" and len(parts) >= 3:
@@ -3022,19 +3103,28 @@ async def handle_ai_tools_callback(update: Update, context: ContextTypes.DEFAULT
             }
         )
         _ai_tool_mode_save_session(context, session)
-        await safe_answer(
-            query,
-            msgs.get("music_style_set", "Style selected: {style}").format(
-                style=_ai_tool_music_style_label(style_key, lang_ui)
-            )[:180],
-            show_alert=False,
-        )
+        await safe_answer(query)
         try:
-            await query.edit_message_reply_markup(
-                reply_markup=_ai_tool_music_style_inline_keyboard(lang_ui, style_key)
+            duration_s = int(session.get("music_duration_s") or _AI_MUSIC_DURATION_CHOICES[1])
+            await query.edit_message_text(
+                _ai_tool_music_setup_text(lang_ui, style_key, duration_s),
+                reply_markup=_ai_tool_music_setup_inline_keyboard(
+                    lang_ui,
+                    selected_style=style_key,
+                    selected_duration=duration_s,
+                ),
             )
         except Exception:
-            pass
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=_ai_tool_music_setup_inline_keyboard(
+                        lang_ui,
+                        selected_style=style_key,
+                        selected_duration=int(session.get("music_duration_s") or _AI_MUSIC_DURATION_CHOICES[1]),
+                    )
+                )
+            except Exception:
+                pass
         return
 
     if action in {"quizstart", "quizgroup", "quizshare"} and len(parts) >= 3:
@@ -3106,4 +3196,3 @@ async def handle_ai_tools_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     await safe_answer(query)
-

@@ -1,21 +1,44 @@
 import os
 from dotenv import load_dotenv
 
+_CONFIG_ERRORS: list[str] = []
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    raw = str(os.getenv(name, str(default)) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        _CONFIG_ERRORS.append(f"{name} must be an integer value")
+        return int(default)
+
+
 # Load variables from project .env using an absolute path so systemd cwd does not matter.
-# Use override=True so .env values win over existing shell env vars.
+# By default, do not override existing process env vars (safer for systemd EnvironmentFile).
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_PATH = os.path.join(_BASE_DIR, ".env")
-load_dotenv(dotenv_path=_ENV_PATH, override=True)
+_DOTENV_OVERRIDE = _env_bool("DOTENV_OVERRIDE", False)
+load_dotenv(dotenv_path=_ENV_PATH, override=_DOTENV_OVERRIDE)
 
 # Load secrets/config from environment to avoid committing credentials.
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("TELEGRAM_OWNER_ID", "0"))
-# Admin must be explicitly configured (or falls back to OWNER_ID).
-# Never hardcode a real user ID as a fallback: it can accidentally grant admin powers.
-ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0")) or OWNER_ID
-REQUEST_CHAT_ID = int(os.getenv("REQUEST_CHAT_ID", "0"))
+OWNER_ID = _env_int("TELEGRAM_OWNER_ID", 0)
+# Legacy compatibility only. Runtime authorization is owner-only.
+ADMIN_ID = _env_int("TELEGRAM_ADMIN_ID", 0)
+REQUEST_CHAT_ID = _env_int("REQUEST_CHAT_ID", 0)
 _UPLOAD_CHANNEL_ID_RAW = os.getenv("UPLOAD_CHANNEL_ID", "").strip()
 _UPLOAD_CHANNEL_IDS_RAW = os.getenv("UPLOAD_CHANNEL_IDS", "").strip()
+_VIDEO_UPLOAD_CHANNEL_ID_RAW = os.getenv("VIDEO_UPLOAD_CHANNEL_ID", "").strip()
+_VIDEO_UPLOAD_CHANNEL_IDS_RAW = os.getenv("VIDEO_UPLOAD_CHANNEL_IDS", "").strip()
 
 def _parse_id_list(raw: str) -> list[int]:
     items = []
@@ -35,14 +58,44 @@ if not _ids:
     _ids = _parse_id_list(_UPLOAD_CHANNEL_ID_RAW)
 
 UPLOAD_CHANNEL_IDS = _ids
-UPLOAD_CHANNEL_ID = _ids[0] if _ids else int(_UPLOAD_CHANNEL_ID_RAW or "0")
-AUDIO_UPLOAD_CHANNEL_ID = int(os.getenv("AUDIO_UPLOAD_CHANNEL_ID", "0") or "0")
-VIDEO_UPLOAD_CHANNEL_ID = int(os.getenv("VIDEO_UPLOAD_CHANNEL_ID", "0") or "0")
+UPLOAD_CHANNEL_ID = _ids[0] if _ids else _env_int("UPLOAD_CHANNEL_ID", 0)
+AUDIO_UPLOAD_CHANNEL_ID = _env_int("AUDIO_UPLOAD_CHANNEL_ID", 0)
+
+_video_ids = _parse_id_list(_VIDEO_UPLOAD_CHANNEL_IDS_RAW)
+if not _video_ids:
+    # Allow comma-separated IDs in VIDEO_UPLOAD_CHANNEL_ID as well.
+    _video_ids = _parse_id_list(_VIDEO_UPLOAD_CHANNEL_ID_RAW)
+
+VIDEO_UPLOAD_CHANNEL_IDS = _video_ids
+VIDEO_UPLOAD_CHANNEL_ID = _video_ids[0] if _video_ids else _env_int("VIDEO_UPLOAD_CHANNEL_ID", 0)
 
 # Coins / leaderboard settings
-COIN_SEARCH = int(os.getenv("COIN_SEARCH", "1"))
-COIN_DOWNLOAD = int(os.getenv("COIN_DOWNLOAD", "1"))
-COIN_REACTION = int(os.getenv("COIN_REACTION", "1"))
-COIN_FAVORITE = int(os.getenv("COIN_FAVORITE", "1"))
-COIN_REFERRAL = int(os.getenv("COIN_REFERRAL", "15"))
-TOP_USERS_LIMIT = int(os.getenv("TOP_USERS_LIMIT", "10"))
+COIN_SEARCH = _env_int("COIN_SEARCH", 1)
+COIN_DOWNLOAD = _env_int("COIN_DOWNLOAD", 1)
+COIN_REACTION = _env_int("COIN_REACTION", 1)
+COIN_FAVORITE = _env_int("COIN_FAVORITE", 1)
+COIN_REFERRAL = _env_int("COIN_REFERRAL", 15)
+TOP_USERS_LIMIT = _env_int("TOP_USERS_LIMIT", 10)
+
+
+def validate_runtime_config() -> list[str]:
+    errors = list(_CONFIG_ERRORS)
+    if not TOKEN or not isinstance(TOKEN, str) or len(TOKEN) < 10:
+        errors.append("TELEGRAM_BOT_TOKEN is missing or invalid")
+    if OWNER_ID <= 0:
+        errors.append("TELEGRAM_OWNER_ID must be a positive integer")
+
+    for key in ("DB_NAME", "DB_USER", "DB_PASS", "DB_HOST"):
+        if not str(os.getenv(key, "") or "").strip():
+            errors.append(f"{key} is required")
+    db_port_raw = str(os.getenv("DB_PORT", "5432") or "").strip()
+    if not db_port_raw:
+        errors.append("DB_PORT is required")
+    else:
+        try:
+            if int(db_port_raw) <= 0:
+                errors.append("DB_PORT must be a positive integer")
+        except Exception:
+            errors.append("DB_PORT must be a valid integer")
+
+    return errors

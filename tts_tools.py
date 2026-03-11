@@ -846,7 +846,7 @@ async def _tts_handle_text_input(update: Update, context: ContextTypes.DEFAULT_T
             session,
             msgs["confirm"].format(**_tts_text_stats(session["text_buffer"])),
             reply_markup=_tts_confirm_keyboard(lang_ui),
-            prefer_edit=True,
+            prefer_edit=False,
         )
         return True
     if phase == "awaiting_confirm":
@@ -860,7 +860,7 @@ async def _tts_handle_text_input(update: Update, context: ContextTypes.DEFAULT_T
             session,
             msgs["confirm"].format(**_tts_text_stats(session["text_buffer"])),
             reply_markup=_tts_confirm_keyboard(lang_ui),
-            prefer_edit=True,
+            prefer_edit=False,
         )
         return True
     return False

@@ -20,7 +20,7 @@ graph TD
 
   APP --> CH_BOOKS[Books Upload Channels]
   APP --> CH_AUDIO[Audio Upload Channel]
-  APP --> CH_VIDEO[Video Upload Channel]
+  APP --> CH_VIDEO[Video Upload Channels]
 
   APP --> FFMPEG[ffmpeg]
   APP --> EDGE[edge-tts]
@@ -54,6 +54,19 @@ graph TD
   - `ffmpeg` for audio/sticker/video conversions.
   - `edge-tts` for natural TTS.
   - `rembg` optional for sticker background removal.
+
+### 1.4 Schema migrations (Alembic)
+
+- Alembic config is included in `alembic.ini` and `alembic/`.
+- Migration environment resolves DB connection from:
+  - `DATABASE_URL`, or
+  - `DB_NAME`, `DB_USER`, `DB_PASS`, `DB_HOST`, `DB_PORT`.
+- Initial migration:
+  - `20260309_0001_admin_task_runs` creates persisted admin task history table + indexes.
+- Typical commands:
+  - `alembic upgrade head`
+  - `alembic current`
+  - `alembic history`
 
 ## 2. Feature Catalog
 
@@ -185,25 +198,25 @@ Group-reading command behavior:
 
 | Command | Purpose | Effective access |
 |---|---|---|
-| `/upload` | Book upload mode | Admin-only wrapper (`_is_admin_user`) |
-| `/admin` | Admin control panel | `_is_admin_user` |
-| `/smoke` | Smoke checklist | Admin-only wrapper |
-| `/db_dupes` | DB duplicate cleanup preview/task | `_is_admin_user` |
-| `/es_dupes` | ES duplicate cleanup preview/task | `_is_admin_user` |
-| `/dupes_status` | Duplicate cleanup status | `_is_admin_user` |
-| `/cancel_task` | Cancel background task | `_is_admin_user` |
-| `/user` | User search/admin actions | `_is_admin_user` |
-| `/pause_bot` | Pause public interactions | `_is_admin_user` |
-| `/resume_bot` | Resume public interactions | `_is_admin_user` |
-| `/upload_local_books` | Local bulk upload job | `_is_admin_user` |
-| `/broadcast` | Broadcast message to all users | Admin wrapper + internal `ADMIN_ID` check |
-| `/audit` | Audit/metrics report | `ADMIN_ID` check |
-| `/prune` | Remove blocked/unreachable users | `ADMIN_ID` check |
-| `/missing` | Missing-file preview/cleanup | `ADMIN_ID` check |
+| `/upload` | Book upload mode | Owner-only (`_is_admin_user` maps to owner) |
+| `/admin` | Admin control panel | Owner-only |
+| `/smoke` | Smoke checklist | Owner-only |
+| `/db_dupes` | DB duplicate cleanup preview/task | Owner-only |
+| `/es_dupes` | ES duplicate cleanup preview/task | Owner-only |
+| `/dupes_status` | Duplicate cleanup status | Owner-only |
+| `/cancel_task` | Cancel background task | Owner-only |
+| `/user` | User search/admin actions | Owner-only |
+| `/pause_bot` | Pause public interactions | Owner-only |
+| `/resume_bot` | Resume public interactions | Owner-only |
+| `/upload_local_books` | Local bulk upload job | Owner-only |
+| `/broadcast` | Broadcast message to all users | Owner-only |
+| `/audit` | Audit/metrics report | Owner-only |
+| `/prune` | Remove blocked/unreachable users | Owner-only |
+| `/missing` | Missing-file preview/cleanup | Owner-only |
 
 Important:
-- `_is_admin_user` means `user_id in {ADMIN_ID, OWNER_ID}`.
-- A subset of legacy admin commands still check `ADMIN_ID` directly; set `TELEGRAM_ADMIN_ID` correctly for main operator access.
+- Runtime authority is owner-only (`TELEGRAM_OWNER_ID`).
+- `TELEGRAM_ADMIN_ID` remains as a legacy compatibility variable and is not used for command authorization.
 
 ## 6. Permissions and Rights Model
 
@@ -217,13 +230,13 @@ Every major flow checks these states:
 
 ### 6.2 Role gates
 
-- Admin user: `_is_admin_user(user_id)`.
+- Admin user alias: `_is_admin_user(user_id)` (owner-only mapping).
 - Owner user: `_is_owner_user(user_id)`.
 - Group admin: `_is_group_admin_user()` for group-reading moderation commands.
 
 ### 6.3 Upload rights
 
-- Book upload command (`/upload`) is wrapped as admin-only.
+- Book upload command (`/upload`) is owner-only.
 - Movie upload command (`/movie_upload`) uses `is_allowed(user_id)` to activate mode.
 - Unauthorized upload attempts trigger upload-help request flow.
 
@@ -278,7 +291,7 @@ Command menus are synced by scopes:
 - Supports video/document/animation sources.
 - Parses caption metadata (title/year/genre/language/country/rating) with multilingual patterns.
 - Stores canonical movie record in DB and indexes in ES.
-- Requires valid `VIDEO_UPLOAD_CHANNEL_ID` for channel-backed storage flow.
+- Requires `VIDEO_UPLOAD_CHANNEL_IDS` (recommended, comma-separated) or legacy `VIDEO_UPLOAD_CHANNEL_ID`.
 
 ### 8.3 Audiobooks
 
@@ -421,11 +434,12 @@ PostgreSQL remains source of truth; ES is derivative and rebuildable.
 
 ## 12.2 Core optional
 
-- `TELEGRAM_ADMIN_ID`
+- `TELEGRAM_ADMIN_ID` (legacy compatibility only, not used for auth)
 - `REQUEST_CHAT_ID`
 - `UPLOAD_CHANNEL_ID`
 - `UPLOAD_CHANNEL_IDS` (comma-separated)
 - `AUDIO_UPLOAD_CHANNEL_ID`
+- `VIDEO_UPLOAD_CHANNEL_IDS` (comma-separated, recommended for round-robin movie storage)
 - `VIDEO_UPLOAD_CHANNEL_ID`
 - `MOVIES_ES_INDEX` (default `movies`)
 
@@ -488,6 +502,13 @@ PostgreSQL remains source of truth; ES is derivative and rebuildable.
 
 - `VIDEO_DL_MAX_MB` (currently capped to 15 MB in code)
 
+## 12.10 Runtime reliability
+
+- `DB_RUNTIME_SCHEMA_MODE` (`auto`, `always`, `never`)
+- `DROP_PENDING_UPDATES` (`0`/`1`)
+- `ERROR_LOG_MAX_MB`
+- `ERROR_LOG_BACKUP_COUNT`
+
 ## 13. Setup and Run
 
 ### 13.1 Manual run
@@ -497,6 +518,7 @@ cd ~/Documents/SmartAIToolsBot
 python3 -m venv venv312
 source venv312/bin/activate
 pip install -r requirements.txt
+python3 -m alembic upgrade head
 python3 bot.py
 ```
 
@@ -608,9 +630,9 @@ sudo journalctl -u SmartAIToolsBot-bot.service -f -l
 
 If `setMessageReaction` is unsupported by your local Bot API server version, reactions may silently fallback.
 
-### 16.6 Movie upload says VIDEO_UPLOAD_CHANNEL_ID not configured
+### 16.6 Movie upload says VIDEO_UPLOAD_CHANNEL_IDS/VIDEO_UPLOAD_CHANNEL_ID not configured
 
-Set a valid channel ID in `.env`, ensure bot is admin in that channel, then restart service.
+Set `VIDEO_UPLOAD_CHANNEL_IDS` in `.env` (comma-separated) or legacy `VIDEO_UPLOAD_CHANNEL_ID`, ensure bot is admin in each channel, then restart service.
 
 ## 17. Security Notes
 
@@ -621,4 +643,4 @@ Set a valid channel ID in `.env`, ensure bot is admin in that channel, then rest
 
 ## 18. Current Status
 
-The codebase is modular and production-usable for current features, with active development on new capabilities (for example, full Name Meanings feature activation and further AI/media tooling).
+The codebase is modular and production-usable for current features, with active development on additional AI/media capabilities and quality improvements.

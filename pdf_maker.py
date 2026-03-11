@@ -1286,6 +1286,7 @@ async def _pdf_maker_handle_text_input(update: Update, context: ContextTypes.DEF
             session,
             msgs["prompt_text_confirm"].format(**stats),
             reply_markup=_pdf_maker_generate_confirm_keyboard(lang),
+            prefer_edit=False,
         )
         return True
 
@@ -1301,6 +1302,7 @@ async def _pdf_maker_handle_text_input(update: Update, context: ContextTypes.DEF
             session,
             msgs["prompt_text_confirm"].format(**stats),
             reply_markup=_pdf_maker_generate_confirm_keyboard(lang),
+            prefer_edit=False,
         )
         return True
 

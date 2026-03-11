@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 MESSAGES: dict[str, dict[str, str]] = {}
 
 
-# Runtime-injected by bot.py via configure(globals()).
+# Runtime-injected by bot.py via explicit configure(...) dependencies.
 # These placeholders keep static analyzers quiet and produce a clear error if
 # the module is used before configuration.
 def _vdl_missing_dep(*args, **kwargs):

@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 from typing import Any
+from urllib.parse import quote_plus
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import ContextTypes
@@ -32,6 +33,69 @@ except ImportError:
     cache_set = lambda k, v, ttl=300: False
     cache_delete = lambda k: False
     cache_clear_pattern = lambda p: 0
+
+
+_MOVIE_CAPTION_LINK_RE = re.compile(r"(?:https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+)", re.IGNORECASE)
+MOVIE_REACTION_EMOJI = {
+    "like": "👍",
+    "dislike": "👎",
+    "berry": "🍓",
+    "whale": "🐳",
+}
+
+
+def _movie_caption_without_links(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    lines_out: list[str] = []
+    blank_emitted = False
+    for raw_line in raw.splitlines():
+        line = _MOVIE_CAPTION_LINK_RE.sub("", str(raw_line))
+        line = re.sub(r"\s{2,}", " ", line).strip()
+        if line:
+            lines_out.append(line)
+            blank_emitted = False
+            continue
+        if lines_out and not blank_emitted:
+            lines_out.append("")
+            blank_emitted = True
+
+    cleaned = "\n".join(lines_out).strip()
+    if len(cleaned) > 1024:
+        cleaned = cleaned[:1021].rstrip() + "..."
+    return cleaned
+
+
+def _compose_movie_delivery_caption(base_caption: str, lang: str) -> str:
+    footer = str(
+        MESSAGES.get(lang, MESSAGES.get("en", {})).get(
+            "movie_caption_bot_info",
+            "🤖 @SmartAIToolsBot | Books • Movies • AI tools",
+        )
+        or ""
+    ).strip()
+    base = str(base_caption or "").strip()
+    if not footer:
+        return base[:1024]
+    if not base:
+        return footer[:1024]
+
+    sep = "\n\n"
+    max_len = 1024
+    full = f"{base}{sep}{footer}"
+    if len(full) <= max_len:
+        return full
+
+    # Keep footer and trim base if needed.
+    room_for_base = max_len - len(sep) - len(footer)
+    if room_for_base <= 3:
+        return footer[:max_len]
+    trimmed_base = base[:room_for_base]
+    if len(base) > room_for_base:
+        trimmed_base = trimmed_base[:-3].rstrip() + "..."
+    return f"{trimmed_base}{sep}{footer}"
 
 
 def _ttl_value(name: str, default: int, minimum: int = 1) -> int:
@@ -133,6 +197,7 @@ def configure(deps: dict[str, Any]) -> None:
         globals()[k] = v
 
 
+
 _THANKS_REPLY_PATTERNS: list[tuple[str, str]] = [
     ("uz", r"\b(rahm+a+t|raxm+a+t|rakhmat|tashakkur|tashakkurlar|minnatdor(m\w*)?)\b"),
     ("en", r"\b(thanks?|thank you|thankyou|thank u|thx|tnx|appreciate it|much appreciated)\b"),
@@ -190,6 +255,118 @@ async def _send_reaction_for_message(update: Update, context: ContextTypes.DEFAU
 
 async def _send_heart_reaction_for_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_reaction_for_message(update, context, "❤️")
+
+
+def _callback_reaction_state_key(query) -> str | None:
+    msg = getattr(query, "message", None)
+    chat = getattr(msg, "chat", None) if msg else None
+    message_id = getattr(msg, "message_id", None) if msg else None
+    user = getattr(query, "from_user", None)
+    user_id = getattr(user, "id", None) if user else None
+    if not chat or not message_id:
+        return None
+    return f"{chat.id}:{message_id}:{user_id or 0}"
+
+
+def _reserve_callback_reaction_seq(query, context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, int]:
+    key = _callback_reaction_state_key(query)
+    if key is None:
+        return None, 0
+    app = getattr(context, "application", None)
+    bot_data = getattr(app, "bot_data", None) if app else None
+    if not isinstance(bot_data, dict):
+        return key, 0
+    state = bot_data.setdefault("_callback_reaction_seq", {})
+    if not isinstance(state, dict):
+        state = {}
+        bot_data["_callback_reaction_seq"] = state
+    seq = int(state.get(key, 0) or 0) + 1
+    state[key] = seq
+    return key, seq
+
+
+def _is_callback_reaction_latest(context: ContextTypes.DEFAULT_TYPE, state_key: str, state_seq: int) -> bool:
+    app = getattr(context, "application", None)
+    bot_data = getattr(app, "bot_data", None) if app else None
+    if not isinstance(bot_data, dict):
+        return True
+    state = bot_data.get("_callback_reaction_seq")
+    if not isinstance(state, dict):
+        return True
+    return int(state.get(state_key, 0) or 0) == int(state_seq)
+
+
+async def _send_reaction_for_callback_message(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    emoji: str,
+    *,
+    state_key: str | None = None,
+    state_seq: int = 0,
+) -> bool:
+    msg = getattr(query, "message", None)
+    chat = getattr(msg, "chat", None) if msg else None
+    bot = getattr(context, "bot", None)
+    message_id = getattr(msg, "message_id", None) if msg else None
+    if not msg or not chat or not bot or not emoji or not message_id:
+        return False
+
+    if state_key is not None and state_seq > 0 and not _is_callback_reaction_latest(context, state_key, state_seq):
+        return False
+
+    if hasattr(bot, "set_message_reaction") and ReactionTypeEmoji is not None:
+        try:
+            await bot.set_message_reaction(
+                chat_id=chat.id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+                is_big=False,
+            )
+            return True
+        except Exception as e:
+            logger.debug("callback reaction (native) failed: %s", e)
+
+    try:
+        reaction_payload = json.dumps([{"type": "emoji", "emoji": emoji}], ensure_ascii=False)
+        await bot._post(
+            "setMessageReaction",
+            data={
+                "chat_id": chat.id,
+                "message_id": message_id,
+                "reaction": reaction_payload,
+                "is_big": False,
+            },
+        )
+        return True
+    except Exception as e:
+        logger.debug("callback reaction (raw) failed: %s", e)
+        return False
+
+
+async def _send_callback_reaction_with_fallbacks(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    emojis: tuple[str, ...] | list[str],
+    *,
+    state_key: str | None = None,
+    state_seq: int = 0,
+) -> bool:
+    seen: set[str] = set()
+    for emoji in emojis:
+        e = str(emoji or "").strip()
+        if not e or e in seen:
+            continue
+        seen.add(e)
+        sent = await _send_reaction_for_callback_message(
+            query,
+            context,
+            e,
+            state_key=state_key,
+            state_seq=state_seq,
+        )
+        if sent:
+            return True
+    return False
 
 
 async def _send_salute_reaction_for_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -542,6 +719,105 @@ def build_movie_results_keyboard(entries: list, page: int, pages: int, query_id:
     return InlineKeyboardMarkup(keyboard)
 
 
+def _resolve_bot_mention(context: ContextTypes.DEFAULT_TYPE | None = None) -> str:
+    username = ""
+    try:
+        bot_obj = getattr(context, "bot", None) if context else None
+        username = str(getattr(bot_obj, "username", "") or "").strip().lstrip("@")
+    except Exception:
+        username = ""
+    if username:
+        return f"@{username}"
+    return "@SmartAIToolsBot"
+
+
+def _build_movie_share_text(movie: dict, lang: str, context: ContextTypes.DEFAULT_TYPE | None = None) -> str:
+    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
+    title = str(movie.get("display_name") or movie.get("movie_name") or "Movie").strip() or "Movie"
+    template = msgs.get("movie_share_text", "🎬 {title}\n\n🤖 {bot}")
+    text = str(template or "").strip()
+    if not text:
+        text = "🎬 {title}\n\n🤖 {bot}"
+    bot_mention = _resolve_bot_mention(context)
+    text = text.format(title=title, bot=bot_mention)
+    if len(text) > 1000:
+        text = text[:997].rstrip() + "..."
+    return text
+
+
+def _movie_connected_post_url(movie: dict) -> str | None:
+    channel_id_raw = movie.get("channel_id")
+    message_id_raw = movie.get("channel_message_id")
+    try:
+        channel_id = int(channel_id_raw or 0)
+        message_id = int(message_id_raw or 0)
+    except Exception:
+        return None
+    if channel_id == 0 or message_id <= 0:
+        return None
+
+    channel_username = str(movie.get("channel_username") or "").strip().lstrip("@")
+    if channel_username:
+        return f"https://t.me/{channel_username}/{message_id}"
+
+    channel_str = str(channel_id)
+    if channel_str.startswith("-100") and len(channel_str) > 4:
+        return f"https://t.me/c/{channel_str[4:]}/{message_id}"
+    return None
+
+
+def _build_movie_share_url(movie: dict, lang: str, context: ContextTypes.DEFAULT_TYPE | None = None) -> str:
+    post_url = _movie_connected_post_url(movie)
+    if post_url:
+        return f"https://t.me/share/url?url={quote_plus(post_url)}"
+    share_text = _build_movie_share_text(movie, lang, context)
+    return f"https://t.me/share/url?text={quote_plus(share_text)}"
+
+
+def _build_movie_share_inline_query(movie_id: str) -> str:
+    return f"mshare_{str(movie_id or '').strip()}"
+
+
+def build_movie_keyboard(
+    movie_id: str,
+    counts: dict[str, int] | None = None,
+    user_reaction: str | None = None,
+    lang: str = "en",
+    share_query: str | None = None,
+    share_url: str | None = None,
+) -> InlineKeyboardMarkup:
+    counts_map = counts or {}
+    like = int(counts_map.get("like", 0) or 0)
+    dislike = int(counts_map.get("dislike", 0) or 0)
+    berry = int(counts_map.get("berry", 0) or 0)
+    whale = int(counts_map.get("whale", 0) or 0)
+    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
+
+    def label(key: str, emoji: str, count: int) -> str:
+        prefix = "★ " if user_reaction == key else ""
+        return f"{prefix}{emoji} {count}"
+
+    share_label = msgs.get("movie_share_button", "🔗 Share")
+    if share_query:
+        share_button = InlineKeyboardButton(share_label, switch_inline_query=share_query)
+    elif share_url:
+        share_button = InlineKeyboardButton(share_label, url=share_url)
+    else:
+        # Fallback for old call-sites/messages; new flow passes URL for one-tap share.
+        share_button = InlineKeyboardButton(share_label, callback_data=f"mshare:{movie_id}")
+
+    rows = [
+        [
+            InlineKeyboardButton(label("whale", MOVIE_REACTION_EMOJI["whale"], whale), callback_data=f"mreact:{movie_id}:whale"),
+            InlineKeyboardButton(label("berry", MOVIE_REACTION_EMOJI["berry"], berry), callback_data=f"mreact:{movie_id}:berry"),
+            InlineKeyboardButton(label("like", MOVIE_REACTION_EMOJI["like"], like), callback_data=f"mreact:{movie_id}:like"),
+            InlineKeyboardButton(label("dislike", MOVIE_REACTION_EMOJI["dislike"], dislike), callback_data=f"mreact:{movie_id}:dislike"),
+        ],
+        [share_button],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 def build_user_info_text(user: dict) -> str:
     name = " ".join([p for p in [user.get("first_name"), user.get("last_name")] if p]).strip() or "—"
     username = f"@{user.get('username')}" if user.get("username") else "—"
@@ -868,6 +1144,15 @@ def _extract_requested_book_id(query_text: str) -> str | None:
     return value or None
 
 
+def _resolve_audiobook_request_book_id(record: dict | None) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    direct = str(record.get("book_id") or "").strip()
+    if direct:
+        return direct
+    return _extract_requested_book_id(str(record.get("query") or ""))
+
+
 async def _notify_waiting_users_audiobook_ready(
     context: ContextTypes.DEFAULT_TYPE,
     book_id: str,
@@ -889,16 +1174,40 @@ async def _notify_waiting_users_audiobook_ready(
     mark_done_fn = globals().get("mark_request_fulfilled")
     update_status_fn = globals().get("update_request_status")
     notified = 0
+    notified_users: set[int] = set()
+
+    async def _mark_done_for_request(req: dict) -> None:
+        req_id = req.get("id")
+        if not req_id:
+            return
+        try:
+            if callable(mark_done_fn):
+                await run_blocking(mark_done_fn, req_id, book_id)
+            elif callable(update_status_fn):
+                await run_blocking(update_status_fn, req_id, "done", None, "Audiobook added automatically")
+        except Exception as e:
+            logger.warning("Failed to mark audiobook request as done (request_id=%s): %s", req.get("id"), e)
 
     for req in requests:
         if str(req.get("status") or "") not in {"open", "seen"}:
             continue
-        req_book_id = _extract_requested_book_id(str(req.get("query") or ""))
+        req_book_id = _resolve_audiobook_request_book_id(req)
         if not req_book_id or str(req_book_id).strip() != str(book_id).strip():
             continue
 
         user_id = req.get("user_id")
         if not user_id:
+            continue
+        try:
+            target_user_id = int(user_id)
+        except Exception:
+            continue
+        if target_user_id <= 0:
+            continue
+
+        # Multiple open requests can exist for one user+book. Notify once, then just mark the rest done.
+        if target_user_id in notified_users:
+            await _mark_done_for_request(req)
             continue
 
         req_lang = req.get("language") or "en"
@@ -912,26 +1221,18 @@ async def _notify_waiting_users_audiobook_ready(
         )
 
         try:
-            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+            await context.bot.send_message(chat_id=target_user_id, text=text, reply_markup=keyboard)
         except Exception as e:
             logger.warning(
                 "Failed to send audiobook-ready message to user=%s for book_id=%s: %s",
-                user_id,
+                target_user_id,
                 book_id,
                 e,
             )
             continue
 
-        try:
-            req_id = req.get("id")
-            if req_id:
-                if callable(mark_done_fn):
-                    await run_blocking(mark_done_fn, req_id, book_id)
-                elif callable(update_status_fn):
-                    await run_blocking(update_status_fn, req_id, "done", None, "Audiobook added automatically")
-        except Exception as e:
-            logger.warning("Failed to mark audiobook request as done (request_id=%s): %s", req.get("id"), e)
-
+        await _mark_done_for_request(req)
+        notified_users.add(target_user_id)
         notified += 1
 
     return notified
@@ -1282,7 +1583,17 @@ async def _handle_missing_audiobook_request(
     try:
         send_request = globals().get("send_request_to_admin")
         if callable(send_request) and update.effective_user:
-            await send_request(context, update.effective_user, request_query, lang)
+            try:
+                await send_request(
+                    context,
+                    update.effective_user,
+                    request_query,
+                    lang,
+                    book_id=book_id,
+                )
+            except TypeError:
+                # Backward compatibility for older bot bridge signatures.
+                await send_request(context, update.effective_user, request_query, lang)
     except Exception as e:
         logger.warning("Failed to send audiobook request to admin group (book_id=%s): %s", book_id, e)
 
@@ -1313,6 +1624,15 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     book_id = data.split(":", 1)[1]
+
+    reaction_state_key, reaction_state_seq = _reserve_callback_reaction_seq(query, context)
+    await _send_callback_reaction_with_fallbacks(
+        query,
+        context,
+        ("🥰", "❤️", "👍"),
+        state_key=reaction_state_key,
+        state_seq=reaction_state_seq,
+    )
 
     # Get the audiobook for this book
     audio_book = await run_blocking(get_audio_book_for_book, book_id)
@@ -1704,6 +2024,15 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if handled:
                 return
 
+        # Keep search mode stable between messages.
+        search_mode = str(context.user_data.get("search_mode") or "").strip().lower()
+        if search_mode == "movie":
+            context.user_data["awaiting_movie_search"] = True
+            context.user_data["awaiting_book_search"] = False
+        elif search_mode == "book":
+            if not bool(context.user_data.get("awaiting_movie_search")):
+                context.user_data["awaiting_book_search"] = True
+
         limited, wait_s = spam_check_message(update, context)
         if limited:
             await update.message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
@@ -1730,7 +2059,7 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         pending_bonus = context.user_data.get("awaiting_user_bonus")
-        if pending_bonus and update.effective_user.id in {ADMIN_ID, OWNER_ID}:
+        if pending_bonus and _is_admin_user(update.effective_user.id):
             if time.time() > pending_bonus.get("expires_at", 0):
                 context.user_data.pop("awaiting_user_bonus", None)
             else:
@@ -1776,7 +2105,7 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Admin reply to request status
         pending = context.user_data.get("pending_request_reply")
-        if pending and update.effective_user.id in {ADMIN_ID, OWNER_ID}:
+        if pending and _is_admin_user(update.effective_user.id):
             if time.time() > pending.get("expires_at", 0):
                 context.user_data.pop("pending_request_reply", None)
             else:
@@ -1824,7 +2153,7 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Admin reply to upload access request
         pending_upload = context.user_data.get("pending_upload_reply")
-        if pending_upload and update.effective_user.id in {ADMIN_ID, OWNER_ID}:
+        if pending_upload and _is_admin_user(update.effective_user.id):
             if time.time() > pending_upload.get("expires_at", 0):
                 context.user_data.pop("pending_upload_reply", None)
             else:
@@ -1877,7 +2206,7 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Admin adding audiobook parts
         pending_abook = context.user_data.get("pending_abook")
-        if pending_abook and update.effective_user.id in {ADMIN_ID, OWNER_ID}:
+        if pending_abook and _is_admin_user(update.effective_user.id):
             # allow cancelling/finishing via text
             if update.message.text:
                 t = update.message.text.strip().lower()
@@ -2023,10 +2352,22 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     es_results += await run_blocking(search_movies_es, translit_movie_query, MAX_SEARCH_RESULTS)
 
                 unique_matches: dict[str, dict[str, Any]] = {}
+                existing_movie_id_cache: dict[str, bool] = {}
                 for movie, score, es_id in es_results:
                     row = movie or {}
                     mid = str(row.get("id") or es_id or "").strip()
                     if not mid:
+                        continue
+                    exists_in_db = existing_movie_id_cache.get(mid)
+                    if exists_in_db is None:
+                        try:
+                            exists_in_db = bool(await run_blocking(db_get_movie_by_id, mid))
+                        except Exception as e:
+                            logger.warning("movie search DB existence check failed for id=%s: %s", mid, e)
+                            # Fail open if DB check transiently fails.
+                            exists_in_db = True
+                        existing_movie_id_cache[mid] = exists_in_db
+                    if not exists_in_db:
                         continue
                     title_base = str(row.get("display_name") or row.get("movie_name") or f"Movie {len(unique_matches) + 1}")
                     year_val = row.get("release_year")
@@ -2559,13 +2900,33 @@ async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_T
         file_id = str(movie.get("file_id") or "").strip()
         local_path = movie.get("path")
         title = str(movie.get("display_name") or movie.get("movie_name") or "Movie")
+        raw_caption = str(movie.get("caption_text") or "").strip()
+        base_caption = _movie_caption_without_links(raw_caption) or title
+        delivery_caption = _compose_movie_delivery_caption(base_caption, lang)
+        reaction_counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
+        user_reaction = None
+        try:
+            reaction_counts = await run_blocking(db_get_movie_reaction_counts, movie_id)
+            user_reaction = await run_blocking(db_get_user_movie_reaction, movie_id, query.from_user.id)
+        except Exception:
+            reaction_counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
+            user_reaction = None
+        share_query = _build_movie_share_inline_query(movie_id)
+        movie_kb = build_movie_keyboard(
+            movie_id=movie_id,
+            counts=reaction_counts,
+            user_reaction=user_reaction,
+            lang=lang,
+            share_query=share_query,
+        )
         sent_ok = False
         if file_id:
             try:
                 await context.bot.send_document(
                     chat_id=query.message.chat_id,
                     document=file_id,
-                    caption=title[:1024],
+                    caption=delivery_caption,
+                    reply_markup=movie_kb,
                 )
                 sent_ok = True
             except Exception:
@@ -2573,7 +2934,8 @@ async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_T
                     await context.bot.send_video(
                         chat_id=query.message.chat_id,
                         video=file_id,
-                        caption=title[:1024],
+                        caption=delivery_caption,
+                        reply_markup=movie_kb,
                     )
                     sent_ok = True
                 except Exception:
@@ -2585,7 +2947,8 @@ async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_T
                     await context.bot.send_document(
                         chat_id=query.message.chat_id,
                         document=InputFile(f, filename=os.path.basename(local_path)),
-                        caption=title[:1024],
+                        caption=delivery_caption,
+                        reply_markup=movie_kb,
                     )
                 sent_ok = True
             except Exception:
@@ -2623,6 +2986,129 @@ async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_T
         lang = ensure_user_language(update, context)
         await update.callback_query.message.reply_text(MESSAGES[lang]["error"])
         raise
+
+
+async def handle_movie_reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if update.effective_user and await is_stopped_user(update.effective_user.id):
+        await safe_answer(query)
+        return
+    lang = ensure_user_language(update, context)
+    limited, wait_s = spam_check_callback(update, context)
+    if limited:
+        await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
+        return
+    try:
+        _, movie_id, reaction = str(query.data or "").split(":", 2)
+    except Exception:
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
+
+    if reaction not in MOVIE_REACTION_EMOJI:
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
+
+    reaction_emojis = {
+        "whale": ("❤️", "🐳"),
+        "berry": ("😍", "🍓", "❤️"),
+        "like": ("🥰", "👍", "❤️"),
+        "dislike": ("😒", "💔"),
+    }.get(reaction, ("❤️",))
+    reaction_state_key, reaction_state_seq = _reserve_callback_reaction_seq(query, context)
+
+    try:
+        old_reaction = await run_blocking(db_get_user_movie_reaction, movie_id, query.from_user.id)
+        if old_reaction == reaction:
+            await _send_callback_reaction_with_fallbacks(
+                query,
+                context,
+                reaction_emojis,
+                state_key=reaction_state_key,
+                state_seq=reaction_state_seq,
+            )
+            await safe_answer(query)
+            return
+
+        await run_blocking(db_set_movie_reaction, query.from_user.id, movie_id, reaction)
+        await _run_db_retry(db_increment_counter, f"movie_reaction_{reaction}", 1)
+        await _send_callback_reaction_with_fallbacks(
+            query,
+            context,
+            reaction_emojis,
+            state_key=reaction_state_key,
+            state_seq=reaction_state_seq,
+        )
+
+        if query.message:
+            counts = await run_blocking(db_get_movie_reaction_counts, movie_id)
+            user_reaction = await run_blocking(db_get_user_movie_reaction, movie_id, query.from_user.id)
+            share_query = _build_movie_share_inline_query(movie_id)
+            try:
+                await query.message.edit_reply_markup(
+                    reply_markup=build_movie_keyboard(
+                        movie_id=movie_id,
+                        counts=counts,
+                        user_reaction=user_reaction,
+                        lang=lang,
+                        share_query=share_query,
+                    )
+                )
+            except Exception:
+                pass
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("Movie reaction update failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_movie_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if update.effective_user and await is_stopped_user(update.effective_user.id):
+        await safe_answer(query)
+        return
+    lang = ensure_user_language(update, context)
+    limited, wait_s = spam_check_callback(update, context)
+    if limited:
+        await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
+        return
+    try:
+        _, movie_id = str(query.data or "").split(":", 1)
+    except Exception:
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
+
+    movie = await run_blocking(db_get_movie_by_id, movie_id)
+    if not movie:
+        await safe_answer(query, MESSAGES[lang].get("movie_not_found", MESSAGES[lang]["book_not_found"]), show_alert=True)
+        return
+    if not query.message:
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
+
+    share_url = _build_movie_share_url(movie, lang, context)
+    counts = await run_blocking(db_get_movie_reaction_counts, movie_id)
+    user_reaction = await run_blocking(db_get_user_movie_reaction, movie_id, query.from_user.id)
+    share_query = _build_movie_share_inline_query(movie_id)
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=build_movie_keyboard(
+                movie_id=movie_id,
+                counts=counts,
+                user_reaction=user_reaction,
+                lang=lang,
+                share_query=share_query,
+            )
+        )
+    except Exception:
+        pass
+    try:
+        await query.answer(MESSAGES.get(lang, MESSAGES.get("en", {})).get("movie_share_prompt", "Use share button")[:180], show_alert=False)
+    except Exception:
+        await safe_answer(query)
 
 
 async def handle_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -24,13 +24,14 @@ _MENU_BACKED_PUBLIC_COMMANDS = {
     "movie_upload",
 }
 
-_PUBLIC_PREFERRED_ORDER = ("start", "language", "myprofile", "favorite", "request", "requests")
+_PUBLIC_PREFERRED_ORDER = ("start", "random", "language", "myprofile", "favorite", "request", "requests")
 
 
 def get_public_commands(lang: str = "en") -> list[BotCommand]:
     localized = {
         "en": [
             BotCommand("start", "🚀 Start / choose language"),
+            BotCommand("random", "🎲 Get 10 random books"),
             BotCommand("help", "❓ How to use the bot"),
             BotCommand("pdf_maker", "📄 Make PDF from text"),
             BotCommand("pdf_editor", "🧰 Edit PDF files"),
@@ -49,6 +50,7 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
         ],
         "ru": [
             BotCommand("start", "🚀 Запуск / выбор языка"),
+            BotCommand("random", "🎲 10 случайных книг"),
             BotCommand("help", "❓ Как пользоваться ботом"),
             BotCommand("pdf_maker", "📄 PDF из текста"),
             BotCommand("pdf_editor", "🧰 Редактировать PDF"),
@@ -67,6 +69,7 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
         ],
         "uz": [
             BotCommand("start", "🚀 Botni ishga tushirish / til tanlash"),
+            BotCommand("random", "🎲 10 ta tasodifiy kitob"),
             BotCommand("help", "❓ Botdan foydalanish"),
             BotCommand("pdf_maker", "📄 Matndan PDF yaratish"),
             BotCommand("pdf_editor", "🧰 PDF fayl tahrirlash"),
@@ -141,20 +144,7 @@ def get_group_admin_commands(lang: str = "en") -> list[BotCommand]:
     return localized.get(lang, localized["en"])
 
 
-def _owner_minimal_commands(lang: str = "en") -> list[BotCommand]:
-    by_name = {cmd.command: cmd for cmd in get_public_commands(lang)}
-    ordered: list[BotCommand] = []
-    for name in ("start", "language", "myprofile", "favorite", "request", "requests", "upload", "movie_upload"):
-        cmd = by_name.get(name)
-        if cmd:
-            ordered.append(cmd)
-    return ordered
-
-
-def get_admin_commands(lang: str = "en", *, owner_user: bool = False) -> list[BotCommand]:
-    if owner_user:
-        return _owner_minimal_commands(lang)
-
+def get_admin_commands(lang: str = "en") -> list[BotCommand]:
     # Keep upload commands out of public menu, but include them for admin command menu.
     base = list(get_public_commands_for_menu(lang))
     by_name = {cmd.command: cmd for cmd in get_public_commands(lang)}
@@ -186,13 +176,25 @@ async def set_bot_commands(
     application,
     *,
     owner_id: int | None,
-    admin_id: int | None,
     logger: logging.Logger,
 ) -> None:
     try:
         await application.bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
         await application.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
         await application.bot.delete_my_commands(scope=BotCommandScopeAllChatAdministrators())
+        if owner_id:
+            try:
+                await application.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=owner_id))
+            except Exception:
+                pass
+            for lang in ("en", "ru", "uz"):
+                try:
+                    await application.bot.delete_my_commands(
+                        scope=BotCommandScopeChat(chat_id=owner_id),
+                        language_code=lang,
+                    )
+                except Exception:
+                    pass
 
         await application.bot.set_my_commands(
             get_public_commands_for_menu("en"),
@@ -214,15 +216,6 @@ async def set_bot_commands(
                 scope=BotCommandScopeAllChatAdministrators(),
                 language_code=lang,
             )
-
-        scoped_admin_id = owner_id or admin_id
-        if scoped_admin_id:
-            for lang in ("en", "ru", "uz"):
-                await application.bot.set_my_commands(
-                    get_admin_commands(lang, owner_user=(owner_id is not None and scoped_admin_id == owner_id)),
-                    scope=BotCommandScopeChat(chat_id=scoped_admin_id),
-                    language_code=lang,
-                )
         logger.debug("Bot commands set successfully")
     except Exception as e:
         logger.error(f"Failed to set bot commands: {e}")
@@ -234,7 +227,6 @@ async def sync_user_commands_if_needed(
     user_id: int | None,
     lang: str,
     owner_id: int | None,
-    admin_id: int | None,
     logger: logging.Logger,
 ) -> None:
     if not context or not user_id:
@@ -247,9 +239,7 @@ async def sync_user_commands_if_needed(
         cached_lang = cache.get(user_id)
         if cached_lang == lang:
             return
-        is_admin_user = user_id in {x for x in (admin_id, owner_id) if x}
-        owner_user = bool(owner_id and user_id == owner_id)
-        commands = get_admin_commands(lang, owner_user=owner_user) if is_admin_user else get_public_commands_for_menu(lang)
+        commands = get_public_commands_for_menu(lang)
         await context.bot.set_my_commands(
             commands,
             scope=BotCommandScopeChat(chat_id=user_id),

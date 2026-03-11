@@ -3,7 +3,17 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 # Dictionary of interface messages in multiple languages
 MESSAGES = {
     "uz": {
-        "greeting": "📚 Xush kelibsiz!\n👇 Davom etish uchun pastdagi menyudan bo‘lim tanlang.",
+        "greeting": (
+            "Assalomu alaykum 👋\n"
+            "{first_name}\n\n"
+            "<blockquote>Smart AI Tools Bot ga xush kelibsiz!\n\n"
+            "Quyidagilardan birini tanlang:</blockquote>\n\n"
+            "📚 Kitob qidirish\n"
+            "🎬 Kino qidirish\n"
+            "🤖 AI vositalar\n"
+            "📥 Video yuklash\n"
+            "🧰 Boshqa funksiyalar"
+        ),
         "start_menu_title": "Assalomu alaykum, {name} 👋",
         "start_menu_subtitle": "Kerakli bo‘limni tanlang 👇",
         "menu_search_books": "🔎 Kitob qidirish",
@@ -52,6 +62,16 @@ MESSAGES = {
         "menu_search_click_first_hint": "📚 Kitob qidirish uchun avval `🔎 Kitob qidirish` tugmasini bosing.\n🔎 So‘ng kerakli kitob nomini oddiy matn qilib yuboring.",
         "menu_search_image_hint": "🖼️ Hozircha rasm ichidagi kitob nomini o‘qib qidira olmayman.\n🔎 Iltimos, kitob nomini matn ko‘rinishida yuboring.\n✨ Keyinroq rasm tavsifi funksiyasi qo‘shilishi mumkin.",
         "menu_request_prompt": "📝 Kerakli kitob nomini yuboring. So‘rov adminlarga yuboriladi.",
+        "menu_name_meanings_prompt": "🪪 Ism yuboring, ma'nosini ko'rsataman.\n\nMasalan:\n• Abdulloh\n• Mohira\n• Sevara",
+        "name_meanings_processing": "🪪 Ism ma'nosi qidirilmoqda... Iltimos, kuting.",
+        "name_meanings_not_found": "❌ Bu ism bo'yicha ma'no topilmadi.\n💡 Boshqa yozilishi bilan qayta urinib ko'ring.",
+        "name_meanings_results_header": "🪪 '{query}' uchun ism ma'nolari",
+        "name_meanings_gender_male": "o'g'il",
+        "name_meanings_gender_female": "qiz",
+        "name_meanings_gender_unisex": "unisex",
+        "name_meanings_meaning_unknown": "Ma'no topilmadi.",
+        "name_meanings_origin_prefix": "Kelib chiqishi: {origin}",
+        "name_meanings_dataset_unavailable": "⚠️ Ismlar bazasi hali yuklanmagan.\n\nAdmin uchun: PostgreSQL ishga tushiring va `uzbek_names_natural_40000_postgresql.sql` faylini import qiling.",
         "contact_admin_info": "📞 Admin bilan aloqa\n👤 Bot egasi/dasturchi: {owner}\n🌍 Guruh: {group}",
         "menu_use_command_hint": "👇 Bu bo‘lim menyu orqali ochiladi.",
         "menu_flow_cancelled": "❌ Oldingi jarayon bekor qilindi.",
@@ -76,11 +96,12 @@ MESSAGES = {
         "upload_inactive": "⚠️ Yuklash rejimi faol emas yoki sizga ruxsat berilmagan.",
         "upload_activated": "📥 Yuklash rejimi yoqildi. Kitob fayllarini yuboring.",
         "movie_upload_activated": "🎬 Kino yuklash rejimi yoqildi. Video fayllarni yuboring.",
-        "movie_upload_no_channel": "⚠️ VIDEO_UPLOAD_CHANNEL_ID sozlanmagan. Avval video kanal ID ni kiriting.",
+        "movie_upload_no_channel": "⚠️ VIDEO_UPLOAD_CHANNEL_IDS/VIDEO_UPLOAD_CHANNEL_ID sozlanmagan. Avval video kanallar ID larini kiriting.",
         "movie_upload_help_prompt": "🎬 Bot bazasiga kinolar qo'shishni xohlaysizmi? Bu media bazani kengaytirishga yordam beradi.",
         "not_authorized": "❌ Sizga bu buyruqni ishlatishga ruxsat berilmagan.",
         "results_for": "📖 Natijalar",
         "results_header": "📚 Natijalar '{query}' uchun (sahifa {page}/{pages}, jami {total})",
+        "random_results_query": "🎲 Tasodifiy kitoblar",
         "movie_results_header": "🎬 Kino natijalari '{query}' uchun (sahifa {page}/{pages}, jami {total})",
         "top_header": "🔥 Top kitoblar (sahifa {page}/{pages}, jami {total})",
         "top_empty": "❌ Top roʻyxat bo‘sh.",
@@ -93,6 +114,11 @@ MESSAGES = {
         "book_not_found": "⚠️ Kitob topilmadi.\n💡 Nomni aniqroq yozib yana yuboring.",
         "movie_not_found": "⚠️ Kino topilmadi.\n💡 Nomni aniqroq yozib yana yuboring.",
         "movie_unavailable": "❌ Kino fayli mavjud emas yoki yuborib bo'lmadi.",
+        "movie_caption_bot_info": "🤖 @SmartAIToolsBot | Kitoblar • Kinolar • AI vositalar",
+        "movie_share_button": "🔗 Ulashish",
+        "movie_share_open_button": "📤 Hozir ulashish",
+        "movie_share_prompt": "📤 Kinoni ulashish uchun pastdagi tugmani bosing.",
+        "movie_share_text": "🎬 Kino tavsiyasi: {title}\n\n🤖 {bot} orqali toping.",
         "after_book_group_invite": "📚 Yangi kitoblar, muhokamalar va foydali tavsiyalar uchun guruhimizga qo‘shiling.",
         "after_book_group_button": "🌍 Guruhga qo‘shilish",
         "audit_failed": "⚠️ Audit bajarilmadi, loglarni tekshiring.",
@@ -376,7 +402,17 @@ MESSAGES = {
         "book_next_search_hint": "😊❤️ Yana kitob kerakmi? Kitob nomini to‘g‘ridan-to‘g‘ri yuboring."
     },
     "en": {
-        "greeting": "📚 Welcome!\n👇 Choose a section from the menu below to continue.",
+        "greeting": (
+            "Hello 👋\n"
+            "{first_name}\n\n"
+            "<blockquote>Welcome to Smart AI Tools Bot!\n\n"
+            "Choose one of the following:</blockquote>\n\n"
+            "📚 Book Search\n"
+            "🎬 Movie Search\n"
+            "🤖 AI Tools\n"
+            "📥 Video Upload\n"
+            "🧰 Other Functions"
+        ),
         "start_menu_title": "Welcome, {name} 👋",
         "start_menu_subtitle": "Choose what you want to do 👇",
         "menu_search_books": "🔎 Search Books",
@@ -425,6 +461,16 @@ MESSAGES = {
         "menu_search_click_first_hint": "📚 To search for a book, first tap `🔎 Search Books`.\n🔎 Then send the book name as a normal message.",
         "menu_search_image_hint": "🖼️ I can’t read a book name from an image for search yet.\n🔎 Please send the book name as text.\n✨ An image description feature may be added later.",
         "menu_request_prompt": "📝 Send the book name you need. Your request will be sent to admins.",
+        "menu_name_meanings_prompt": "🪪 Send a name to see its meaning.\n\nExamples:\n• Abdulloh\n• Mohira\n• Sevara",
+        "name_meanings_processing": "🪪 Looking up name meaning... please wait.",
+        "name_meanings_not_found": "❌ Name meaning not found.\n💡 Try another spelling.",
+        "name_meanings_results_header": "🪪 Name meanings for '{query}'",
+        "name_meanings_gender_male": "male",
+        "name_meanings_gender_female": "female",
+        "name_meanings_gender_unisex": "unisex",
+        "name_meanings_meaning_unknown": "Meaning not available.",
+        "name_meanings_origin_prefix": "Origin: {origin}",
+        "name_meanings_dataset_unavailable": "⚠️ Name meanings dataset is not loaded yet.\n\nFor admin: start PostgreSQL and import `uzbek_names_natural_40000_postgresql.sql`.",
         "contact_admin_info": "📞 Contact Admin\n👤 Bot owner/developer: {owner}\n🌍 Group: {group}",
         "menu_use_command_hint": "👇 This section is available from the menu.",
         "menu_flow_cancelled": "❌ Previous process was cancelled.",
@@ -449,11 +495,12 @@ MESSAGES = {
         "upload_inactive": "⚠️ Upload mode is not active or you are not authorized.",
         "upload_activated": "📥 Upload mode activated. Forward me book files.",
         "movie_upload_activated": "🎬 Movie upload mode activated. Send video files.",
-        "movie_upload_no_channel": "⚠️ VIDEO_UPLOAD_CHANNEL_ID is not set. Please set the video channel ID first.",
+        "movie_upload_no_channel": "⚠️ VIDEO_UPLOAD_CHANNEL_IDS/VIDEO_UPLOAD_CHANNEL_ID is not set. Please configure video channel IDs first.",
         "movie_upload_help_prompt": "🎬 Do you want to add movies to the bot database and help expand the media library?",
         "not_authorized": "❌ You are not authorized to use this command.",
         "results_for": "📖 Results for",
         "results_header": "📚 Results for '{query}' (page {page}/{pages}, total {total})",
+        "random_results_query": "🎲 Random books",
         "movie_results_header": "🎬 Movie results for '{query}' (page {page}/{pages}, total {total})",
         "top_header": "🔥 Top books (page {page}/{pages}, total {total})",
         "top_empty": "❌ Top list is empty.",
@@ -466,6 +513,11 @@ MESSAGES = {
         "book_not_found": "⚠️ Book not found.\n💡 Try a clearer full title or author name.",
         "movie_not_found": "⚠️ Movie not found.\n💡 Try a clearer movie title.",
         "movie_unavailable": "❌ Movie file is unavailable or failed to send.",
+        "movie_caption_bot_info": "🤖 @SmartAIToolsBot | Books • Movies • AI tools",
+        "movie_share_button": "🔗 Share",
+        "movie_share_open_button": "📤 Share now",
+        "movie_share_prompt": "📤 Tap the button below to share this movie.",
+        "movie_share_text": "🎬 Movie recommendation: {title}\n\n🤖 Find it in {bot}.",
         "after_book_group_invite": "📚 Join our group for new books, discussions, and useful recommendations.",
         "after_book_group_button": "🌍 Join Group",
         "audit_failed": "⚠️ Audit failed, check logs.",
@@ -776,7 +828,17 @@ MESSAGES = {
         "use_buttons": "💡 Use the buttons below to get a book."
     },
     "ru": {
-        "greeting": "📚 Добро пожаловать!\n👇 Выберите раздел в меню ниже, чтобы продолжить.",
+        "greeting": (
+            "Здравствуйте 👋\n"
+            "{first_name}\n\n"
+            "<blockquote>Добро пожаловать в Smart AI Tools Bot!\n\n"
+            "Выберите один из следующих разделов:</blockquote>\n\n"
+            "📚 Поиск книг\n"
+            "🎬 Поиск фильмов\n"
+            "🤖 AI инструменты\n"
+            "📥 Загрузка видео\n"
+            "🧰 Другие функции"
+        ),
         "start_menu_title": "Здравствуйте, {name} 👋",
         "start_menu_subtitle": "Выберите нужный раздел 👇",
         "menu_search_books": "🔎 Поиск книг",
@@ -825,6 +887,16 @@ MESSAGES = {
         "menu_search_click_first_hint": "📚 Чтобы искать книги, сначала нажмите `🔎 Поиск книг`.\n🔎 Затем отправьте название книги обычным сообщением.",
         "menu_search_image_hint": "🖼️ Пока я не умею читать название книги с изображения для поиска.\n🔎 Пожалуйста, отправьте название книги текстом.\n✨ Позже может быть добавлена функция описания изображения.",
         "menu_request_prompt": "📝 Отправьте название нужной книги. Запрос будет отправлен администраторам.",
+        "menu_name_meanings_prompt": "🪪 Отправьте имя, и я покажу его значение.\n\nНапример:\n• Abdulloh\n• Mohira\n• Sevara",
+        "name_meanings_processing": "🪪 Ищу значение имени... пожалуйста, подождите.",
+        "name_meanings_not_found": "❌ Значение этого имени не найдено.\n💡 Попробуйте другой вариант написания.",
+        "name_meanings_results_header": "🪪 Значения имени для '{query}'",
+        "name_meanings_gender_male": "муж.",
+        "name_meanings_gender_female": "жен.",
+        "name_meanings_gender_unisex": "унисекс",
+        "name_meanings_meaning_unknown": "Значение недоступно.",
+        "name_meanings_origin_prefix": "Происхождение: {origin}",
+        "name_meanings_dataset_unavailable": "⚠️ База значений имён ещё не загружена.\n\nДля админа: запустите PostgreSQL и импортируйте `uzbek_names_natural_40000_postgresql.sql`.",
         "contact_admin_info": "📞 Связь с админом\n👤 Владелец/разработчик бота: {owner}\n🌍 Группа: {group}",
         "menu_use_command_hint": "👇 Этот раздел доступен через меню.",
         "menu_flow_cancelled": "❌ Предыдущий процесс отменён.",
@@ -849,11 +921,12 @@ MESSAGES = {
         "upload_inactive": "⚠️ Режим загрузки не активен или у вас нет доступа.",
         "upload_activated": "📥 Режим загрузки активирован. Перешлите мне файлы книг.",
         "movie_upload_activated": "🎬 Режим загрузки фильмов активирован. Отправьте видеофайлы.",
-        "movie_upload_no_channel": "⚠️ VIDEO_UPLOAD_CHANNEL_ID не задан. Сначала укажите ID канала для видео.",
+        "movie_upload_no_channel": "⚠️ VIDEO_UPLOAD_CHANNEL_IDS/VIDEO_UPLOAD_CHANNEL_ID не задан. Сначала укажите ID каналов для видео.",
         "movie_upload_help_prompt": "🎬 Хотите добавлять фильмы в базу бота? Это поможет расширить медиатеку.",
         "not_authorized": "❌ У вас нет прав для использования этой команды.",
         "results_for": "📖 Результаты",
         "results_header": "📚 Результаты по запросу '{query}' (страница {page}/{pages}, всего {total})",
+        "random_results_query": "🎲 Случайные книги",
         "movie_results_header": "🎬 Результаты фильмов по запросу '{query}' (страница {page}/{pages}, всего {total})",
         "top_header": "🔥 Топ книг (страница {page}/{pages}, всего {total})",
         "top_empty": "❌ Топ список пуст.",
@@ -866,6 +939,11 @@ MESSAGES = {
         "book_not_found": "⚠️ Книга не найдена.\n💡 Попробуйте более точное полное название или автора.",
         "movie_not_found": "⚠️ Фильм не найден.\n💡 Уточните название фильма.",
         "movie_unavailable": "❌ Файл фильма недоступен или не удалось отправить.",
+        "movie_caption_bot_info": "🤖 @SmartAIToolsBot | Книги • Фильмы • AI инструменты",
+        "movie_share_button": "🔗 Поделиться",
+        "movie_share_open_button": "📤 Поделиться сейчас",
+        "movie_share_prompt": "📤 Нажмите кнопку ниже, чтобы поделиться этим фильмом.",
+        "movie_share_text": "🎬 Рекомендация фильма: {title}\n\n🤖 Найти можно в {bot}.",
         "after_book_group_invite": "📚 Вступайте в нашу группу: новые книги, обсуждения и полезные рекомендации.",
         "after_book_group_button": "🌍 Вступить в группу",
         "audit_failed": "⚠️ Аудит не выполнен, проверьте логи.",

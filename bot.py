@@ -11,6 +11,8 @@ import math
 import asyncio
 import fcntl
 import atexit
+import html
+from logging.handlers import RotatingFileHandler
 from functools import partial
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +24,10 @@ from telegram import InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import InlineQueryHandler
 import uuid
 from telegram import InlineQueryResultCachedDocument
+try:
+    from telegram import InlineQueryResultCachedVideo
+except Exception:
+    InlineQueryResultCachedVideo = None  # type: ignore
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update, InputFile
 
 from urllib3.exceptions import InsecureRequestWarning
@@ -60,7 +66,6 @@ except Exception:
 from config import (
     TOKEN,
     OWNER_ID,
-    ADMIN_ID,
     REQUEST_CHAT_ID,
     COIN_SEARCH,
     COIN_DOWNLOAD,
@@ -70,7 +75,9 @@ from config import (
     TOP_USERS_LIMIT,
     UPLOAD_CHANNEL_IDS,
     AUDIO_UPLOAD_CHANNEL_ID,
+    VIDEO_UPLOAD_CHANNEL_IDS,
     VIDEO_UPLOAD_CHANNEL_ID,
+    validate_runtime_config,
 )
 
 from db import (
@@ -88,6 +95,9 @@ from db import (
     get_user_coin_adjustment as db_get_user_coin_adjustment,
     delete_users_by_ids,
     insert_removed_users,
+    insert_admin_task_run as db_insert_admin_task_run,
+    update_admin_task_run as db_update_admin_task_run,
+    list_admin_task_runs as db_list_admin_task_runs,
     add_favorite as db_add_favorite,
     remove_favorite as db_remove_favorite,
     is_favorited as db_is_favorited,
@@ -113,12 +123,16 @@ from db import (
     get_upload_request_status_counts as db_get_upload_request_status_counts,
     get_user_status_counts as db_get_user_status_counts,
     get_reaction_totals as db_get_reaction_totals,
+    get_movie_reaction_totals as db_get_movie_reaction_totals,
     get_user_reaction as db_get_user_reaction,
+    get_user_movie_reaction as db_get_user_movie_reaction,
     award_reaction_action as db_award_reaction_action,
     get_user_reaction_awards_count as db_get_user_reaction_awards_count,
     get_daily_analytics as db_get_daily_analytics,
     get_user_daily_counts as db_get_user_daily_counts,
     list_books as db_list_books,
+    get_random_books as db_get_random_books,
+    get_random_book as db_get_random_book,
     get_book_by_id as db_get_book_by_id,
     get_book_summary as db_get_book_summary,
     get_book_by_path as db_get_book_by_path,
@@ -140,6 +154,8 @@ from db import (
     increment_book_download as db_increment_book_download,
     increment_book_searches as db_increment_book_searches,
     set_book_reaction as db_set_book_reaction,
+    set_movie_reaction as db_set_movie_reaction,
+    get_movie_reaction_counts as db_get_movie_reaction_counts,
     get_book_stats as db_get_book_stats,
     get_top_books as db_get_top_books,
     get_top_users as db_get_top_users,
@@ -223,7 +239,8 @@ import tts_tools as _tts_tools
 logger = logging.getLogger(__name__)
 
 # Explicit bridge deps: DB symbols are consumed indirectly by extracted modules
-# via configure(globals()). This keeps IDE static analysis from dimming them as unused.
+# via module configure(...) dependency injection. This keeps IDE static analysis
+# from dimming them as unused.
 _BRIDGE_DB_SYMBOLS = (
     init_db,
     get_user,
@@ -239,6 +256,9 @@ _BRIDGE_DB_SYMBOLS = (
     db_get_user_coin_adjustment,
     delete_users_by_ids,
     insert_removed_users,
+    db_insert_admin_task_run,
+    db_update_admin_task_run,
+    db_list_admin_task_runs,
     db_add_favorite,
     db_remove_favorite,
     db_is_favorited,
@@ -264,7 +284,9 @@ _BRIDGE_DB_SYMBOLS = (
     db_get_upload_request_status_counts,
     db_get_user_status_counts,
     db_get_reaction_totals,
+    db_get_movie_reaction_totals,
     db_get_user_reaction,
+    db_get_user_movie_reaction,
     db_award_reaction_action,
     db_get_user_reaction_awards_count,
     db_get_daily_analytics,
@@ -291,6 +313,8 @@ _BRIDGE_DB_SYMBOLS = (
     db_increment_book_download,
     db_increment_book_searches,
     db_set_book_reaction,
+    db_set_movie_reaction,
+    db_get_movie_reaction_counts,
     db_get_book_stats,
     db_get_top_books,
     db_get_top_users,
@@ -346,6 +370,502 @@ _BRIDGE_DB_SYMBOLS = (
     db_set_user_referrer,
 )
 
+_SEARCH_FLOW_DEP_KEYS = (
+    "MESSAGES",
+    "AUDIT_CACHE_TTL",
+    "AUDIO_UPLOAD_CHANNEL_ID",
+    "ApplicationHandlerStop",
+    "DB_RETRY_ATTEMPTS",
+    "DB_RETRY_BASE_DELAY_SEC",
+    "LOCAL_SEND_BACKOFF_SEC",
+    "LOCAL_SEND_RETRIES",
+    "MAX_SEARCH_RESULTS",
+    "PAGE_SIZE",
+    "SEARCH_CACHE_NS",
+    "SEARCH_COOLDOWN_SEC",
+    "TOP_CACHE_TTL",
+    "_admin_tools_handle_admin_menu_prompt_input",
+    "_ai_chat_handle_text_input",
+    "_ai_tool_mode_handle_text_input",
+    "_audio_conv_handle_media_input",
+    "_audio_conv_handle_text_input",
+    "_book_filename",
+    "_cancel_menu_conflicting_flows",
+    "_group_read_handle_message_activity",
+    "_handle_main_menu_action",
+    "_is_admin_user",
+    "_is_owner_user",
+    "_main_menu_keyboard",
+    "_main_menu_text_action",
+    "_pdf_maker_handle_text_input",
+    "_pdfed_handle_text_input",
+    "_reply_search_menu_click_hint",
+    "_sticker_handle_text_input",
+    "_today_str",
+    "_tts_handle_text_input",
+    "_video_dl_handle_text_input",
+    "add_recent_download",
+    "broadcast",
+    "build_book_caption",
+    "build_book_keyboard",
+    "build_request_admin_keyboard",
+    "build_upload_admin_keyboard",
+    "cache_request",
+    "can_delete_books",
+    "count_pending_audiobook_requests",
+    "db_add_user_coin_adjustment",
+    "db_get_book_by_id",
+    "db_get_book_stats",
+    "db_get_movie_by_id",
+    "db_get_movie_reaction_counts",
+    "db_get_user_movie_reaction",
+    "db_get_user_reaction",
+    "db_list_requests",
+    "db_increment_book_download",
+    "db_increment_book_searches",
+    "db_increment_counter",
+    "db_insert_book",
+    "db_search_movies",
+    "db_set_movie_reaction",
+    "ensure_user_language",
+    "es_available",
+    "format_request_admin_text",
+    "format_upload_request_admin_text",
+    "format_user_name",
+    "format_user_tag",
+    "find_book_by_id",
+    "get_display_name",
+    "get_audio_book_by_id",
+    "get_es",
+    "get_result_title",
+    "get_user",
+    "increment_analytics",
+    "increment_user_analytics",
+    "index_book",
+    "is_blocked",
+    "is_favorited",
+    "is_stopped_user",
+    "load_requests",
+    "mark_request_fulfilled",
+    "load_books",
+    "normalize",
+    "rate_limited",
+    "run_blocking",
+    "run_blocking_db_retry",
+    "safe_answer",
+    "safe_reply",
+    "_schedule_application_task",
+    "search_es",
+    "search_movies_es",
+    "send_request_to_admin",
+    "set_user_allowed",
+    "spam_check_callback",
+    "spam_check_message",
+    "suggest_books",
+    "update_book_file_id",
+    "update_request_status",
+    "update_upload_request_status",
+    "update_user_info",
+    "user_search_command",
+)
+
+_USER_INTERACTIONS_DEP_KEYS = (
+    "COIN_REFERRAL",
+    "InlineKeyboardButton",
+    "InlineKeyboardMarkup",
+    "MESSAGES",
+    "REQUESTS_PAGE_SIZE",
+    "_build_help_text",
+    "_is_admin_user",
+    "build_results_keyboard",
+    "build_results_text",
+    "cache_search_results",
+    "build_referral_link",
+    "build_request_admin_keyboard",
+    "build_requests_keyboard",
+    "build_simple_book_keyboard",
+    "compute_coin_breakdown",
+    "db_delete_request",
+    "db_increment_book_searches",
+    "db_get_request_by_id",
+    "db_get_random_books",
+    "db_get_random_book",
+    "db_get_user_coin_adjustment",
+    "db_get_user_favorite_awards_count",
+    "db_get_user_favorites_count",
+    "db_get_user_reaction_awards_count",
+    "db_get_user_reaction_count",
+    "db_get_user_referrals_count",
+    "db_get_user_usage_stats",
+    "db_increment_counter",
+    "db_list_favorites",
+    "db_list_requests_for_user",
+    "ensure_user_language",
+    "format_request_admin_text",
+    "get_request_by_id",
+    "get_result_title",
+    "get_upload_request_by_id",
+    "is_blocked",
+    "is_stopped_user",
+    "math",
+    "quote_plus",
+    "refresh_requests_list",
+    "run_blocking",
+    "safe_answer",
+    "send_request_to_admin",
+    "send_upload_request_to_admin",
+    "spam_check_callback",
+    "spam_check_message",
+    "time",
+    "update_request_status",
+    "update_user_info",
+)
+
+
+def _build_search_flow_deps() -> dict[str, object]:
+    # search_flow is configured multiple times as late-bound aliases become available.
+    deps: dict[str, object] = {}
+    for key in _SEARCH_FLOW_DEP_KEYS:
+        if key in globals():
+            deps[key] = globals()[key]
+    return deps
+
+
+def _build_user_interactions_deps() -> dict[str, object]:
+    deps: dict[str, object] = {}
+    missing: list[str] = []
+    for key in _USER_INTERACTIONS_DEP_KEYS:
+        if key not in globals():
+            missing.append(key)
+            continue
+        deps[key] = globals()[key]
+    if missing:
+        raise RuntimeError(f"Missing user_interactions dependencies: {', '.join(missing)}")
+    return deps
+
+
+def _build_bridge_deps(
+    required_keys: tuple[str, ...],
+    optional_keys: tuple[str, ...],
+    label: str,
+) -> dict[str, object]:
+    deps: dict[str, object] = {}
+    missing: list[str] = []
+    for key in required_keys:
+        if key not in globals():
+            missing.append(key)
+            continue
+        deps[key] = globals()[key]
+    for key in optional_keys:
+        if key in globals():
+            deps[key] = globals()[key]
+    if missing:
+        raise RuntimeError(f"Missing {label} dependencies: {', '.join(missing)}")
+    return deps
+
+
+_ENGAGEMENT_REQUIRED_DEP_KEYS = (
+    "MESSAGES",
+    "run_blocking",
+    "ensure_user_language",
+    "spam_check_callback",
+    "safe_answer",
+)
+
+_ENGAGEMENT_OPTIONAL_DEP_KEYS = (
+    "BadRequest",
+    "COIN_DOWNLOAD",
+    "COIN_FAVORITE",
+    "COIN_REACTION",
+    "COIN_REFERRAL",
+    "COIN_SEARCH",
+    "ES_INDEX",
+    "InlineKeyboardButton",
+    "InlineKeyboardMarkup",
+    "NotFoundError",
+    "PdfReader",
+    "REACTION_EMOJI",
+    "RetryAfter",
+    "SEARCH_CACHE_NS",
+    "TOP_USERS_CACHE_TTL",
+    "TOP_USERS_LIMIT",
+    "_is_admin_user",
+    "_is_owner_user",
+    "_send_with_retry",
+    "add_favorite",
+    "asyncio",
+    "build_book_caption",
+    "build_book_keyboard",
+    "build_top_keyboard",
+    "build_top_text",
+    "build_top_users_keyboard",
+    "build_top_users_text",
+    "build_user_admin_keyboard",
+    "build_user_info_text",
+    "cache_clear_pattern",
+    "cache_delete",
+    "cache_get",
+    "cache_set",
+    "cache_top_results",
+    "can_delete_books",
+    "count_pending_audiobook_requests",
+    "db_award_favorite_action",
+    "db_award_reaction_action",
+    "db_get_book_by_id",
+    "db_get_book_stats",
+    "db_get_book_summary",
+    "db_get_top_books",
+    "db_get_top_users",
+    "db_get_user_reaction",
+    "db_increment_counter",
+    "db_set_book_reaction",
+    "db_upsert_book_summary",
+    "delete_audio_books_by_book_id",
+    "delete_book_and_related",
+    "es_available",
+    "format_user_name",
+    "get_audio_book_for_book",
+    "get_cached_top_entries",
+    "get_display_name",
+    "get_es",
+    "get_result_title",
+    "get_top_cache",
+    "get_user",
+    "hashlib",
+    "is_blocked",
+    "is_favorited",
+    "is_stopped_user",
+    "remove_favorite",
+    "set_cached_top_entries",
+    "set_user_allowed",
+    "set_user_blocked",
+    "set_user_delete_allowed",
+    "set_user_stopped",
+    "socket",
+    "spam_check_message",
+    "update_user_info",
+    "urllib",
+)
+
+_PDF_MAKER_REQUIRED_DEP_KEYS = (
+    "MESSAGES",
+    "A4",
+    "BadRequest",
+    "LETTER",
+    "_send_with_retry",
+    "canvas",
+    "datetime",
+    "ensure_user_language",
+    "is_blocked",
+    "is_stopped_user",
+    "rl_landscape",
+    "run_blocking",
+    "safe_answer",
+    "spam_check_message",
+    "update_user_info",
+)
+
+_PDF_MAKER_OPTIONAL_DEP_KEYS = (
+    "_ensure_dupes_pdf_font",
+)
+
+_PDF_EDITOR_REQUIRED_DEP_KEYS = (
+    "MESSAGES",
+    "_main_menu_keyboard",
+    "_send_with_retry",
+    "ensure_user_language",
+    "is_blocked",
+    "is_stopped_user",
+    "run_blocking",
+    "safe_answer",
+    "spam_check_callback",
+    "spam_check_message",
+    "update_user_info",
+)
+
+_PDF_EDITOR_OPTIONAL_DEP_KEYS = (
+    "_ai_tool_translate_with_source_retry_blocking",
+)
+
+_TTS_REQUIRED_DEP_KEYS = (
+    "MESSAGES",
+    "BadRequest",
+    "_main_menu_keyboard",
+    "_send_with_retry",
+    "edge_tts",
+    "ensure_user_language",
+    "is_blocked",
+    "is_stopped_user",
+    "run_blocking",
+    "safe_answer",
+    "spam_check_message",
+    "update_user_info",
+)
+
+_VIDEO_DOWNLOADER_REQUIRED_DEP_KEYS = (
+    "MESSAGES",
+    "_main_menu_keyboard",
+    "_send_with_retry",
+    "db_get_counters",
+    "db_increment_counter",
+    "ensure_user_language",
+    "run_blocking",
+    "safe_answer",
+    "spam_check_callback",
+)
+
+_AUDIO_CONVERTER_REQUIRED_DEP_KEYS = (
+    "MESSAGES",
+    "_main_menu_keyboard",
+    "_send_with_retry",
+    "ensure_user_language",
+    "run_blocking",
+    "safe_answer",
+    "spam_check_callback",
+)
+
+_STICKER_TOOLS_REQUIRED_DEP_KEYS = (
+    "MESSAGES",
+    "_main_menu_keyboard",
+    "_send_with_retry",
+    "ensure_user_language",
+    "is_blocked",
+    "is_stopped_user",
+    "run_blocking",
+    "safe_answer",
+    "spam_check_callback",
+    "spam_check_message",
+    "update_user_info",
+)
+
+_ADMIN_RUNTIME_OPTIONAL_DEP_KEYS = (
+    "A4",
+    "ContextTypes",
+    "ES_INDEX",
+    "InlineKeyboardButton",
+    "InlineKeyboardMarkup",
+    "InputFile",
+    "MESSAGES",
+    "NetworkError",
+    "NotFoundError",
+    "RetryAfter",
+    "TTFont",
+    "TimedOut",
+    "UPLOAD_CHANNEL_IDS",
+    "UPLOAD_LOCAL_CONNECT_TIMEOUT",
+    "UPLOAD_LOCAL_LARGE_CONCURRENCY",
+    "UPLOAD_LOCAL_LARGE_MB",
+    "UPLOAD_LOCAL_MAX_MB",
+    "UPLOAD_LOCAL_POOL_TIMEOUT",
+    "UPLOAD_LOCAL_READ_TIMEOUT",
+    "UPLOAD_LOCAL_WORKERS",
+    "UPLOAD_LOCAL_WRITE_TIMEOUT",
+    "USER_SEARCH_LIMIT",
+    "Update",
+    "_book_filename",
+    "_build_dupe_preview_lines",
+    "_compute_db_duplicate_cleanup_plan",
+    "_compute_es_duplicate_cleanup_plan",
+    "_edit_progress_message",
+    "_format_dupes_status_text",
+    "_get_dupes_status",
+    "_is_admin_user",
+    "_send_chat_message",
+    "_send_main_menu",
+    "_send_preview_pdf",
+    "_send_progress_message",
+    "_tts_tools_available",
+    "_update_dupes_status",
+    "asyncio",
+    "audit_command",
+    "build_user_results_keyboard",
+    "build_user_results_text",
+    "cache_user_results",
+    "canvas",
+    "datetime",
+    "db_insert_admin_task_run",
+    "db_list_admin_task_runs",
+    "db_list_books",
+    "db_search_users_by_name",
+    "db_update_admin_task_run",
+    "delete_book_and_related",
+    "ensure_user_language",
+    "es_available",
+    "fuzz",
+    "get_es",
+    "get_missing_file_info",
+    "io",
+    "is_bot_paused",
+    "latinize_text",
+    "list_users",
+    "normalize",
+    "os",
+    "pause_bot_command",
+    "pdfmetrics",
+    "prune_command",
+    "re",
+    "resume_bot_command",
+    "run_blocking",
+    "safe_answer",
+    "spam_check_message",
+    "time",
+    "update_book_file_id",
+    "update_user_info",
+)
+
+
+def _build_engagement_handlers_deps() -> dict[str, object]:
+    return _build_bridge_deps(
+        _ENGAGEMENT_REQUIRED_DEP_KEYS,
+        _ENGAGEMENT_OPTIONAL_DEP_KEYS,
+        "engagement_handlers",
+    )
+
+
+def _build_pdf_maker_deps() -> dict[str, object]:
+    return _build_bridge_deps(
+        _PDF_MAKER_REQUIRED_DEP_KEYS,
+        _PDF_MAKER_OPTIONAL_DEP_KEYS,
+        "pdf_maker",
+    )
+
+
+def _build_pdf_editor_deps() -> dict[str, object]:
+    return _build_bridge_deps(
+        _PDF_EDITOR_REQUIRED_DEP_KEYS,
+        _PDF_EDITOR_OPTIONAL_DEP_KEYS,
+        "pdf_editor",
+    )
+
+
+def _build_tts_tools_deps() -> dict[str, object]:
+    return _build_bridge_deps(_TTS_REQUIRED_DEP_KEYS, (), "tts_tools")
+
+
+def _build_video_downloader_deps() -> dict[str, object]:
+    return _build_bridge_deps(
+        _VIDEO_DOWNLOADER_REQUIRED_DEP_KEYS,
+        (),
+        "video_downloader",
+    )
+
+
+def _build_audio_converter_deps() -> dict[str, object]:
+    return _build_bridge_deps(
+        _AUDIO_CONVERTER_REQUIRED_DEP_KEYS,
+        (),
+        "audio_converter",
+    )
+
+
+def _build_sticker_tools_deps() -> dict[str, object]:
+    return _build_bridge_deps(_STICKER_TOOLS_REQUIRED_DEP_KEYS, (), "sticker_tools")
+
+
+def _build_admin_runtime_deps() -> dict[str, object]:
+    required = tuple(getattr(_admin_runtime, "_CONFIG_REQUIRED_KEYS", ()) or ())
+    return _build_bridge_deps(required, _ADMIN_RUNTIME_OPTIONAL_DEP_KEYS, "admin_runtime")
+
 # Tiny runtime use to keep static analyzers from flagging this tuple itself as dead.
 _BRIDGE_DB_SYMBOLS_COUNT = len(_BRIDGE_DB_SYMBOLS)
 
@@ -367,6 +887,7 @@ import admin_runtime as _admin_runtime
 import user_interactions as _user_interactions
 import upload_flow as _upload_flow
 import command_sync as _command_sync
+import handler_registry as _handler_registry
 
 
 async def run_blocking(func, *args, **kwargs):
@@ -375,7 +896,7 @@ async def run_blocking(func, *args, **kwargs):
 
 # Admin-only command wrappers
 async def admin_only_command(update: Update, context: ContextTypes.DEFAULT_TYPE, command_func):
-    """Wrapper to ensure only admins can execute admin commands."""
+    """Wrapper to ensure only owner-level commands can execute."""
     user_id = update.effective_user.id if update.effective_user else None
     if not user_id or not _is_admin_user(user_id):
         lang = ensure_user_language(update, context)
@@ -385,7 +906,8 @@ async def admin_only_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 async def upload_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await admin_only_command(update, context, upload_command)
+    # Upload permission is controlled by DB "allowed" and owner check inside upload flow.
+    await upload_command(update, context)
 
 
 async def broadcast_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -519,6 +1041,13 @@ def _schedule_application_task(application, coro):
             coro.close()
         except Exception:
             pass
+        return None
+
+
+def _safe_asyncio_current_task():
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
         return None
 
 
@@ -761,7 +1290,12 @@ async def send_book(bot, chat_id, book):
 
     book_path = book.get("path")
     book_id = str(book.get("id") or "")
-    stats = db_get_book_stats(book_id) if book_id else {"downloads": 0, "fav_count": 0, "like": 0, "dislike": 0, "berry": 0, "whale": 0}
+    stats = {"downloads": 0, "fav_count": 0, "like": 0, "dislike": 0, "berry": 0, "whale": 0}
+    if book_id:
+        try:
+            stats = await run_blocking(db_get_book_stats, book_id) or stats
+        except Exception as e:
+            logger.warning("Failed to load book stats for %s: %s", book_id, e)
     downloads = stats.get("downloads", 0)
     fav_count = stats.get("fav_count", 0)
     counts = {
@@ -772,15 +1306,34 @@ async def send_book(bot, chat_id, book):
     }
     caption = build_book_caption(book, downloads, fav_count, counts)
     user_id = chat_id if isinstance(chat_id, int) else None
-    is_fav = is_favorited(user_id, book_id) if (user_id and book_id) else False
-    user_reaction = db_get_user_reaction(book_id, user_id) if (book_id and user_id) else None
+    is_fav = False
+    user_reaction = None
+    if user_id and book_id:
+        try:
+            is_fav = bool(await run_blocking(db_is_favorited, user_id, book_id))
+        except Exception as e:
+            logger.warning("Failed to load favorite state for user=%s book=%s: %s", user_id, book_id, e)
+        try:
+            user_reaction = await run_blocking(db_get_user_reaction, book_id, user_id)
+        except Exception as e:
+            logger.warning("Failed to load reaction state for user=%s book=%s: %s", user_id, book_id, e)
     can_delete = await can_delete_books(user_id) if user_id else False
-    audio_book = get_audio_book_for_book(book_id) if book_id else None
+    audio_book = None
+    if book_id:
+        try:
+            audio_book = await run_blocking(get_audio_book_for_book, book_id)
+        except Exception as e:
+            logger.warning("Failed to load audiobook metadata for %s: %s", book_id, e)
     has_ab = bool(audio_book)
     can_add_ab = bool(_is_admin_user(user_id)) if user_id else False
     is_owner_user = bool(_is_owner_user(user_id)) if user_id and callable(globals().get("_is_owner_user")) else False
     show_listen_btn = has_ab if is_owner_user else True
-    ab_request_count = count_pending_audiobook_requests(book_id) if (book_id and can_add_ab and is_owner_user) else 0
+    ab_request_count = 0
+    if book_id and can_add_ab and is_owner_user:
+        try:
+            ab_request_count = int(await run_blocking(count_pending_audiobook_requests, book_id) or 0)
+        except Exception as e:
+            logger.warning("Failed to load pending audiobook request count for %s: %s", book_id, e)
     reactions_kb = (
         build_book_keyboard(
             book_id,
@@ -825,22 +1378,27 @@ async def send_book(bot, chat_id, book):
             # Save updated file_id in DB
             try:
                 if book.get("id"):
-                    update_book_file_id(str(book.get("id")), new_file_id, indexed=True)
+                    await run_blocking(update_book_file_id, str(book.get("id")), new_file_id, True, None)
                 elif book_path:
-                    update_book_by_path(book_path, file_id=new_file_id, indexed=True)
+                    await run_blocking(update_book_by_path, book_path, file_id=new_file_id, indexed=True)
                 logger.debug(f"Updated file_id + indexed flag for {book.get('book_name')} in DB")
             except Exception as e:
                 logger.error(f"⚠️ Failed to update book file_id in DB: {e}")
 
             # ✅ Index in Elasticsearch with stable UUID
             if es_available():
-                index_book(
-                    book["book_name"],
-                    file_id=new_file_id,
-                    path=book_path,
-                    book_id=book.get("id"),   # <-- permanent UUID
-                    display_name=get_display_name(book)
-                )
+                try:
+                    await run_blocking(
+                        index_book,
+                        book["book_name"],
+                        new_file_id,
+                        book_path,
+                        book.get("id"),
+                        get_display_name(book),
+                        None,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to index book in ES for %s: %s", book.get("id"), e)
     else:
         await bot.send_message(chat_id=chat_id, text=MESSAGES["en"]["book_unavailable"])
 
@@ -892,7 +1450,20 @@ def _normalize_bot_api_base_file_url(raw: str, fallback_base_url: str) -> str:
 # Persist errors to file for debugging without cluttering terminal
 try:
     os.makedirs("logs", exist_ok=True)
-    error_handler = logging.FileHandler("logs/errors.log", encoding="utf-8")
+    try:
+        _error_log_max_mb = max(5, int(str(os.getenv("ERROR_LOG_MAX_MB", "20")).strip()))
+    except Exception:
+        _error_log_max_mb = 20
+    try:
+        _error_log_backup_count = max(1, int(str(os.getenv("ERROR_LOG_BACKUP_COUNT", "5")).strip()))
+    except Exception:
+        _error_log_backup_count = 5
+    error_handler = RotatingFileHandler(
+        "logs/errors.log",
+        maxBytes=_error_log_max_mb * 1024 * 1024,
+        backupCount=_error_log_backup_count,
+        encoding="utf-8",
+    )
     error_handler.setLevel(logging.ERROR)
     error_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
     logging.getLogger().addHandler(error_handler)
@@ -1066,8 +1637,9 @@ def save_requests(data):
             db_insert_request(r)
 
 
-def add_request_record(user, query: str, lang: str):
+def add_request_record(user, query: str, lang: str, *, book_id: str | None = None):
     request_id = uuid.uuid4().hex[:10]
+    resolved_book_id = str(book_id or "").strip() or None
     record = {
         "id": request_id,
         "user_id": user.id,
@@ -1086,7 +1658,7 @@ def add_request_record(user, query: str, lang: str):
         "admin_chat_id": None,
         "admin_message_id": None,
         "admin_note": None,
-        "book_id": None
+        "book_id": resolved_book_id,
     }
     db_insert_request(record)
     db_increment_counter("request_created", 1)
@@ -1237,6 +1809,39 @@ def _extract_audiobook_request_book_id(query_text: str | None) -> str | None:
     return value or None
 
 
+def _resolve_request_book_id(record: dict | None) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    direct = str(record.get("book_id") or "").strip()
+    if direct:
+        return direct
+    return _extract_audiobook_request_book_id(record.get("query"))
+
+
+def _find_open_audiobook_request_for_user_book(user_id: int, book_id: str) -> dict | None:
+    target_book_id = str(book_id or "").strip()
+    if not user_id or not target_book_id:
+        return None
+    try:
+        requests = load_requests()
+    except Exception:
+        return None
+
+    for r in requests or []:
+        if str(r.get("status") or "") not in {"open", "seen"}:
+            continue
+        try:
+            req_user_id = int(r.get("user_id") or 0)
+        except Exception:
+            req_user_id = 0
+        if req_user_id != int(user_id):
+            continue
+        req_book_id = _resolve_request_book_id(r)
+        if req_book_id and req_book_id.strip() == target_book_id:
+            return r
+    return None
+
+
 def count_pending_audiobook_requests(book_id: str) -> int:
     target = str(book_id or "").strip()
     if not target:
@@ -1246,14 +1851,20 @@ def count_pending_audiobook_requests(book_id: str) -> int:
     except Exception:
         return 0
 
-    pending = 0
+    pending_users: set[int] = set()
     for r in requests or []:
         if (r.get("status") or "") not in {"open", "seen"}:
             continue
-        req_book_id = _extract_audiobook_request_book_id(r.get("query"))
-        if req_book_id and req_book_id.strip() == target:
-            pending += 1
-    return pending
+        req_book_id = _resolve_request_book_id(r)
+        if not req_book_id or req_book_id.strip() != target:
+            continue
+        try:
+            uid = int(r.get("user_id") or 0)
+        except Exception:
+            uid = 0
+        if uid > 0:
+            pending_users.add(uid)
+    return len(pending_users)
 
 
 def find_open_requests_for_book(book: dict):
@@ -1370,17 +1981,13 @@ def _spam_guard(context: ContextTypes.DEFAULT_TYPE, key: str, limit: int, window
 
 
 def _is_admin_user(user_id: int) -> bool:
-    try:
-        return user_id in {ADMIN_ID, OWNER_ID}
-    except Exception:
-        return user_id == OWNER_ID
+    # Legacy naming: "admin" now maps to owner-only authority.
+    return _is_owner_user(user_id)
 
 
 def _is_owner_user(user_id: int) -> bool:
     try:
-        if OWNER_ID:
-            return user_id == OWNER_ID
-        return user_id == ADMIN_ID
+        return bool(OWNER_ID) and user_id == OWNER_ID
     except Exception:
         return False
 
@@ -2033,8 +2640,21 @@ def cache_request(context: ContextTypes.DEFAULT_TYPE, query: str, user):
     return req_id
 
 
-async def send_request_to_admin(context: ContextTypes.DEFAULT_TYPE, user, query: str, lang: str):
-    record = add_request_record(user, query, lang)
+async def send_request_to_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+    query: str,
+    lang: str,
+    *,
+    book_id: str | None = None,
+):
+    resolved_book_id = str(book_id or "").strip() or None
+    if resolved_book_id and user and getattr(user, "id", None):
+        existing = _find_open_audiobook_request_for_user_book(int(user.id), resolved_book_id)
+        if existing:
+            return existing
+
+    record = add_request_record(user, query, lang, book_id=resolved_book_id)
     target_id = get_request_target_id()
     if target_id:
         keyboard = build_request_admin_keyboard(record["status"], record["id"])
@@ -2074,17 +2694,11 @@ def find_book_by_id(book_id: str):
 def get_request_target_id():
     if REQUEST_CHAT_ID:
         return REQUEST_CHAT_ID
-    if OWNER_ID:
-        return OWNER_ID
-    return ADMIN_ID
+    return OWNER_ID or None
 
 
 def get_admin_id() -> int | None:
-    if OWNER_ID:
-        return OWNER_ID
-    if ADMIN_ID:
-        return ADMIN_ID
-    return None
+    return OWNER_ID or None
 
 
 def get_missing_file_info(limit: int | None = 200):
@@ -2152,7 +2766,9 @@ def get_group_commands(lang: str = "en"):
 
 
 def get_admin_commands(lang: str = "en", user_id: int | None = None):
-    return _command_sync.get_admin_commands(lang, owner_user=bool(user_id and _is_owner_user(user_id)))
+    if user_id is not None and not _is_owner_user(user_id):
+        return _command_sync.get_public_commands_for_menu(lang)
+    return _command_sync.get_admin_commands(lang)
 
 
 def _build_help_text(lang: str, user_id: int | None = None) -> str:
@@ -2163,7 +2779,6 @@ async def set_bot_commands(application):
     await _command_sync.set_bot_commands(
         application,
         owner_id=OWNER_ID,
-        admin_id=ADMIN_ID,
         logger=logger,
     )
 
@@ -2244,7 +2859,6 @@ async def _sync_user_commands_if_needed(context: ContextTypes.DEFAULT_TYPE, user
         user_id=user_id,
         lang=lang,
         owner_id=OWNER_ID,
-        admin_id=ADMIN_ID,
         logger=logger,
     )
 
@@ -2912,6 +3526,8 @@ def is_blocked(user_id: int) -> bool:
 
 
 def is_allowed(user_id: int) -> bool:
+    if _is_owner_user(user_id):
+        return True
     user = get_user(user_id)
     return bool(user.get("allowed")) if user else False
 
@@ -3097,7 +3713,8 @@ async def upload_fanout_worker(app):
             if q.empty():
                 break
     finally:
-        if data.get("upload_fanout_task") is asyncio.current_task():
+        current_task = _safe_asyncio_current_task()
+        if current_task is not None and data.get("upload_fanout_task") is current_task:
             data.pop("upload_fanout_task", None)
 
 
@@ -3274,6 +3891,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Reset menu/search state until the user explicitly chooses a language.
         context.user_data.pop("main_menu_section", None)
         context.user_data["awaiting_book_search"] = False
+        context.user_data["awaiting_movie_search"] = False
+        context.user_data.pop("search_mode", None)
         referrer_id = parse_referral_payload(context.args[0] if context.args else None)
         lang = ensure_user_language(update, context)
         # Always ask user to choose language on /start (do not auto-use Telegram locale).
@@ -3309,6 +3928,8 @@ async def language_command_handler(update: Update, context: ContextTypes.DEFAULT
     # Keep menu hidden/reset until language is explicitly chosen.
     context.user_data.pop("main_menu_section", None)
     context.user_data["awaiting_book_search"] = False
+    context.user_data["awaiting_movie_search"] = False
+    context.user_data.pop("search_mode", None)
     await update.message.reply_text(
         MESSAGES[lang]["choose_language"],
         reply_markup=get_language_keyboard()
@@ -3317,13 +3938,11 @@ async def language_command_handler(update: Update, context: ContextTypes.DEFAULT
 
 def _build_start_greeting_text(lang: str, tg_user) -> str:
     first_name = (getattr(tg_user, "first_name", None) or "").strip() or "Friend"
-    salutation = {
-        "uz": f"Assalomu alaykum, {first_name} 👋",
-        "ru": f"Здравствуйте, {first_name} 👋",
-        "en": f"Welcome, {first_name} 👋",
-    }.get(lang, f"Welcome, {first_name} 👋")
-    base = MESSAGES.get(lang, MESSAGES["en"]).get("greeting") or MESSAGES["en"]["greeting"]
-    return f"{salutation}\n\n{base}"
+    template = MESSAGES.get(lang, MESSAGES["en"]).get("greeting") or MESSAGES["en"]["greeting"]
+    try:
+        return template.format(first_name=html.escape(first_name))
+    except Exception:
+        return template
 
 
 def _build_start_greeting_intro(lang: str, tg_user) -> str:
@@ -3368,7 +3987,14 @@ async def _send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, la
     uid = update.effective_user.id if update.effective_user else None
     await _send_with_retry(lambda: update.message.reply_text(text, reply_markup=_main_menu_keyboard(lang, section, uid)))
     context.user_data["main_menu_section"] = section
-    context.user_data["awaiting_book_search"] = False
+    if section == "main":
+        context.user_data["awaiting_book_search"] = True
+        context.user_data["awaiting_movie_search"] = False
+        context.user_data["search_mode"] = "book"
+    else:
+        context.user_data["awaiting_book_search"] = False
+        context.user_data["awaiting_movie_search"] = False
+        context.user_data.pop("search_mode", None)
     return True
 
 
@@ -3377,7 +4003,14 @@ async def _send_main_menu_to_chat_id(context: ContextTypes.DEFAULT_TYPE, chat_id
     try:
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=_main_menu_keyboard(lang, section, user_id or chat_id))
         context.user_data["main_menu_section"] = section
-        context.user_data["awaiting_book_search"] = False
+        if section == "main":
+            context.user_data["awaiting_book_search"] = True
+            context.user_data["awaiting_movie_search"] = False
+            context.user_data["search_mode"] = "book"
+        else:
+            context.user_data["awaiting_book_search"] = False
+            context.user_data["awaiting_movie_search"] = False
+            context.user_data.pop("search_mode", None)
         return True
     except Exception:
         return False
@@ -3522,6 +4155,7 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     if action == "search":
         context.user_data["awaiting_book_search"] = True
         context.user_data["awaiting_movie_search"] = False
+        context.user_data["search_mode"] = "book"
         await update.message.reply_text(
             m.get("menu_search_prompt", "Send a book name to search."),
             reply_markup=_main_menu_keyboard(lang, "main", user_id),
@@ -3531,6 +4165,7 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     context.user_data["awaiting_book_search"] = False
     if action == "search_movies":
         context.user_data["awaiting_movie_search"] = True
+        context.user_data["search_mode"] = "movie"
         await update.message.reply_text(
             m.get("menu_movie_search_prompt", "Send a movie name to search."),
             reply_markup=_main_menu_keyboard(lang, "main", user_id),
@@ -3538,6 +4173,7 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         context.user_data["main_menu_section"] = "main"
         return True
     context.user_data["awaiting_movie_search"] = False
+    context.user_data.pop("search_mode", None)
     if action == "tts":
         context.user_data["main_menu_section"] = "main"
         await _tts_start_session_from_message(update.message, update, context, lang)
@@ -3704,10 +4340,19 @@ async def _send_animated_start_greeting(update: Update, context: ContextTypes.DE
         return False
     final_text = _build_start_greeting_text(lang, update.effective_user)
     uid = update.effective_user.id if update.effective_user else None
-    sent = await _send_with_retry(lambda: update.message.reply_text(final_text, reply_markup=_main_menu_keyboard(lang, "main", uid)))
+    sent = await _send_with_retry(
+        lambda: update.message.reply_text(
+            final_text,
+            reply_markup=_main_menu_keyboard(lang, "main", uid),
+            parse_mode="HTML",
+        )
+    )
     if not sent:
         return False
     context.user_data["main_menu_section"] = "main"
+    context.user_data["awaiting_book_search"] = True
+    context.user_data["awaiting_movie_search"] = False
+    context.user_data["search_mode"] = "book"
     return True
 
 
@@ -3720,9 +4365,12 @@ async def _edit_or_send_animated_start_greeting(query, context: ContextTypes.DEF
             chat_id=query.from_user.id,
             text=final_text,
             reply_markup=_main_menu_keyboard(lang, "main", uid),
+            parse_mode="HTML",
         )
         context.user_data["main_menu_section"] = "main"
-        context.user_data["awaiting_book_search"] = False
+        context.user_data["awaiting_book_search"] = True
+        context.user_data["awaiting_movie_search"] = False
+        context.user_data["search_mode"] = "book"
         if getattr(query, "message", None):
             async def _cleanup_old_picker():
                 try:
@@ -3808,12 +4456,40 @@ async def handle_language_callback(update: Update, context: ContextTypes.DEFAULT
         logger.error(f"Failed to update user commands language: {e}")
     try:
         context.user_data["main_menu_section"] = "main"
+        context.user_data["awaiting_book_search"] = True
+        context.user_data["awaiting_movie_search"] = False
+        context.user_data["search_mode"] = "book"
     except Exception:
         pass
 
 
 # Upload flow extracted module bridge
-_upload_flow.configure(globals())
+_UPLOAD_FLOW_OPTIONAL_DEP_KEYS = (
+    "run_blocking_heavy",
+    "bulk_index_books",
+    "VIDEO_UPLOAD_CHANNEL_IDS",
+    "VIDEO_UPLOAD_CHANNEL_ID",
+)
+
+
+def _build_upload_flow_deps() -> dict[str, object]:
+    deps: dict[str, object] = {}
+    missing: list[str] = []
+    required = tuple(getattr(_upload_flow, "_CONFIG_REQUIRED_KEYS", ()) or ())
+    for key in required:
+        if key not in globals():
+            missing.append(key)
+            continue
+        deps[key] = globals()[key]
+    for key in _UPLOAD_FLOW_OPTIONAL_DEP_KEYS:
+        if key in globals():
+            deps[key] = globals()[key]
+    if missing:
+        raise RuntimeError(f"Missing upload_flow dependencies: {', '.join(missing)}")
+    return deps
+
+
+_upload_flow.configure(_build_upload_flow_deps())
 
 upload_command = _upload_flow.upload_command
 movie_upload_command = _upload_flow.movie_upload_command
@@ -3929,7 +4605,7 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_message = update.message or (update.callback_query.message if update.callback_query else None)
     if not target_message:
         return
-    if update.effective_user.id != ADMIN_ID:
+    if not _is_admin_user(update.effective_user.id):
         await target_message.reply_text(MESSAGES[lang]["admin_only"])
         return
     limited, wait_s = spam_check_message(update, context)
@@ -3977,6 +4653,7 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req_status = await run_blocking(db_get_request_status_counts)
         upload_status = await run_blocking(db_get_upload_request_status_counts)
         reaction_current = await run_blocking(db_get_reaction_totals)
+        movie_reaction_current = await run_blocking(db_get_movie_reaction_totals)
         
         # --- New statistics ---
         try:
@@ -4007,11 +4684,16 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "upload_request_created",
             "reaction_like",
             "reaction_dislike",
-            "movie_search_total",
-            "movie_download_total",
-            "video_downloads",
             "reaction_berry",
             "reaction_whale",
+            "movie_reaction_like",
+            "movie_reaction_dislike",
+            "movie_reaction_berry",
+            "movie_reaction_whale",
+            "movie_search_total",
+            "movie_download_total",
+            "movie_share_total",
+            "video_downloads",
             # AI Tools counters
             "ai_chat_sessions",
             "ai_translator_uses",
@@ -4109,6 +4791,7 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- {MESSAGES[lang]['audit_download_total']}: {counters.get('download_total', 0)}",
             f"- Movie searches: {counters.get('movie_search_total', 0)}",
             f"- Movie downloads: {counters.get('movie_download_total', 0)}",
+            f"- Movie shares: {counters.get('movie_share_total', 0)}",
             f"- Video downloader downloads: {counters.get('video_downloads', 0)}",
             f"- {MESSAGES[lang]['audit_requests_created']}: {counters.get('request_created', 0)}",
             f"- {MESSAGES[lang]['audit_requests_cancelled']}: {counters.get('request_cancelled', 0)}",
@@ -4154,6 +4837,14 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- {MESSAGES[lang]['audit_reaction_current_dislike']}: {reaction_current.get('dislike', 0)}",
             f"- {MESSAGES[lang]['audit_reaction_current_berry']}: {reaction_current.get('berry', 0)}",
             f"- {MESSAGES[lang]['audit_reaction_current_whale']}: {reaction_current.get('whale', 0)}",
+            f"- 🎬 Movie 👍 (total): {counters.get('movie_reaction_like', 0)}",
+            f"- 🎬 Movie 👎 (total): {counters.get('movie_reaction_dislike', 0)}",
+            f"- 🎬 Movie 🍓 (total): {counters.get('movie_reaction_berry', 0)}",
+            f"- 🎬 Movie 🐳 (total): {counters.get('movie_reaction_whale', 0)}",
+            f"- 🎬 Movie 👍 (current): {movie_reaction_current.get('like', 0)}",
+            f"- 🎬 Movie 👎 (current): {movie_reaction_current.get('dislike', 0)}",
+            f"- 🎬 Movie 🍓 (current): {movie_reaction_current.get('berry', 0)}",
+            f"- 🎬 Movie 🐳 (current): {movie_reaction_current.get('whale', 0)}",
         ]
 
         report = "\n".join(lines)
@@ -4165,12 +4856,14 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await target_message.reply_text(MESSAGES[lang]["audit_failed"])
 
 # Search flow handlers extracted module bridge (phase 2)
-_search_flow.configure(globals())
+_search_flow.configure(_build_search_flow_deps())
 
 transliterate_to_latin = _search_flow.transliterate_to_latin
 search_books = _search_flow.search_books
 handle_book_selection = _search_flow.handle_book_selection
 handle_movie_selection = _search_flow.handle_movie_selection
+handle_movie_reaction_callback = _search_flow.handle_movie_reaction_callback
+handle_movie_share_callback = _search_flow.handle_movie_share_callback
 handle_audiobook_callback = _search_flow.handle_audiobook_callback
 handle_audiobook_part_callback = _search_flow.handle_audiobook_part_callback
 handle_audiobook_part_delete_callback = _search_flow.handle_audiobook_part_delete_callback
@@ -4188,7 +4881,7 @@ handle_user_select_callback = _search_flow.handle_user_select_callback
 
 
 # Engagement handlers extracted module bridge
-_engagement_handlers.configure(globals())
+_engagement_handlers.configure(_build_engagement_handlers_deps())
 
 handle_user_action_callback = _engagement_handlers.handle_user_action_callback
 top_users_command = _engagement_handlers.top_users_command
@@ -4226,7 +4919,7 @@ handle_delete_book_callback = _engagement_handlers.handle_delete_book_callback
 
 
 # User interactions extracted module bridge
-_user_interactions.configure(globals())
+_user_interactions.configure(_build_user_interactions_deps())
 
 handle_request_callback = _user_interactions.handle_request_callback
 handle_request_status_callback = _user_interactions.handle_request_status_callback
@@ -4236,6 +4929,7 @@ handle_request_cancel_callback = _user_interactions.handle_request_cancel_callba
 handle_upload_request_status_callback = _user_interactions.handle_upload_request_status_callback
 handle_upload_help_callback = _user_interactions.handle_upload_help_callback
 favorites_command = _user_interactions.favorites_command
+random_command = _user_interactions.random_command
 help_command = _user_interactions.help_command
 request_command = _user_interactions.request_command
 requests_command = _user_interactions.requests_command
@@ -4245,7 +4939,7 @@ mystats_command = _user_interactions.mystats_command
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = ensure_user_language(update, context)
-    if update.effective_user.id != ADMIN_ID:
+    if not _is_admin_user(update.effective_user.id):
         await update.message.reply_text(MESSAGES[lang]["admin_only"])
         return
     limited, wait_s = spam_check_message(update, context)
@@ -4262,7 +4956,15 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = await run_blocking(load_users)  # list of dicts from DB
     sent_count = 0
     blocked_users = []
-    today = str(datetime.now().date())
+    transient_failures = 0
+
+    def _definitive_user_unreachable_error(exc: Exception) -> bool:
+        if isinstance(exc, Forbidden):
+            return True
+        if isinstance(exc, BadRequest):
+            msg = str(exc).lower()
+            return ("chat not found" in msg) or ("user not found" in msg)
+        return False
 
     for user in users:
         user_id = user.get("id")
@@ -4272,10 +4974,20 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user_id, text=message)
             sent_count += 1
         except Exception as e:
-            logger.debug(f"Failed to send to {user_id}: {e}")
-            # ✅ If sending fails, assume user blocked the bot
-            await run_blocking(update_user_left_date, user_id, datetime.now().date())
-            blocked_users.append(user)
+            if _definitive_user_unreachable_error(e):
+                logger.info("Broadcast: marking unreachable user %s: %s", user_id, e)
+                await run_blocking(update_user_left_date, user_id, datetime.now().date())
+                blocked_users.append(user)
+            elif isinstance(e, RetryAfter):
+                transient_failures += 1
+                delay = int(getattr(e, "retry_after", 1) or 1)
+                await asyncio.sleep(max(1, delay))
+            elif isinstance(e, (NetworkError, TimedOut)):
+                transient_failures += 1
+                logger.warning("Broadcast: transient error for user %s: %s", user_id, e)
+            else:
+                transient_failures += 1
+                logger.warning("Broadcast: non-definitive send error for user %s: %s", user_id, e)
 
     if blocked_users:
         await run_blocking(insert_removed_users, blocked_users)
@@ -4283,6 +4995,8 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         MESSAGES[lang]["broadcast_done"].format(sent=sent_count, blocked=len(blocked_users))
     )
+    if transient_failures:
+        logger.warning("Broadcast completed with %s transient/non-definitive failures", transient_failures)
 
     
 
@@ -4296,6 +5010,70 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not query:
         await update.inline_query.answer([], cache_time=0)
+        return
+
+    # Inline movie-share flow: triggered by movie keyboard share button.
+    token = query.split()[0].strip()
+    if token.startswith("mshare_"):
+        movie_id = token[len("mshare_"):].strip()
+        if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", movie_id or ""):
+            await update.inline_query.answer([], cache_time=0, is_personal=True)
+            return
+        try:
+            movie = await run_blocking(db_get_movie_by_id, movie_id)
+        except Exception as e:
+            logger.warning("inline movie share lookup failed for %s: %s", movie_id, e)
+            movie = None
+        if not movie:
+            await update.inline_query.answer([], cache_time=0, is_personal=True)
+            return
+
+        file_id = str(movie.get("file_id") or "").strip()
+        if not file_id:
+            await update.inline_query.answer([], cache_time=0, is_personal=True)
+            return
+
+        lang_ui = ensure_user_language(update, context)
+        title = str(movie.get("display_name") or movie.get("movie_name") or "Movie").strip() or "Movie"
+        raw_caption = str(movie.get("caption_text") or "").strip()
+        try:
+            base_caption = _search_flow._movie_caption_without_links(raw_caption) or title
+        except Exception:
+            base_caption = raw_caption or title
+        try:
+            share_caption = _search_flow._compose_movie_delivery_caption(base_caption, lang_ui)
+        except Exception:
+            share_caption = base_caption[:1024]
+
+        mime_type = str(movie.get("mime_type") or "").lower()
+        description = "Tap to send movie"
+        result_id = f"mshare:{movie_id}"
+        if InlineQueryResultCachedVideo is not None and mime_type.startswith("video/"):
+            results = [
+                InlineQueryResultCachedVideo(
+                    id=result_id,
+                    video_file_id=file_id,
+                    title=title[:64],
+                    description=description,
+                    caption=share_caption,
+                )
+            ]
+        else:
+            results = [
+                InlineQueryResultCachedDocument(
+                    id=result_id,
+                    title=title[:64],
+                    document_file_id=file_id,
+                    description=description,
+                    caption=share_caption,
+                )
+            ]
+
+        try:
+            await run_blocking(db_increment_counter, "movie_share_total", 1)
+        except Exception:
+            pass
+        await update.inline_query.answer(results, cache_time=0, is_personal=True)
         return
 
     try:
@@ -4423,7 +5201,7 @@ async def prune_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_message = update.message or (update.callback_query.message if update.callback_query else None)
     if not target_message:
         return
-    if update.effective_user.id != ADMIN_ID:
+    if not _is_admin_user(update.effective_user.id):
         await target_message.reply_text(MESSAGES[lang]["admin_only"])
         return
 
@@ -4434,7 +5212,7 @@ async def prune_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def missing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = ensure_user_language(update, context)
-    if update.effective_user.id != ADMIN_ID:
+    if not _is_admin_user(update.effective_user.id):
         await update.message.reply_text(MESSAGES[lang]["admin_only"])
         return
     args = context.args or []
@@ -4840,7 +5618,7 @@ def _format_dupes_status_text(app) -> str:
 
 
 # PDF Maker extracted module bridge
-_pdf_maker_mod.configure(globals())
+_pdf_maker_mod.configure(_build_pdf_maker_deps())
 
 _pdf_maker_texts = _pdf_maker_mod._pdf_maker_texts
 _PDF_MAKER_SESSION_KEY = _pdf_maker_mod._PDF_MAKER_SESSION_KEY
@@ -4885,7 +5663,7 @@ _pdf_maker_start_session_from_message = _pdf_maker_mod._pdf_maker_start_session_
 handle_pdf_maker_callback = _pdf_maker_mod.handle_pdf_maker_callback
 
 # PDF Editor extracted module bridge
-_pdf_editor.configure(globals())
+_pdf_editor.configure(_build_pdf_editor_deps())
 
 _pdfed_clear_session = _pdf_editor._pdf_editor_clear_session
 _pdfed_get_session = _pdf_editor._pdf_editor_get_session
@@ -4899,7 +5677,7 @@ handle_pdf_editor_callback = _pdf_editor.handle_pdf_editor_callback
 
 
 # TTS extracted module bridge
-_tts_tools.configure(globals())
+_tts_tools.configure(_build_tts_tools_deps())
 
 _TTS_SESSION_KEY = _tts_tools._TTS_SESSION_KEY
 _TTS_LANG_KEYS = _tts_tools._TTS_LANG_KEYS
@@ -4949,6 +5727,7 @@ _ai_tools.configure(
     run_blocking_heavy_fn=run_blocking_heavy,
     send_with_retry_fn=_send_with_retry,
     main_menu_keyboard_fn=_main_menu_keyboard,
+    safe_answer_fn=safe_answer,
     db_save_user_quiz_fn=db_save_user_quiz,
     db_get_user_quiz_fn=db_get_user_quiz,
     db_list_user_quizzes_fn=db_list_user_quizzes,
@@ -4994,7 +5773,7 @@ _ai_tool_translate_ollama_blocking = _ai_tools._ai_tool_translate_ollama_blockin
 _ai_tool_translate_blocking = _ai_tools._ai_tool_translate_blocking
 _ai_tool_translate_with_source_retry_blocking = _ai_tools._ai_tool_translate_with_source_retry_blocking
 # pdf_editor needs translator bindings after AI tools bridge is ready.
-_pdf_editor.configure(globals())
+_pdf_editor.configure(_build_pdf_editor_deps())
 _ai_tool_grammar_fix_blocking = _ai_tools._ai_tool_grammar_fix_blocking
 _ai_tool_email_writer_blocking = _ai_tools._ai_tool_email_writer_blocking
 _ai_tool_mode_start_session_from_message = _ai_tools._ai_tool_mode_start_session_from_message
@@ -5014,7 +5793,7 @@ _ai_chat_handle_text_input = _ai_tools._ai_chat_handle_text_input
 
 
 # Video downloader extracted module bridge
-_video_downloader.configure(globals())
+_video_downloader.configure(_build_video_downloader_deps())
 
 _video_dl_clear_session = _video_downloader._video_dl_clear_session
 _video_dl_get_session = _video_downloader._video_dl_get_session
@@ -5023,7 +5802,7 @@ _video_dl_handle_text_input = _video_downloader._video_dl_handle_text_input
 handle_video_downloader_callback = _video_downloader.handle_video_downloader_callback
 
 # Audio converter extracted module bridge
-_audio_converter.configure(globals())
+_audio_converter.configure(_build_audio_converter_deps())
 
 _audio_conv_clear_session = _audio_converter._audio_conv_clear_session
 _audio_conv_get_session = _audio_converter._audio_conv_get_session
@@ -5033,7 +5812,7 @@ _audio_conv_handle_media_input = _audio_converter._audio_conv_handle_media_input
 handle_audio_converter_callback = _audio_converter.handle_audio_converter_callback
 
 # Sticker tools extracted module bridge
-_sticker_tools.configure(globals())
+_sticker_tools.configure(_build_sticker_tools_deps())
 
 _sticker_clear_session = _sticker_tools._sticker_clear_session
 _sticker_get_session = _sticker_tools._sticker_get_session
@@ -5044,11 +5823,11 @@ handle_sticker_tools_callback = _sticker_tools.handle_sticker_tools_callback
 sticker_tools_command = _sticker_tools.sticker_tools_command
 
 # Refresh search_flow dependencies after late-bound feature bridges.
-_search_flow.configure(globals())
+_search_flow.configure(_build_search_flow_deps())
 
 
 # Admin runtime extracted module bridge
-_admin_runtime.configure(globals())
+_admin_runtime.configure(_build_admin_runtime_deps())
 
 _list_running_background_tasks = _admin_runtime._list_running_background_tasks
 _background_tasks_keyboard = _admin_runtime._background_tasks_keyboard
@@ -5084,17 +5863,33 @@ _start_upload_local_books = _admin_runtime._start_upload_local_books
 upload_local_books_command = _admin_runtime.upload_local_books_command
 
 # Refresh search_flow again after admin runtime aliases (e.g. user_search_command).
-_search_flow.configure(globals())
+_search_flow.configure(_build_search_flow_deps())
+
+
+def _build_handler_registry_deps() -> dict[str, object]:
+    deps: dict[str, object] = {}
+    missing: list[str] = []
+    for key in _handler_registry.REQUIRED_DEP_KEYS:
+        if key not in globals():
+            missing.append(key)
+            continue
+        deps[key] = globals()[key]
+    if missing:
+        raise RuntimeError(f"Missing handler dependencies: {', '.join(missing)}")
+    return deps
 
 
 def main():
     if not _acquire_single_instance_lock():
         return
     try:
-        if not TOKEN or not isinstance(TOKEN, str) or len(TOKEN) < 10:
-            logger.error("Invalid or missing Telegram TOKEN in config.py")
-        else:
-            logger.debug("TOKEN loaded")
+        config_errors = validate_runtime_config()
+        if config_errors:
+            logger.error("Configuration validation failed. Startup aborted.")
+            for err in config_errors:
+                logger.error("Config error: %s", err)
+            return
+        logger.debug("Runtime configuration validated")
 
         # Initialize DB
         init_db()
@@ -5114,11 +5909,14 @@ def main():
             logger.info(f"DB: up | users={users} books={books} indexed={indexed}")
         else:
             logger.error(f"DB: down | error={db_stats.get('error')}")
+        video_channels_for_log = list(VIDEO_UPLOAD_CHANNEL_IDS or [])
+        if not video_channels_for_log and VIDEO_UPLOAD_CHANNEL_ID:
+            video_channels_for_log = [VIDEO_UPLOAD_CHANNEL_ID]
         logger.info(
             "Upload channels: books=%s audio=%s video=%s",
             ",".join(str(x) for x in (UPLOAD_CHANNEL_IDS or [])) or "none",
             AUDIO_UPLOAD_CHANNEL_ID,
-            VIDEO_UPLOAD_CHANNEL_ID,
+            ",".join(str(x) for x in video_channels_for_log) or "none",
         )
 
         logger.info(
@@ -5181,102 +5979,7 @@ def main():
         app = builder.build()
 
         # Register handlers
-        app.add_handler(MessageHandler(filters.ALL, paused_guard), group=-1)
-        app.add_handler(CallbackQueryHandler(paused_callback_guard), group=-1)
-        app.add_handler(MessageHandler(filters.ALL, _touch_user_activity_message), group=-1)
-        app.add_handler(CallbackQueryHandler(_touch_user_activity_callback), group=-1)
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("upload", upload_command_wrapper))
-        app.add_handler(CommandHandler("movie_upload", movie_upload_command))
-        app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
-        app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
-        # audiobook audio parts (when admin is uploading)
-        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | (filters.Document.ALL & filters.Document.MimeType("audio/")), handle_abook_audio))
-        app.add_handler(MessageHandler(filters.VIDEO | (filters.Document.ALL & filters.Document.MimeType("video/")), handle_movie_video))
-        app.add_handler(MessageHandler(filters.ANIMATION, handle_movie_video))
-        app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_books))
-        app.add_handler(CommandHandler("language", language_command_handler))
-        app.add_handler(CommandHandler("ramazon", ramazon_command))
-        app.add_handler(CommandHandler("pdf_maker", pdf_maker_command))
-        app.add_handler(CommandHandler("pdf_editor", pdf_editor_command))
-        app.add_handler(CommandHandler("text_to_voice", text_to_voice_command))
-        app.add_handler(CommandHandler("sticker_tools", sticker_tools_command))
-        app.add_handler(CallbackQueryHandler(handle_pdf_maker_callback, pattern="^pdfmk:"))
-        app.add_handler(CallbackQueryHandler(handle_pdf_editor_callback, pattern="^pdfed:"))
-        app.add_handler(CallbackQueryHandler(handle_tts_callback, pattern="^tts:"))
-        app.add_handler(CallbackQueryHandler(handle_video_downloader_callback, pattern="^vdl:"))
-        app.add_handler(CallbackQueryHandler(handle_audio_converter_callback, pattern="^atool:"))
-        app.add_handler(CallbackQueryHandler(handle_sticker_tools_callback, pattern="^stkr:"))
-        app.add_handler(CallbackQueryHandler(handle_ai_tools_callback, pattern="^aitool:"))
-        app.add_handler(CallbackQueryHandler(handle_my_quiz_callback, pattern="^myquiz:"))
-        app.add_handler(PollAnswerHandler(handle_ai_quiz_poll_answer))
-        app.add_handler(CallbackQueryHandler(handle_language_callback, pattern="^lang_"))
-        app.add_handler(CallbackQueryHandler(handle_page_callback, pattern="^page:"))
-        app.add_handler(CallbackQueryHandler(handle_movie_page_callback, pattern="^mpage:"))
-        app.add_handler(CallbackQueryHandler(handle_user_page_callback, pattern="^userpage:"))
-        app.add_handler(CallbackQueryHandler(handle_top_page_callback, pattern="^top:"))
-        app.add_handler(CallbackQueryHandler(handle_top_users_toggle_callback, pattern="^topusers:"))
-        app.add_handler(CallbackQueryHandler(handle_favorite_callback, pattern="^fav:"))
-        app.add_handler(CallbackQueryHandler(handle_audiobook_listen_callback, pattern="^abook:"))
-        app.add_handler(CallbackQueryHandler(handle_audiobook_page_callback, pattern="^abpage:"))
-        app.add_handler(CallbackQueryHandler(handle_audiobook_part_play_callback, pattern="^abplay:"))
-        app.add_handler(CallbackQueryHandler(handle_reaction_callback, pattern="^react:"))
-        app.add_handler(CallbackQueryHandler(handle_summary_placeholder_callback, pattern="^summary:"))
-        app.add_handler(CallbackQueryHandler(handle_admin_panel_callback, pattern="^adminp:"))
-        app.add_handler(CallbackQueryHandler(handle_background_task_callback, pattern="^bgtask:"))
-        app.add_handler(CallbackQueryHandler(handle_dupes_confirm_callback, pattern="^dupesop:"))
-        app.add_handler(CallbackQueryHandler(handle_user_select_callback, pattern="^user:"))
-        app.add_handler(CallbackQueryHandler(handle_user_action_callback, pattern="^uact:"))
-        app.add_handler(CallbackQueryHandler(handle_request_callback, pattern="^request:"))
-        app.add_handler(CallbackQueryHandler(handle_group_read_callback, pattern="^gread:"))
-        app.add_handler(CommandHandler("broadcast", broadcast_command_wrapper))
-        app.add_handler(CommandHandler("admin", admin_panel_command))
-        app.add_handler(CommandHandler("smoke", smoke_command_wrapper))
-        app.add_handler(CommandHandler("favorite", favorites_command))
-        app.add_handler(CommandHandler("top", top_command))
-        app.add_handler(CommandHandler("top_users", top_users_command))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("request", request_command))
-        app.add_handler(CommandHandler("requests", requests_command_wrapper))
-        app.add_handler(CommandHandler("my_quiz", my_quiz_command))
-        app.add_handler(CommandHandler("mystats", mystats_command))
-        app.add_handler(CommandHandler("myprofile", myprofile_command))
-        app.add_handler(CommandHandler("group_read_start", group_read_start_command))
-        app.add_handler(CommandHandler("group_read_status", group_read_status_command))
-        app.add_handler(CommandHandler("group_read_end", group_read_end_command))
-        app.add_handler(InlineQueryHandler(inlinequery))
-        app.add_handler(CommandHandler("audit", audit_command))
-        app.add_handler(CommandHandler("prune", prune_command))
-        app.add_handler(CommandHandler("missing", missing_command))
-        app.add_handler(CommandHandler("db_dupes", db_dupes_command))
-        app.add_handler(CommandHandler("es_dupes", es_dupes_command))
-        app.add_handler(CommandHandler("dupes_status", dupes_status_command))
-        app.add_handler(CommandHandler("cancel_task", cancel_task_command))
-        app.add_handler(CommandHandler("user", user_search_command))
-        app.add_handler(CommandHandler("pause_bot", pause_bot_command))
-        app.add_handler(CommandHandler("resume_bot", resume_bot_command))
-        app.add_handler(CommandHandler("upload_local_books", upload_local_books_command))
-
-        app.add_handler(CallbackQueryHandler(handle_request_status_callback, pattern="^reqstatus:"))
-        app.add_handler(CallbackQueryHandler(handle_requests_page_callback, pattern="^reqpage:"))
-        app.add_handler(CallbackQueryHandler(handle_requests_view_callback, pattern="^reqview:"))
-        app.add_handler(CallbackQueryHandler(handle_request_cancel_callback, pattern="^reqcancel:"))
-        app.add_handler(CallbackQueryHandler(handle_upload_help_callback, pattern="^upload_help_"))
-        app.add_handler(CallbackQueryHandler(handle_upload_request_status_callback, pattern="^uploadreqstatus:"))
-        app.add_handler(CallbackQueryHandler(handle_delete_book_callback, pattern="^delbook:"))
-
-        # audiobook admin callbacks (user-facing audiobook handlers are registered above)
-        app.add_handler(CallbackQueryHandler(handle_audiobook_part_delete_callback, pattern=r"^apdel:"))
-        app.add_handler(CallbackQueryHandler(handle_audiobook_delete_by_book_callback, pattern=r"^abdelbook:"))
-        app.add_handler(CallbackQueryHandler(handle_audiobook_delete_callback, pattern=r"^abdel:"))
-        app.add_handler(CallbackQueryHandler(handle_audiobook_add_callback, pattern=r"^abadd:"))
-        app.add_handler(CallbackQueryHandler(handle_movie_selection, pattern=r"^movie:[0-9a-fA-F-]{32,36}$"))
-        # ✅ Book selection (only for book callbacks)
-        app.add_handler(CallbackQueryHandler(handle_book_selection, pattern=r"^(book:)?[0-9a-fA-F-]{32,36}$"))
-
-        # Error handler
-        app.add_error_handler(handle_error)
+        _handler_registry.register_handlers(app, _build_handler_registry_deps())
 
         sync_unindexed_books()
         sync_unindexed_movies()
@@ -5285,9 +5988,10 @@ def main():
         print("Bot is running...")
         startup_retry_max = max(0, int(os.getenv("BOT_STARTUP_MAX_RETRIES", "0") or "0"))
         bootstrap_retries = -1 if startup_retry_max == 0 else startup_retry_max
+        drop_pending_updates = _env_bool("DROP_PENDING_UPDATES", False)
         app.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
+            drop_pending_updates=drop_pending_updates,
             bootstrap_retries=bootstrap_retries,
         )
     except Exception as e:

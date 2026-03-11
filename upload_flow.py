@@ -13,12 +13,77 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
+_CONFIG_REQUIRED_KEYS = (
+    "MESSAGES",
+    "run_blocking",
+    "ensure_user_language",
+    "is_blocked",
+    "is_stopped_user",
+    "spam_check_message",
+    "update_user_info",
+    "is_allowed",
+    "clean_query",
+    "db_find_duplicate_movie",
+    "db_insert_movie",
+    "es_available",
+    "update_movie_indexed",
+    "_send_with_retry",
+    "ApplicationHandlerStop",
+    "safe_reply",
+    "db_find_duplicate_book",
+    "db_update_upload_receipt",
+    "db_insert_book",
+    "db_update_book_upload_meta",
+    "UPLOAD_CHANNEL_IDS",
+    "enqueue_upload_fanout",
+    "index_book",
+    "notify_request_matches",
+    "db_insert_upload_receipt",
+    "_reply_search_image_hint",
+    "ensure_index",
+    "load_books",
+    "get_display_name",
+    "update_book_indexed",
+    "ensure_movies_index",
+    "index_movie",
+    "db_list_unindexed_movies",
+    "InlineKeyboardMarkup",
+    "InlineKeyboardButton",
+)
+
+_UPLOAD_MODE_KEY = "upload_mode_state"
+_UPLOAD_MODE_BOOK = "book"
+_UPLOAD_MODE_MOVIE = "movie"
+
 
 def configure(deps: dict[str, Any]) -> None:
     for k, v in deps.items():
         if k.startswith('__') and k.endswith('__'):
             continue
         globals()[k] = v
+    missing = [key for key in _CONFIG_REQUIRED_KEYS if key not in globals()]
+    if missing:
+        raise RuntimeError(f"upload_flow missing configured dependencies: {', '.join(missing)}")
+
+
+def _set_user_upload_mode(context: ContextTypes.DEFAULT_TYPE, mode: str | None) -> None:
+    try:
+        if mode in {_UPLOAD_MODE_BOOK, _UPLOAD_MODE_MOVIE}:
+            context.user_data[_UPLOAD_MODE_KEY] = mode
+        else:
+            context.user_data.pop(_UPLOAD_MODE_KEY, None)
+    except Exception:
+        pass
+
+
+def _get_user_upload_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    try:
+        mode = str(context.user_data.get(_UPLOAD_MODE_KEY) or "").strip().lower()
+    except Exception:
+        mode = ""
+    if mode in {_UPLOAD_MODE_BOOK, _UPLOAD_MODE_MOVIE}:
+        return mode
+    return ""
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -38,6 +103,76 @@ def _env_float(name: str, default: float) -> float:
         return float(str(os.getenv(name, str(default))).strip())
     except Exception:
         return float(default)
+
+
+def _coerce_int_id_list(raw: Any) -> list[int]:
+    values: list[Any]
+    if raw is None:
+        values = []
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = str(raw).split(",")
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in values:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            value = int(text)
+        except Exception:
+            continue
+        if value == 0 or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _resolve_video_upload_channel_ids() -> list[int]:
+    # Preferred: VIDEO_UPLOAD_CHANNEL_IDS (list/comma-separated), with
+    # VIDEO_UPLOAD_CHANNEL_ID kept as backward-compatible fallback.
+    ids = _coerce_int_id_list(globals().get("VIDEO_UPLOAD_CHANNEL_IDS"))
+    if ids:
+        return ids
+    ids = _coerce_int_id_list(os.getenv("VIDEO_UPLOAD_CHANNEL_IDS", ""))
+    if ids:
+        return ids
+    ids = _coerce_int_id_list([globals().get("VIDEO_UPLOAD_CHANNEL_ID")])
+    if ids:
+        return ids
+    return _coerce_int_id_list([os.getenv("VIDEO_UPLOAD_CHANNEL_ID", "")])
+
+
+async def _pick_video_upload_channel_id(context: ContextTypes.DEFAULT_TYPE, channel_ids: list[int] | None = None) -> int | None:
+    ids = list(channel_ids or _resolve_video_upload_channel_ids())
+    if not ids:
+        return None
+
+    app = getattr(context, "application", None)
+    if app is None:
+        return ids[0]
+
+    data = app.bot_data
+    lock = data.get("video_upload_channel_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        data["video_upload_channel_lock"] = lock
+
+    async with lock:
+        idx = int(data.get("video_upload_channel_index", 0) or 0)
+        channel_id = ids[idx % len(ids)]
+        data["video_upload_channel_index"] = idx + 1
+        return channel_id
+
+
+def _safe_asyncio_current_task():
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
 
 
 async def _send_status_with_retry(status_msg, text: str, reply_only: bool = False) -> None:
@@ -197,7 +332,8 @@ async def upload_bulk_index_worker(app):
             for _ in batch:
                 q.task_done()
     finally:
-        if data.get("upload_bulk_index_worker") is asyncio.current_task():
+        current_task = _safe_asyncio_current_task()
+        if current_task is not None and data.get("upload_bulk_index_worker") is current_task:
             data.pop("upload_bulk_index_worker", None)
 
 
@@ -229,6 +365,7 @@ async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update_user_info(update, context)
         if is_allowed(update.effective_user.id):
+            _set_user_upload_mode(context, _UPLOAD_MODE_BOOK)
             upload_mode = True
             movie_upload_mode = False
             await update.message.reply_text(MESSAGES[lang]["upload_activated"])
@@ -255,17 +392,19 @@ _QUOTE_CHARS = "\"'“”«»„‟"
 _TITLE_QUOTED_RE = re.compile(r"[\"“«„](.{2,180}?)[\"”»‟]")
 _YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2}|21\d{2})\b")
 _FIELD_PATTERNS = {
+    "title": re.compile(r"^(?:nomi|nom|title|name|название)\s*[:\-]\s*(.+)$", re.IGNORECASE),
     "year": re.compile(r"^(?:yili|yil|year|год|йили|йил)\s*[:\-]\s*(.+)$", re.IGNORECASE),
     "genre": re.compile(r"^(?:janr|genre|жанр)\s*[:\-]\s*(.+)$", re.IGNORECASE),
     "country": re.compile(r"^(?:davlat|давлат|country|страна)\s*[:\-]\s*(.+)$", re.IGNORECASE),
     "language": re.compile(r"^(?:tili|til|тили|тил|language|язык)\s*[:\-]\s*(.+)$", re.IGNORECASE),
-    "rating": re.compile(r"^(?:kinopoisk|kino\s*poisk|imdb|rating|reyting|рейтинг|кинопоиск)\s*[:\-]\s*(.+)$", re.IGNORECASE),
+    "rating": re.compile(r"^(?:kinopoisk|kino\s*poisk|imdb|rating|reyting|рейтинг|кинопоиск|sifati|quality|качество)\s*[:\-]\s*(.+)$", re.IGNORECASE),
 }
 _LANG_INLINE_PATTERNS = [
     re.compile(r"^(.+?)\s+tilida$", re.IGNORECASE),
     re.compile(r"^(.+?)\s+тилида$", re.IGNORECASE),
 ]
-_PROMO_LINE_RE = re.compile(r"^(?:premyera|premiere|премьера)\b", re.IGNORECASE)
+_PROMO_LINE_RE = re.compile(r"^(?:#\s*)?(?:premyera|premiere|премьера)\b", re.IGNORECASE)
+_CAPTION_LINK_RE = re.compile(r"(?:https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+)", re.IGNORECASE)
 
 
 def _clean_caption_line(raw: str) -> str:
@@ -280,6 +419,97 @@ def _clean_caption_line(raw: str) -> str:
 def _clean_meta_value(raw: str) -> str:
     text = _clean_caption_line(raw)
     return text.strip(_QUOTE_CHARS + " ")
+
+
+def _line_for_match(raw: str) -> str:
+    line = _clean_caption_line(raw)
+    if not line:
+        return ""
+    # Remove leading emoji/decorative symbols before field matching.
+    line = re.sub(r"^[^\w]+", "", line, flags=re.UNICODE)
+    return line.strip()
+
+
+def _is_separator_line(raw: str) -> bool:
+    line = str(raw or "").strip()
+    if not line:
+        return True
+    # Decorative separators like ───── or ***** should be ignored.
+    return not bool(re.search(r"[\w]", line, flags=re.UNICODE))
+
+
+def _is_channel_or_link_line(raw: str, normalized: str = "") -> bool:
+    raw_s = str(raw or "").strip().lower()
+    norm_s = str(normalized or "").strip().lower()
+    if not raw_s and not norm_s:
+        return False
+    if raw_s.startswith("@"):
+        return True
+    if "t.me/" in raw_s or "telegram.me/" in raw_s:
+        return True
+    if raw_s.startswith(("http://", "https://", "www.")):
+        return True
+    if norm_s.startswith(("manba:", "source:")):
+        return True
+    return False
+
+
+def _normalize_title_candidate(raw: str) -> str:
+    value = _clean_meta_value(raw)
+    value = value.strip("#").strip()
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _is_bad_movie_title_candidate(raw: str) -> bool:
+    value = _normalize_title_candidate(raw)
+    if not value:
+        return True
+    lower = value.lower()
+    if _PROMO_LINE_RE.match(value):
+        return True
+    if _is_channel_or_link_line(value, value):
+        return True
+    if lower.startswith("video_") and len(lower) >= 12:
+        return True
+    if re.fullmatch(r"video[_\-\s]*agad[a-z0-9_\-]{5,}", lower):
+        return True
+    if re.fullmatch(r"agad[a-z0-9_\-]{6,}", lower):
+        return True
+    return False
+
+
+def _humanize_movie_filename_stem(stem: str) -> str:
+    text = str(stem or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"[_\.]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _sanitize_caption_for_storage(caption: str) -> str:
+    raw = str(caption or "").strip()
+    if not raw:
+        return ""
+
+    lines_out: list[str] = []
+    blank_emitted = False
+    for raw_line in raw.splitlines():
+        line = _CAPTION_LINK_RE.sub("", str(raw_line))
+        line = re.sub(r"\s{2,}", " ", line).strip()
+        if line:
+            lines_out.append(line)
+            blank_emitted = False
+            continue
+        if lines_out and not blank_emitted:
+            lines_out.append("")
+            blank_emitted = True
+
+    cleaned = "\n".join(lines_out).strip()
+    if len(cleaned) > 1024:
+        cleaned = cleaned[:1021].rstrip() + "..."
+    return cleaned
 
 
 def _normalize_search_text(raw: str) -> str:
@@ -305,8 +535,8 @@ def _parse_movie_caption(caption: str) -> dict[str, Any]:
 
     title = ""
     for m in _TITLE_QUOTED_RE.finditer(text):
-        candidate = _clean_meta_value(m.group(1))
-        if candidate:
+        candidate = _normalize_title_candidate(m.group(1))
+        if candidate and not _is_bad_movie_title_candidate(candidate):
             title = candidate
             break
 
@@ -317,16 +547,26 @@ def _parse_movie_caption(caption: str) -> dict[str, Any]:
     rating = ""
 
     for line in lines:
+        if _is_separator_line(line):
+            continue
+        line_for_match = _line_for_match(line)
+        if not line_for_match:
+            continue
+
         parsed = False
         for key, pattern in _FIELD_PATTERNS.items():
-            m = pattern.match(line)
+            m = pattern.match(line_for_match)
             if not m:
                 continue
             value = _clean_meta_value(m.group(1))
             if not value:
                 parsed = True
                 break
-            if key == "year":
+            if key == "title":
+                candidate = _normalize_title_candidate(value)
+                if candidate and not _is_bad_movie_title_candidate(candidate):
+                    title = candidate
+            elif key == "year":
                 ym = _YEAR_RE.search(value)
                 if ym:
                     try:
@@ -348,7 +588,7 @@ def _parse_movie_caption(caption: str) -> dict[str, Any]:
 
         if not language:
             for pat in _LANG_INLINE_PATTERNS:
-                m = pat.match(line)
+                m = pat.match(line_for_match)
                 if m:
                     language = _clean_meta_value(m.group(1))
                     parsed = True
@@ -357,8 +597,8 @@ def _parse_movie_caption(caption: str) -> dict[str, Any]:
             continue
 
         if year is None:
-            ym = _YEAR_RE.search(line)
-            if ym and any(tok in line.lower() for tok in ("yil", "year", "год", "йил")):
+            ym = _YEAR_RE.search(line_for_match)
+            if ym and any(tok in line_for_match.lower() for tok in ("yil", "year", "год", "йил")):
                 try:
                     year = int(ym.group(1))
                 except Exception:
@@ -366,16 +606,23 @@ def _parse_movie_caption(caption: str) -> dict[str, Any]:
 
     if not title:
         for line in lines:
-            if _PROMO_LINE_RE.match(line):
+            if _is_separator_line(line):
                 continue
-            if any(p.match(line) for p in _FIELD_PATTERNS.values()):
+            line_for_match = _line_for_match(line)
+            if not line_for_match:
                 continue
-            if any(p.match(line) for p in _LANG_INLINE_PATTERNS):
+            if _is_channel_or_link_line(line, line_for_match):
                 continue
-            if _YEAR_RE.search(line) and len(line) <= 12:
+            if _PROMO_LINE_RE.match(line_for_match):
                 continue
-            candidate = _clean_meta_value(line)
-            if candidate:
+            if any(p.match(line_for_match) for p in _FIELD_PATTERNS.values()):
+                continue
+            if any(p.match(line_for_match) for p in _LANG_INLINE_PATTERNS):
+                continue
+            if _YEAR_RE.search(line_for_match) and len(line_for_match) <= 12:
+                continue
+            candidate = _normalize_title_candidate(line_for_match)
+            if candidate and not _is_bad_movie_title_candidate(candidate):
                 title = candidate
                 break
 
@@ -409,7 +656,9 @@ def _movie_media_payload_from_message(msg) -> dict | None:
     if not msg:
         return None
     caption = str(getattr(msg, "caption", "") or "").strip()
-    caption_meta = _parse_movie_caption(caption)
+    storage_caption = _sanitize_caption_for_storage(caption)
+    caption_for_parse = storage_caption or caption
+    caption_meta = _parse_movie_caption(caption_for_parse)
     video = getattr(msg, "video", None)
     if video:
         movie_name = getattr(video, "file_name", None) or f"video_{getattr(video, 'file_unique_id', '') or uuid.uuid4().hex[:8]}.mp4"
@@ -422,6 +671,7 @@ def _movie_media_payload_from_message(msg) -> dict | None:
             "duration_seconds": getattr(video, "duration", None),
             "file_size": getattr(video, "file_size", None),
             "caption": caption,
+            "storage_caption": storage_caption or None,
             **caption_meta,
         }
     doc = getattr(msg, "document", None)
@@ -440,6 +690,7 @@ def _movie_media_payload_from_message(msg) -> dict | None:
                 "duration_seconds": None,
                 "file_size": getattr(doc, "file_size", None),
                 "caption": caption,
+                "storage_caption": storage_caption or None,
                 **caption_meta,
             }
     return None
@@ -460,6 +711,7 @@ async def movie_upload_command(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         await update_user_info(update, context)
         if is_allowed(update.effective_user.id):
+            _set_user_upload_mode(context, _UPLOAD_MODE_MOVIE)
             upload_mode = False
             movie_upload_mode = True
             await update.message.reply_text(
@@ -498,23 +750,29 @@ async def _process_movie_upload(
         no_status_edits = _env_bool("UPLOAD_NO_STATUS_EDITS", False)
         skip_name_duplicate_check = _env_bool("UPLOAD_SKIP_NAME_DUP_CHECK", False)
 
-        raw_video_channel_id = globals().get("VIDEO_UPLOAD_CHANNEL_ID")
-        try:
-            video_channel_id = int(raw_video_channel_id or 0)
-        except Exception:
-            video_channel_id = 0
-        # Telegram channel IDs are usually negative (-100...).
-        # Treat only 0/empty/invalid as "not configured".
-        if video_channel_id == 0:
+        video_channel_ids = _resolve_video_upload_channel_ids()
+        if not video_channel_ids:
             logger.warning(
-                "Movie upload rejected: VIDEO_UPLOAD_CHANNEL_ID invalid (value=%r)",
-                raw_video_channel_id,
+                "Movie upload rejected: no valid video channel configured (VIDEO_UPLOAD_CHANNEL_IDS=%r, VIDEO_UPLOAD_CHANNEL_ID=%r)",
+                globals().get("VIDEO_UPLOAD_CHANNEL_IDS"),
+                globals().get("VIDEO_UPLOAD_CHANNEL_ID"),
             )
             await _send_status_with_retry(
                 status_msg,
                 MESSAGES[lang].get(
                     "movie_upload_no_channel",
-                    "⚠️ VIDEO_UPLOAD_CHANNEL_ID is not set. Please set the video channel ID first.",
+                    "⚠️ VIDEO_UPLOAD_CHANNEL_IDS/VIDEO_UPLOAD_CHANNEL_ID is not set. Please configure video channel IDs first.",
+                ),
+                reply_only=no_status_edits,
+            )
+            return
+        video_channel_id = await _pick_video_upload_channel_id(context, video_channel_ids)
+        if video_channel_id is None:
+            await _send_status_with_retry(
+                status_msg,
+                MESSAGES[lang].get(
+                    "movie_upload_no_channel",
+                    "⚠️ VIDEO_UPLOAD_CHANNEL_IDS/VIDEO_UPLOAD_CHANNEL_ID is not set. Please configure video channel IDs first.",
                 ),
                 reply_only=no_status_edits,
             )
@@ -524,12 +782,21 @@ async def _process_movie_upload(
         file_unique_id = str(media.get("file_unique_id") or "").strip() or None
         file_name = str(media.get("file_name") or "video.mp4").strip() or "video.mp4"
         fallback_name_raw, _ = os.path.splitext(file_name)
-        parsed_title = str(media.get("parsed_title") or "").strip()
-        movie_name_raw = parsed_title or fallback_name_raw
+        parsed_title = _normalize_title_candidate(str(media.get("parsed_title") or "").strip())
+        if _is_bad_movie_title_candidate(parsed_title):
+            parsed_title = ""
+        fallback_name = _normalize_title_candidate(_humanize_movie_filename_stem(fallback_name_raw))
+        if _is_bad_movie_title_candidate(fallback_name):
+            fallback_name = ""
+        movie_name_raw = parsed_title or fallback_name
+        if not movie_name_raw:
+            token = str(file_unique_id or uuid.uuid4().hex[:10])[:10]
+            movie_name_raw = f"movie {token}"
         cleaned_name = clean_query(movie_name_raw)
         if not cleaned_name:
-            cleaned_name = clean_query(fallback_name_raw)
-            movie_name_raw = fallback_name_raw
+            cleaned_name = clean_query(_humanize_movie_filename_stem(fallback_name_raw))
+            movie_name_raw = _humanize_movie_filename_stem(fallback_name_raw) or movie_name_raw
+        display_label = movie_name_raw or file_name
 
         release_year = media.get("release_year")
         try:
@@ -563,16 +830,47 @@ async def _process_movie_upload(
         if existing:
             await _send_status_with_retry(
                 status_msg,
-                f"{MESSAGES[lang].get('movie_duplicate', MESSAGES[lang].get('duplicate', '⚠️ Duplicate ignored:'))} {file_name}",
+                f"{MESSAGES[lang].get('movie_duplicate', MESSAGES[lang].get('duplicate', '⚠️ Duplicate ignored:'))} {display_label}",
                 reply_only=no_status_edits,
             )
             return
 
+        storage_caption = str(
+            media.get("storage_caption")
+            or media.get("caption_text")
+            or media.get("caption")
+            or ""
+        ).strip()
+        if storage_caption:
+            storage_caption = _sanitize_caption_for_storage(storage_caption)
+        kind = str(media.get("kind") or "").strip().lower()
         sent = None
         send_retry_max = 5
         for attempt in range(1, send_retry_max + 1):
             try:
-                sent = await context.bot.send_document(chat_id=video_channel_id, document=file_id)
+                if kind == "video":
+                    send_kwargs: dict[str, Any] = {
+                        "chat_id": video_channel_id,
+                        "video": file_id,
+                    }
+                    duration_seconds = media.get("duration_seconds")
+                    try:
+                        duration_int = int(duration_seconds) if duration_seconds is not None else None
+                    except Exception:
+                        duration_int = None
+                    if duration_int and duration_int > 0:
+                        send_kwargs["duration"] = duration_int
+                    if storage_caption:
+                        send_kwargs["caption"] = storage_caption
+                    sent = await context.bot.send_video(**send_kwargs)
+                else:
+                    send_kwargs = {
+                        "chat_id": video_channel_id,
+                        "document": file_id,
+                    }
+                    if storage_caption:
+                        send_kwargs["caption"] = storage_caption
+                    sent = await context.bot.send_document(**send_kwargs)
                 break
             except Exception as e:
                 retry_after = getattr(e, "retry_after", None)
@@ -629,7 +927,7 @@ async def _process_movie_upload(
         if inserted is False:
             await _send_status_with_retry(
                 status_msg,
-                f"{MESSAGES[lang].get('movie_duplicate', MESSAGES[lang].get('duplicate', '⚠️ Duplicate ignored:'))} {file_name}",
+                f"{MESSAGES[lang].get('movie_duplicate', MESSAGES[lang].get('duplicate', '⚠️ Duplicate ignored:'))} {display_label}",
                 reply_only=no_status_edits,
             )
             return
@@ -705,7 +1003,7 @@ async def _process_movie_upload(
 
         await _send_status_with_retry(
             status_msg,
-            f"{MESSAGES[lang].get('movie_saved', MESSAGES[lang].get('saved', '✅ Saved:'))} {file_name}",
+            f"{MESSAGES[lang].get('movie_saved', MESSAGES[lang].get('saved', '✅ Saved:'))} {display_label}",
             reply_only=no_status_edits,
         )
     except Exception as e:
@@ -738,14 +1036,13 @@ async def _start_movie_upload_from_media(update: Update, context: ContextTypes.D
 
 
 async def handle_movie_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global movie_upload_mode
     try:
         if not update.message:
             return
         media = _movie_media_payload_from_message(update.message)
         if not media:
             return
-        if not movie_upload_mode:
+        if _get_user_upload_mode(context) != _UPLOAD_MODE_MOVIE:
             return
         lang = ensure_user_language(update, context)
         user_id = update.effective_user.id if update.effective_user else None
@@ -1056,15 +1353,14 @@ async def _process_upload(
                 logger.error(f"Failed to send error reply: {reply_e}")
                 # Last resort - try to send any message
                 try:
-                    if hasattr(update, 'message') and update.message:
-                        await update.message.reply_text("❌ Upload processing failed")
+                    if status_msg:
+                        await status_msg.reply_text("❌ Upload processing failed")
                         logger.info("Sent fallback error message")
                 except Exception as fallback_e:
                     logger.error(f"All error message attempts failed: {fallback_e}")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global upload_mode, movie_upload_mode
     try:
         lang = ensure_user_language(update, context)
 
@@ -1080,7 +1376,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update_user_info(update, context)
 
-        logger.info(f"handle_file: upload_mode={upload_mode}, user_id={update.effective_user.id}, is_allowed={is_allowed(update.effective_user.id) if update.effective_user else 'N/A'}")
+        user_mode = _get_user_upload_mode(context)
+        logger.info(
+            "handle_file: user_mode=%s, user_id=%s, is_allowed=%s",
+            user_mode or "none",
+            update.effective_user.id if update.effective_user else "N/A",
+            is_allowed(update.effective_user.id) if update.effective_user else "N/A",
+        )
         doc = update.message.document
         doc_mime = str(getattr(doc, "mime_type", "") or "").lower() if doc else ""
         doc_name = str(getattr(doc, "file_name", "") or "").lower() if doc else ""
@@ -1091,13 +1393,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
-        if movie_upload_mode and is_allowed(update.effective_user.id) and looks_like_video_doc:
+        if user_mode == _UPLOAD_MODE_MOVIE and is_allowed(update.effective_user.id) and looks_like_video_doc:
             media = _movie_media_payload_from_message(update.message)
             if media:
                 await _start_movie_upload_from_media(update, context, media, lang)
                 return
 
-        if upload_mode and is_allowed(update.effective_user.id):
+        if user_mode == _UPLOAD_MODE_BOOK and is_allowed(update.effective_user.id):
             if not update.message.document:
                 await update.message.reply_text(MESSAGES[lang]["send_doc"])
                 return
@@ -1147,7 +1449,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
         else:
-            logger.info(f"handle_file: ELSE branch - upload_mode={upload_mode}, is_allowed={is_allowed(update.effective_user.id) if update.effective_user else 'N/A'}")
+            logger.info(
+                "handle_file: ELSE branch - user_mode=%s, is_allowed=%s",
+                user_mode or "none",
+                is_allowed(update.effective_user.id) if update.effective_user else "N/A",
+            )
             if doc_mime.startswith("image/"):
                 await _reply_search_image_hint(update, context, lang)
             else:

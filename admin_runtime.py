@@ -1,9 +1,24 @@
 from __future__ import annotations
 
 import logging
+import textwrap
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_CONFIG_REQUIRED_KEYS = (
+    "MESSAGES",
+    "ensure_user_language",
+    "_is_admin_user",
+    "spam_check_message",
+    "run_blocking",
+    "safe_answer",
+    "_edit_progress_message",
+    "_send_chat_message",
+    "db_list_admin_task_runs",
+    "db_insert_admin_task_run",
+    "db_update_admin_task_run",
+)
 
 
 def configure(deps: dict[str, Any]) -> None:
@@ -11,6 +26,19 @@ def configure(deps: dict[str, Any]) -> None:
         if k.startswith('__') and k.endswith('__'):
             continue
         globals()[k] = v
+    missing = [key for key in _CONFIG_REQUIRED_KEYS if key not in globals()]
+    if missing:
+        raise RuntimeError(f"admin_runtime missing configured dependencies: {', '.join(missing)}")
+
+
+def _safe_asyncio_current_task():
+    asyncio_mod = globals().get("asyncio")
+    if not asyncio_mod:
+        return None
+    try:
+        return asyncio_mod.current_task()
+    except Exception:
+        return None
 
 
 def _list_running_background_tasks(app) -> list[dict]:
@@ -77,6 +105,55 @@ def _format_background_tasks_text(app, notice: str | None = None) -> str:
     lines.append("──────────")
     lines.append("Choose a task below to cancel it.")
     return "\n".join(lines)
+
+
+def _fmt_task_ts(value) -> str:
+    if not value:
+        return "-"
+    try:
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value)
+
+
+def _format_task_history_text(rows: list[dict], limit: int = 6) -> str:
+    if not rows:
+        return "Recent task runs\n──────────\nNo persisted task runs yet."
+    lines = ["Recent task runs", "──────────"]
+    for row in rows[: max(1, int(limit))]:
+        kind = str(row.get("task_kind") or row.get("task_key") or "task")
+        status = str(row.get("status") or "unknown")
+        started = _fmt_task_ts(row.get("started_at"))
+        finished = _fmt_task_ts(row.get("finished_at"))
+        summary = str(row.get("summary") or "").strip()
+        line = f"- {kind} | {status} | start={started} | end={finished}"
+        if summary:
+            line += f" | {summary[:80]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def _build_background_tasks_with_history_text(
+    context: ContextTypes.DEFAULT_TYPE,
+    notice: str | None = None,
+    history_limit: int = 6,
+) -> str:
+    text = _format_background_tasks_text(context.application, notice=notice)
+    try:
+        history = await run_blocking(db_list_admin_task_runs, max(8, int(history_limit or 6)))
+    except Exception as e:
+        logger.warning("Failed to load admin task history: %s", e)
+        history = []
+    if history:
+        text = text + "\n\n" + _format_task_history_text(history, limit=history_limit)
+    return text
+
+
+def _now_dt():
+    try:
+        return datetime.now()
+    except Exception:
+        return None
 
 
 def _admin_panel_snapshot_text(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -408,7 +485,7 @@ async def cancel_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     target_message = update.message or (update.callback_query.message if update.callback_query else None)
     if not target_message:
         return
-    if update.effective_user.id != ADMIN_ID:
+    if not _is_admin_user(update.effective_user.id):
         await target_message.reply_text(MESSAGES[lang]["admin_only"])
         return
     limited, wait_s = spam_check_message(update, context)
@@ -416,7 +493,7 @@ async def cancel_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
         return
     items = _list_running_background_tasks(context.application)
-    text = _format_background_tasks_text(context.application)
+    text = await _build_background_tasks_with_history_text(context, history_limit=6)
     reply_markup = _background_tasks_keyboard(items) if items else None
     await target_message.reply_text(text, reply_markup=reply_markup)
 
@@ -426,7 +503,7 @@ async def handle_background_task_callback(update: Update, context: ContextTypes.
     if not query:
         return
     lang = ensure_user_language(update, context)
-    if (query.from_user.id if query.from_user else None) != ADMIN_ID:
+    if not _is_admin_user(query.from_user.id if query.from_user else 0):
         await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
         return
     data = str(query.data or "")
@@ -448,7 +525,7 @@ async def handle_background_task_callback(update: Update, context: ContextTypes.
     if action == "refresh":
         await safe_answer(query)
         items = _list_running_background_tasks(context.application)
-        text = _format_background_tasks_text(context.application)
+        text = await _build_background_tasks_with_history_text(context, history_limit=6)
         markup = _background_tasks_keyboard(items) if items else None
         await _edit_progress_message(query.message, text, reply_markup=markup)
         return
@@ -461,12 +538,35 @@ async def handle_background_task_callback(update: Update, context: ContextTypes.
     if not task or task.done():
         await safe_answer(query, "Task is already finished.", show_alert=True)
         items = _list_running_background_tasks(context.application)
-        text = _format_background_tasks_text(context.application, notice=f"{key}: already finished")
+        text = await _build_background_tasks_with_history_text(
+            context,
+            notice=f"{key}: already finished",
+            history_limit=6,
+        )
         markup = _background_tasks_keyboard(items) if items else None
         await _edit_progress_message(query.message, text, reply_markup=markup)
         return
 
     task.cancel()
+    run_id = None
+    if key == "upload_local_task":
+        run_id = context.application.bot_data.get("upload_local_task_run_id")
+    elif key == _dupes_task_key("db"):
+        st = _get_dupes_status(context.application, "db")
+        run_id = st.get("task_run_id") if isinstance(st, dict) else None
+    elif key == _dupes_task_key("es"):
+        st = _get_dupes_status(context.application, "es")
+        run_id = st.get("task_run_id") if isinstance(st, dict) else None
+    if run_id:
+        try:
+            await run_blocking(
+                db_update_admin_task_run,
+                str(run_id),
+                status="cancelling",
+                summary="Cancellation requested by operator",
+            )
+        except Exception as e:
+            logger.warning("Failed to mark task run as cancelling (%s): %s", run_id, e)
     if key == "upload_local_task":
         context.application.bot_data.pop("upload_local_status", None)
     elif key == "upload_fanout_task":
@@ -479,7 +579,11 @@ async def handle_background_task_callback(update: Update, context: ContextTypes.
     await safe_answer(query, "Cancel signal sent")
     await asyncio.sleep(0)
     items = _list_running_background_tasks(context.application)
-    text = _format_background_tasks_text(context.application, notice=f"Cancel requested: {key}")
+    text = await _build_background_tasks_with_history_text(
+        context,
+        notice=f"Cancel requested: {key}",
+        history_limit=6,
+    )
     markup = _background_tasks_keyboard(items) if items else None
     await _edit_progress_message(query.message, text, reply_markup=markup)
 
@@ -662,7 +766,13 @@ def _format_es_dupes_summary(stats: dict, deleted_es: int, es_failed: int, proce
     return "\n".join(lines)
 
 
-async def _run_db_dupes_cleanup_job(context: ContextTypes.DEFAULT_TYPE, lang: str, status_msg, admin_chat_id: int | None):
+async def _run_db_dupes_cleanup_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    lang: str,
+    status_msg,
+    admin_chat_id: int | None,
+    task_run_id: str | None = None,
+):
     _update_dupes_status(context.application, "db", stage="scanning", running=True)
     stats, victims, _preview_pairs = await run_blocking(_compute_db_duplicate_cleanup_plan)
     deleted_db = 0
@@ -732,9 +842,34 @@ async def _run_db_dupes_cleanup_job(context: ContextTypes.DEFAULT_TYPE, lang: st
         final_message_sent=bool(sent is not None),
         finished_at=time.time(),
     )
+    if task_run_id:
+        try:
+            await run_blocking(
+                db_update_admin_task_run,
+                str(task_run_id),
+                status="done",
+                summary=final_text,
+                metadata={
+                    "kind": "db",
+                    "total": total,
+                    "planned_delete": int(stats.get("total_delete", 0) or 0),
+                    "deleted_db": deleted_db,
+                    "deleted_es": deleted_es,
+                    "es_failed": es_failed,
+                },
+                finished_at=_now_dt(),
+            )
+        except Exception as e:
+            logger.warning("Failed to persist db dupes task completion: %s", e)
 
 
-async def _run_es_dupes_cleanup_job(context: ContextTypes.DEFAULT_TYPE, lang: str, status_msg, admin_chat_id: int | None):
+async def _run_es_dupes_cleanup_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    lang: str,
+    status_msg,
+    admin_chat_id: int | None,
+    task_run_id: str | None = None,
+):
     _update_dupes_status(context.application, "es", stage="scanning", running=True)
     stats, victims, _preview_pairs = await run_blocking(_compute_es_duplicate_cleanup_plan)
     deleted_es = 0
@@ -798,6 +933,24 @@ async def _run_es_dupes_cleanup_job(context: ContextTypes.DEFAULT_TYPE, lang: st
         final_message_sent=bool(sent is not None),
         finished_at=time.time(),
     )
+    if task_run_id:
+        try:
+            await run_blocking(
+                db_update_admin_task_run,
+                str(task_run_id),
+                status="done",
+                summary=final_text,
+                metadata={
+                    "kind": "es",
+                    "total": total,
+                    "planned_delete": int(stats.get("total_delete", 0) or 0),
+                    "deleted_es": deleted_es,
+                    "es_failed": es_failed,
+                },
+                finished_at=_now_dt(),
+            )
+        except Exception as e:
+            logger.warning("Failed to persist es dupes task completion: %s", e)
 
 
 def _dupes_task_key(kind: str) -> str:
@@ -809,18 +962,51 @@ def _dupes_is_running(app, kind: str) -> bool:
     return bool(task and not task.done())
 
 
-def _start_dupes_cleanup_task(context: ContextTypes.DEFAULT_TYPE, kind: str, lang: str, status_msg, admin_chat_id: int | None):
+def _start_dupes_cleanup_task(
+    context: ContextTypes.DEFAULT_TYPE,
+    kind: str,
+    lang: str,
+    status_msg,
+    admin_chat_id: int | None,
+    started_by: int | None = None,
+):
     app = context.application
     key = _dupes_task_key(kind)
     if _dupes_is_running(app, kind):
         return False
 
     async def _runner():
+        task_run_id = None
         try:
+            try:
+                task_run_id = await run_blocking(
+                    db_insert_admin_task_run,
+                    key,
+                    f"{kind}_dupes",
+                    started_by,
+                    "running",
+                    {"kind": kind, "admin_chat_id": admin_chat_id},
+                )
+                _update_dupes_status(app, kind, task_run_id=task_run_id)
+            except Exception as e:
+                logger.warning("Failed to persist %s dupes task start: %s", kind, e)
             if kind == "db":
-                await _run_db_dupes_cleanup_job(context, lang, status_msg, admin_chat_id)
+                await _run_db_dupes_cleanup_job(context, lang, status_msg, admin_chat_id, task_run_id=task_run_id)
             else:
-                await _run_es_dupes_cleanup_job(context, lang, status_msg, admin_chat_id)
+                await _run_es_dupes_cleanup_job(context, lang, status_msg, admin_chat_id, task_run_id=task_run_id)
+        except asyncio.CancelledError:
+            if task_run_id:
+                try:
+                    await run_blocking(
+                        db_update_admin_task_run,
+                        str(task_run_id),
+                        status="cancelled",
+                        summary="Task cancelled",
+                        finished_at=_now_dt(),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to persist %s dupes task cancellation: %s", kind, e)
+            raise
         except Exception as e:
             _update_dupes_status(
                 app,
@@ -832,12 +1018,25 @@ def _start_dupes_cleanup_task(context: ContextTypes.DEFAULT_TYPE, kind: str, lan
                 finished_at=time.time(),
             )
             logger.error("%s_dupes background task failed: %s", kind, e, exc_info=True)
+            if task_run_id:
+                try:
+                    await run_blocking(
+                        db_update_admin_task_run,
+                        str(task_run_id),
+                        status="failed",
+                        error=str(e),
+                        summary=f"{kind.upper()} duplicate cleanup failed",
+                        finished_at=_now_dt(),
+                    )
+                except Exception as db_e:
+                    logger.warning("Failed to persist %s dupes task failure: %s", kind, db_e)
             try:
                 await _send_chat_message(context, admin_chat_id, f"{kind.upper()} duplicate cleanup failed: {e}")
             except Exception:
                 pass
         finally:
-            if app.bot_data.get(key) is asyncio.current_task():
+            current_task = _safe_asyncio_current_task()
+            if current_task is not None and app.bot_data.get(key) is current_task:
                 app.bot_data.pop(key, None)
 
     task = app.create_task(_runner())
@@ -851,7 +1050,7 @@ async def db_dupes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_message = update.message or (update.callback_query.message if update.callback_query else None)
     if not target_message:
         return
-    if update.effective_user.id != ADMIN_ID:
+    if not _is_admin_user(update.effective_user.id):
         await target_message.reply_text(MESSAGES[lang]["admin_only"])
         return
     limited, wait_s = spam_check_message(update, context)
@@ -888,7 +1087,7 @@ async def es_dupes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_message = update.message or (update.callback_query.message if update.callback_query else None)
     if not target_message:
         return
-    if update.effective_user.id != ADMIN_ID:
+    if not _is_admin_user(update.effective_user.id):
         await target_message.reply_text(MESSAGES[lang]["admin_only"])
         return
     limited, wait_s = spam_check_message(update, context)
@@ -929,7 +1128,7 @@ async def dupes_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
     target_message = update.message or (update.callback_query.message if update.callback_query else None)
     if not target_message:
         return
-    if update.effective_user.id != ADMIN_ID:
+    if not _is_admin_user(update.effective_user.id):
         await target_message.reply_text(MESSAGES[lang]["admin_only"])
         return
     limited, wait_s = spam_check_message(update, context)
@@ -945,7 +1144,7 @@ async def handle_dupes_confirm_callback(update: Update, context: ContextTypes.DE
         return
     lang = ensure_user_language(update, context)
     user_id = query.from_user.id if query.from_user else None
-    if user_id != ADMIN_ID:
+    if not _is_admin_user(user_id or 0):
         await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
         return
     data = str(query.data or "")
@@ -989,6 +1188,7 @@ async def handle_dupes_confirm_callback(update: Update, context: ContextTypes.DE
         lang,
         None,
         query.message.chat_id if query.message else (update.effective_chat.id if update.effective_chat else None),
+        started_by=user_id,
     )
     if not started:
         await _send_chat_message(
@@ -1013,11 +1213,21 @@ async def user_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(MESSAGES[lang]["user_search_usage"])
         return
 
-    try:
-        all_users = await run_blocking(list_users)
-    except Exception as e:
-        logger.error(f"User search failed to load users: {e}")
-        all_users = []
+    all_users: list[dict] = []
+    db_search_fn = globals().get("db_search_users_by_name")
+    db_limit = max(int(USER_SEARCH_LIMIT or 30) * 8, 200)
+    if callable(db_search_fn):
+        try:
+            all_users = await run_blocking(db_search_fn, query, db_limit)
+        except Exception as e:
+            logger.error("User search DB query failed: %s", e)
+            all_users = []
+    else:
+        try:
+            all_users = await run_blocking(list_users)
+        except Exception as e:
+            logger.error("User search failed to load users: %s", e)
+            all_users = []
 
     q_norm = normalize(query).lower()
     q_lat = latinize_text(query)
@@ -1154,6 +1364,19 @@ async def _start_upload_local_books(update: Update, context: ContextTypes.DEFAUL
 
     admin_chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
     await target_message.reply_text(MESSAGES[lang]["upload_local_started"])
+    task_run_id = None
+    try:
+        task_run_id = await run_blocking(
+            db_insert_admin_task_run,
+            "upload_local_task",
+            "upload_local",
+            update.effective_user.id if update.effective_user else None,
+            "running",
+            {"mode": mode, "admin_chat_id": int(admin_chat_id)},
+        )
+        context.application.bot_data["upload_local_task_run_id"] = task_run_id
+    except Exception as e:
+        logger.warning("Failed to persist upload_local task run start: %s", e)
 
     async def _run():
         uploaded = 0
@@ -1380,32 +1603,88 @@ async def _start_upload_local_books(update: Update, context: ContextTypes.DEFAUL
                         status["done"] = uploaded + updated + errors
                         context.application.bot_data["upload_local_status"] = status
 
-        tasks = [asyncio.create_task(process_book(b)) for b in to_process]
-        if tasks:
-            await asyncio.gather(*tasks)
+        try:
+            tasks = [asyncio.create_task(process_book(b)) for b in to_process]
+            if tasks:
+                await asyncio.gather(*tasks)
 
-        summary = MESSAGES[lang]["upload_local_done"].format(
-            uploaded=uploaded,
-            updated=updated,
-            skipped=skipped,
-            skipped_large=skipped_large,
-            missing=missing,
-            errors=errors,
-        )
-        try:
-            await context.bot.send_message(chat_id=admin_chat_id, text=summary)
-        except Exception:
-            pass
-        try:
-            context.application.bot_data.pop("upload_local_status", None)
-        except Exception:
-            pass
+            summary = MESSAGES[lang]["upload_local_done"].format(
+                uploaded=uploaded,
+                updated=updated,
+                skipped=skipped,
+                skipped_large=skipped_large,
+                missing=missing,
+                errors=errors,
+            )
+            try:
+                await context.bot.send_message(chat_id=admin_chat_id, text=summary)
+            except Exception:
+                pass
+            if task_run_id:
+                try:
+                    await run_blocking(
+                        db_update_admin_task_run,
+                        str(task_run_id),
+                        status="done",
+                        summary=summary,
+                        metadata={
+                            "mode": mode,
+                            "uploaded": uploaded,
+                            "updated": updated,
+                            "skipped": skipped,
+                            "skipped_large": skipped_large,
+                            "missing": missing,
+                            "errors": errors,
+                            "total": total,
+                        },
+                        finished_at=_now_dt(),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to persist upload_local task completion: %s", e)
+        except asyncio.CancelledError:
+            if task_run_id:
+                try:
+                    await run_blocking(
+                        db_update_admin_task_run,
+                        str(task_run_id),
+                        status="cancelled",
+                        summary="Task cancelled",
+                        finished_at=_now_dt(),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to persist upload_local task cancellation: %s", e)
+            raise
+        except Exception as e:
+            logger.error("upload_local task failed: %s", e, exc_info=True)
+            if task_run_id:
+                try:
+                    await run_blocking(
+                        db_update_admin_task_run,
+                        str(task_run_id),
+                        status="failed",
+                        error=str(e),
+                        summary="Upload local task failed",
+                        finished_at=_now_dt(),
+                    )
+                except Exception as db_e:
+                    logger.warning("Failed to persist upload_local task failure: %s", db_e)
+            try:
+                await context.bot.send_message(chat_id=admin_chat_id, text=MESSAGES[lang]["error"])
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                context.application.bot_data.pop("upload_local_status", None)
+            except Exception:
+                pass
 
     task = asyncio.create_task(_run())
     context.application.bot_data["upload_local_task"] = task
     def _cleanup(_t):
         try:
             context.application.bot_data.pop("upload_local_task", None)
+            context.application.bot_data.pop("upload_local_task_run_id", None)
         except Exception:
             pass
     task.add_done_callback(_cleanup)

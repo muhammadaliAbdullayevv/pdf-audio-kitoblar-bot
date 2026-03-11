@@ -88,6 +88,22 @@ def _apply_schema_migrations(cur) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_audio_book_parts_channel_msg ON audio_book_parts (channel_id, channel_message_id);",
             ],
         ),
+        (
+            5,
+            "movies: add movie_reactions table",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS movie_reactions (
+                    movie_id TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    reaction TEXT NOT NULL,
+                    ts TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (movie_id, user_id)
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_movie_reactions_movie ON movie_reactions (movie_id);",
+            ],
+        ),
     ]
     for version, note, stmts in migrations:
         if version in applied:
@@ -120,6 +136,48 @@ def _dsn():
     }
 
 
+def _table_exists(cur, table_name: str) -> bool:
+    def _first_value(row):
+        if row is None:
+            return None
+        # RealDictCursor rows are mapping-like; regular cursor rows are tuple-like.
+        if isinstance(row, dict):
+            for v in row.values():
+                return v
+            return None
+        try:
+            return row[0]
+        except Exception:
+            try:
+                values = row.values()  # type: ignore[attr-defined]
+                for v in values:
+                    return v
+            except Exception:
+                return None
+            return None
+
+    try:
+        # Resolve against current search_path first, then explicit public schema.
+        # This avoids false negatives when deployments use non-public schemas.
+        cur.execute("SELECT to_regclass(%s)", (str(table_name),))
+        row = cur.fetchone()
+        if _first_value(row):
+            return True
+        if "." not in str(table_name):
+            cur.execute("SELECT to_regclass(%s)", (f"public.{table_name}",))
+            row = cur.fetchone()
+            if _first_value(row):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _runtime_schema_mode() -> str:
+    mode = str(os.getenv("DB_RUNTIME_SCHEMA_MODE", "auto") or "auto").strip().lower()
+    return mode if mode in {"auto", "always", "never"} else "auto"
+
+
 def init_db():
     """Initialize connection pool and ensure schema exists."""
     global _pool
@@ -129,6 +187,24 @@ def init_db():
     with db_conn() as conn:
         with conn.cursor() as cur:
             _ensure_schema_migrations(cur)
+            mode = _runtime_schema_mode()
+            users_exists = _table_exists(cur, "users")
+            # Fast path for Alembic-managed environments:
+            # avoid replaying large CREATE/ALTER bootstrap on every startup.
+            if mode in {"auto", "never"} and users_exists:
+                try:
+                    _apply_schema_migrations(cur)
+                    logger.debug("Runtime schema bootstrap skipped (mode=%s, users_exists=%s)", mode, users_exists)
+                    return
+                except Exception as e:
+                    if mode == "never":
+                        raise
+                    logger.warning("Fast schema migration path failed, falling back to runtime bootstrap: %s", e)
+            if mode == "never" and not users_exists:
+                raise RuntimeError(
+                    "DB_RUNTIME_SCHEMA_MODE=never but required tables are missing. "
+                    "Run Alembic migrations or set DB_RUNTIME_SCHEMA_MODE=auto."
+                )
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -326,6 +402,18 @@ def init_db():
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_book_reactions_book ON book_reactions (book_id);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS movie_reactions (
+                    movie_id TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    reaction TEXT NOT NULL,
+                    ts TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (movie_id, user_id)
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_movie_reactions_movie ON movie_reactions (movie_id);")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_favorites (
@@ -534,6 +622,25 @@ def init_db():
                 );
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS admin_task_runs (
+                    id TEXT PRIMARY KEY,
+                    task_key TEXT NOT NULL,
+                    task_kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_by BIGINT,
+                    started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    finished_at TIMESTAMP,
+                    summary TEXT,
+                    error TEXT,
+                    metadata_json TEXT
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_task_runs_started_at ON admin_task_runs (started_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_task_runs_task_kind ON admin_task_runs (task_kind);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_task_runs_status ON admin_task_runs (status);")
             # --- Migrations: add display_order columns if they don't exist ---
             try:
                 cur.execute("ALTER TABLE audio_books ADD COLUMN IF NOT EXISTS display_order BIGINT;")
@@ -887,6 +994,122 @@ def insert_removed_users(rows: list[dict]):
             return len(values)
 
 
+def insert_admin_task_run(
+    task_key: str,
+    task_kind: str,
+    started_by: int | None = None,
+    status: str = "running",
+    metadata: dict | None = None,
+    task_id: str | None = None,
+):
+    run_id = str(task_id or uuid.uuid4().hex)
+    meta_json = None
+    if metadata is not None:
+        try:
+            meta_json = json.dumps(metadata, ensure_ascii=False)
+        except Exception:
+            meta_json = None
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO admin_task_runs (
+                    id, task_key, task_kind, status, started_by, started_at, metadata_json
+                )
+                VALUES (%s, %s, %s, %s, %s, NOW(), %s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (run_id, str(task_key), str(task_kind), str(status or "running"), started_by, meta_json),
+            )
+    return run_id
+
+
+def update_admin_task_run(
+    task_id: str,
+    *,
+    status: str | None = None,
+    summary: str | None = None,
+    error: str | None = None,
+    metadata: dict | None = None,
+    finished_at: datetime | None = None,
+):
+    if not task_id:
+        return 0
+    set_parts: list[str] = []
+    values: list = []
+    if status is not None:
+        set_parts.append("status=%s")
+        values.append(str(status))
+    if summary is not None:
+        set_parts.append("summary=%s")
+        values.append(str(summary)[:4000])
+    if error is not None:
+        set_parts.append("error=%s")
+        values.append(str(error)[:4000])
+    if metadata is not None:
+        try:
+            meta_json = json.dumps(metadata, ensure_ascii=False)
+        except Exception:
+            meta_json = None
+        set_parts.append("metadata_json=%s")
+        values.append(meta_json)
+    if finished_at is not None:
+        set_parts.append("finished_at=%s")
+        values.append(finished_at)
+    if not set_parts:
+        return 0
+    values.append(str(task_id))
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE admin_task_runs SET {', '.join(set_parts)} WHERE id=%s",
+                values,
+            )
+            return cur.rowcount
+
+
+def list_admin_task_runs(limit: int = 30, task_kind: str | None = None):
+    limit = max(1, min(int(limit or 30), 200))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if task_kind:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM admin_task_runs
+                    WHERE task_kind=%s
+                    ORDER BY started_at DESC
+                    LIMIT %s
+                    """,
+                    (str(task_kind), limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM admin_task_runs
+                    ORDER BY started_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            rows = cur.fetchall() or []
+
+    out = []
+    for row in rows:
+        item = dict(row)
+        meta = item.get("metadata_json")
+        if isinstance(meta, str) and meta:
+            try:
+                item["metadata"] = json.loads(meta)
+            except Exception:
+                item["metadata"] = None
+        else:
+            item["metadata"] = None
+        out.append(item)
+    return out
+
+
 # --- Favorites & Recents ---
 
 def add_favorite(user_id: int, book_id: str, title: str, max_favorites: int):
@@ -1135,6 +1358,8 @@ def backfill_counters_if_empty() -> bool:
 
             cur.execute("SELECT reaction, COUNT(*) FROM book_reactions GROUP BY reaction")
             react_counts = {str(r): int(c or 0) for r, c in cur.fetchall()}
+            cur.execute("SELECT reaction, COUNT(*) FROM movie_reactions GROUP BY reaction")
+            movie_react_counts = {str(r): int(c or 0) for r, c in cur.fetchall()}
 
             counters = {
                 "search_total": int(search_total or 0),
@@ -1152,6 +1377,10 @@ def backfill_counters_if_empty() -> bool:
                 "reaction_dislike": react_counts.get("dislike", 0),
                 "reaction_berry": react_counts.get("berry", 0),
                 "reaction_whale": react_counts.get("whale", 0),
+                "movie_reaction_like": movie_react_counts.get("like", 0),
+                "movie_reaction_dislike": movie_react_counts.get("dislike", 0),
+                "movie_reaction_berry": movie_react_counts.get("berry", 0),
+                "movie_reaction_whale": movie_react_counts.get("whale", 0),
             }
 
             for key, value in counters.items():
@@ -1226,6 +1455,43 @@ def list_books():
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM books")
+            return cur.fetchall()
+
+
+def get_random_book(require_accessible: bool = True):
+    rows = get_random_books(limit=1, require_accessible=require_accessible)
+    return rows[0] if rows else None
+
+
+def get_random_books(limit: int = 10, require_accessible: bool = True):
+    try:
+        safe_limit = max(1, min(50, int(limit or 10)))
+    except Exception:
+        safe_limit = 10
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if require_accessible:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM books
+                    WHERE (file_id IS NOT NULL AND file_id <> '')
+                       OR (path IS NOT NULL AND path <> '')
+                    ORDER BY RANDOM()
+                    LIMIT %s
+                    """,
+                    (safe_limit,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM books
+                    ORDER BY RANDOM()
+                    LIMIT %s
+                    """,
+                    (safe_limit,),
+                )
             return cur.fetchall()
 
 
@@ -1802,6 +2068,35 @@ def get_book_reaction_counts(book_id: str) -> dict[str, int]:
     return counts
 
 
+def set_movie_reaction(user_id: int, movie_id: str, reaction: str):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO movie_reactions (movie_id, user_id, reaction)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (movie_id, user_id) DO UPDATE SET
+                    reaction = EXCLUDED.reaction,
+                    ts = NOW()
+                """,
+                (movie_id, user_id, reaction),
+            )
+
+
+def get_movie_reaction_counts(movie_id: str) -> dict[str, int]:
+    counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reaction, COUNT(*) FROM movie_reactions WHERE movie_id=%s GROUP BY reaction",
+                (movie_id,),
+            )
+            for reaction, count in cur.fetchall():
+                if reaction in counts:
+                    counts[reaction] = int(count)
+    return counts
+
+
 def get_book_favorite_count(book_id: str) -> int:
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -1990,12 +2285,34 @@ def get_reaction_totals() -> dict[str, int]:
     return counts
 
 
+def get_movie_reaction_totals() -> dict[str, int]:
+    counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT reaction, COUNT(*) FROM movie_reactions GROUP BY reaction")
+            for reaction, count in cur.fetchall():
+                if reaction in counts:
+                    counts[reaction] = int(count or 0)
+    return counts
+
+
 def get_user_reaction(book_id: str, user_id: int) -> str | None:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT reaction FROM book_reactions WHERE book_id=%s AND user_id=%s",
                 (book_id, user_id),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+
+def get_user_movie_reaction(movie_id: str, user_id: int) -> str | None:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reaction FROM movie_reactions WHERE movie_id=%s AND user_id=%s",
+                (movie_id, user_id),
             )
             row = cur.fetchone()
             return row[0] if row else None

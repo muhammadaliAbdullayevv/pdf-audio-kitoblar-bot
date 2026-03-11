@@ -57,7 +57,7 @@ async def handle_request_status_callback(update: Update, context: ContextTypes.D
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
 
-    if user.id != ADMIN_ID and user.id != OWNER_ID:
+    if not _is_admin_user(user.id):
         await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
         return
 
@@ -289,7 +289,7 @@ async def handle_upload_request_status_callback(update: Update, context: Context
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
 
-    if user.id != ADMIN_ID and user.id != OWNER_ID:
+    if not _is_admin_user(user.id):
         await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
         return
 
@@ -369,6 +369,55 @@ async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await target_message.reply_text(text, reply_markup=keyboard)
     context.user_data["requests_list_message_id"] = msg.message_id
     context.user_data["requests_list_chat_id"] = msg.chat_id
+
+
+async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    if update.effective_user and is_blocked(update.effective_user.id):
+        await target_message.reply_text(MESSAGES[lang]["blocked"])
+        return
+    if update.effective_user and await is_stopped_user(update.effective_user.id):
+        return
+    limited, wait_s = spam_check_message(update, context)
+    if limited:
+        await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+        return
+    await update_user_info(update, context)
+    books = await run_blocking(db_get_random_books, 10, True)
+    if not books:
+        await target_message.reply_text(MESSAGES[lang]["book_not_found"])
+        return
+
+    entries: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for book in books:
+        book_id = str(book.get("id") or "").strip()
+        if not book_id or book_id in seen_ids:
+            continue
+        seen_ids.add(book_id)
+        title = str(get_result_title(book) or "").strip() or "Untitled"
+        entries.append({"id": book_id, "title": title})
+
+    if not entries:
+        await target_message.reply_text(MESSAGES[lang]["book_not_found"])
+        return
+
+    query_label = MESSAGES[lang].get("random_results_query", "🎲 Random books")
+    query_id = cache_search_results(context, query_label, entries)
+    result_text, page_entries, pages = build_results_text(query_label, entries, 0, lang)
+    reply_markup = build_results_keyboard(page_entries, 0, pages, query_id)
+
+    try:
+        page_ids = [str(e.get("id") or "").strip() for e in page_entries if str(e.get("id") or "").strip()]
+        if page_ids:
+            await run_blocking(db_increment_book_searches, page_ids)
+    except Exception as e:
+        logger.warning("random_command search count increment failed: %s", e)
+
+    await target_message.reply_text(result_text, reply_markup=reply_markup)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
