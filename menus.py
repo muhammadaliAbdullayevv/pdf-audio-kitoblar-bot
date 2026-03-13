@@ -53,7 +53,8 @@ def build_main_menu_keyboard(
             [m.get("menu_ai_chat", "💬 Chat with AI"), m.get("menu_ai_translator", "🌐 AI Translator")],
             [m.get("menu_ai_grammar", "✍️ AI Grammar Fix"), m.get("menu_ai_email_writer", "📧 AI Email Writer")],
             [m.get("menu_ai_quiz", "📝 AI Quiz Generator"), m.get("menu_ai_music", "🎵 AI Music Generator")],
-            [m.get("menu_pdf_maker", "🤖 AI PDF Maker"), m.get("menu_ai_pdf_translator", "🌐📄 AI PDF Translator")],
+            [m.get("menu_ai_song", "🎤 AI Song Generator"), m.get("menu_pdf_maker", "🤖 AI PDF Maker")],
+            [m.get("menu_ai_pdf_translator", "🌐📄 AI PDF Translator")],
             [m.get("menu_back", "⬅️ Back")],
         ]
     elif section == "admin":

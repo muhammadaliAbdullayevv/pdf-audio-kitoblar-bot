@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -11,6 +12,8 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+from collections import OrderedDict
+from threading import Lock
 from typing import Any
 
 import safe_subprocess
@@ -21,6 +24,16 @@ from telegram.ext import ContextTypes
 MESSAGES: dict[str, dict[str, str]] = {}
 logger = logging.getLogger(__name__)
 edge_tts = None
+_TTS_CACHE_LOCK = Lock()
+_TTS_AUDIO_CACHE: "OrderedDict[str, tuple[float, bytes, dict[str, Any]]]" = OrderedDict()
+
+
+class _TTSBuildError(RuntimeError):
+    def __init__(self, code: str, detail: str = "", *, backend: str | None = None):
+        super().__init__(detail or code)
+        self.code = str(code or "tts_failed")
+        self.detail = str(detail or code or "tts_failed")
+        self.backend = str(backend or "").strip() or None
 
 
 def configure(deps: dict[str, Any]) -> None:
@@ -61,8 +74,11 @@ def _tts_texts(lang: str) -> dict[str, str]:
             "cancelled": "Text to Voice bekor qilindi.",
             "expired": "Sessiya tugadi. Pastdagi menyudan Text to Voice bo‘limini qayta tanlang.",
             "empty": "Iltimos, matn yuboring.",
-            "too_long": "Matn juda uzun. Iltimos, qisqaroq yuboring (taxminan 12000 belgi).",
-            "tools_missing": "Natural TTS uchun `edge-tts` va `ffmpeg` kerak (internet ham kerak).",
+            "too_long": "Matn juda uzun. Iltimos, qisqaroq yuboring (taxminan 50000 belgi).",
+            "tools_missing": "Natural TTS uchun `ffmpeg` va kamida bitta backend kerak (`edge-tts` yoki `espeak-ng`).",
+            "provider_failed": "⚠️ Ovoz generatoriga ulanib bo‘lmadi. Keyinroq qayta urinib ko‘ring.",
+            "audio_failed": "⚠️ Ovoz faylini tayyorlab bo‘lmadi. Formatni almashtirib yoki qisqaroq matn bilan urinib ko‘ring.",
+            "chunking_note": "📚 Uzun matn qismlarga bo‘linib o‘qiladi.",
             "gen_btn": "Ovoz yaratish",
             "opt_btn": "Sozlamalar",
             "continue_btn": "Davom etish",
@@ -122,8 +138,11 @@ def _tts_texts(lang: str) -> dict[str, str]:
             "cancelled": "Text to Voice отменен.",
             "expired": "Сессия истекла. Снова выберите Text to Voice в меню ниже.",
             "empty": "Пожалуйста, отправьте текст.",
-            "too_long": "Текст слишком длинный. Отправьте короче (примерно до 12000 символов).",
-            "tools_missing": "Для natural TTS нужны `edge-tts` и `ffmpeg` (и интернет).",
+            "too_long": "Текст слишком длинный. Отправьте короче (примерно до 50000 символов).",
+            "tools_missing": "Для natural TTS нужен `ffmpeg` и хотя бы один backend (`edge-tts` или `espeak-ng`).",
+            "provider_failed": "⚠️ Не удалось связаться с TTS backend. Попробуйте позже.",
+            "audio_failed": "⚠️ Не удалось подготовить аудиофайл. Попробуйте другой формат или более короткий текст.",
+            "chunking_note": "📚 Длинный текст будет озвучен по частям.",
             "gen_btn": "Создать голос",
             "opt_btn": "Настройки",
             "continue_btn": "Продолжить",
@@ -182,8 +201,11 @@ def _tts_texts(lang: str) -> dict[str, str]:
         "cancelled": "Text to Voice cancelled.",
         "expired": "Session expired. Please choose Text to Voice again from the menu below.",
         "empty": "Please send text.",
-        "too_long": "Text is too long. Please send a shorter text (about 12,000 chars max).",
-        "tools_missing": "Natural TTS requires `edge-tts` and `ffmpeg` (and internet).",
+        "too_long": "Text is too long. Please send a shorter text (about 50,000 chars max).",
+        "tools_missing": "Natural TTS requires `ffmpeg` and at least one backend (`edge-tts` or `espeak-ng`).",
+        "provider_failed": "⚠️ The TTS backend is unavailable right now. Please try again later.",
+        "audio_failed": "⚠️ Audio post-processing failed. Try another format or a shorter text.",
+        "chunking_note": "📚 Long text will be spoken in chunks.",
         "gen_btn": "Generate Voice",
         "opt_btn": "Options",
         "continue_btn": "Continue",
@@ -289,8 +311,269 @@ def _tts_allowed_tones(sex_key: str) -> tuple[str, ...]:
     return _TTS_TONE_BASE_KEYS + ("young_boy",)
 
 
+def _tts_max_input_chars() -> int:
+    try:
+        return max(4000, min(120000, int(os.getenv("TTS_MAX_INPUT_CHARS", "50000") or "50000")))
+    except Exception:
+        return 50000
+
+
+def _tts_chunk_max_chars() -> int:
+    try:
+        return max(500, min(5000, int(os.getenv("TTS_CHUNK_MAX_CHARS", "2200") or "2200")))
+    except Exception:
+        return 2200
+
+
+def _tts_cache_ttl_s() -> int:
+    try:
+        return max(60, min(7 * 24 * 3600, int(os.getenv("TTS_CACHE_TTL_S", "21600") or "21600")))
+    except Exception:
+        return 21600
+
+
+def _tts_cache_max_entries() -> int:
+    try:
+        return max(4, min(256, int(os.getenv("TTS_CACHE_MAX_ENTRIES", "32") or "32")))
+    except Exception:
+        return 32
+
+
+def _tts_ffmpeg_timeout_s() -> float:
+    try:
+        return max(15.0, min(600.0, float(os.getenv("TTS_FFMPEG_TIMEOUT_S", "120") or "120")))
+    except Exception:
+        return 120.0
+
+
+def _tts_backend_sequence() -> tuple[str, ...]:
+    raw = str(os.getenv("TTS_BACKENDS", "edge,espeak") or "").strip().lower()
+    if raw in {"", "auto", "default"}:
+        raw = "edge,espeak"
+    allowed = {"edge", "espeak"}
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in raw.split(","):
+        backend = item.strip()
+        if backend not in allowed or backend in seen:
+            continue
+        ordered.append(backend)
+        seen.add(backend)
+    return tuple(ordered or ("edge", "espeak"))
+
+
+def _tts_backend_available(backend: str) -> bool:
+    if backend == "edge":
+        return bool(edge_tts is not None)
+    if backend == "espeak":
+        return bool(shutil.which("espeak-ng"))
+    return False
+
+
 def _tts_tools_available() -> bool:
-    return bool(edge_tts is not None and shutil.which("ffmpeg"))
+    if not shutil.which("ffmpeg"):
+        return False
+    return any(_tts_backend_available(backend) for backend in _tts_backend_sequence())
+
+
+def _tts_normalize_text(text: str) -> str:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = re.sub(r"[ \t]+", " ", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
+def _tts_split_text_by_limit(text: str, max_chars: int) -> list[str]:
+    clean = _tts_normalize_text(text)
+    if not clean:
+        return []
+    if len(clean) <= max_chars:
+        return [clean]
+
+    sentence_parts = re.split(r"(?<=[.!?…։۔！？])\s+|\n+", clean)
+    units = [part.strip() for part in sentence_parts if part and part.strip()]
+    if not units:
+        units = [clean]
+
+    chunks: list[str] = []
+    current = ""
+
+    def append_piece(piece: str) -> None:
+        nonlocal current
+        piece = piece.strip()
+        if not piece:
+            return
+        if not current:
+            current = piece
+            return
+        candidate = f"{current} {piece}".strip()
+        if len(candidate) <= max_chars:
+            current = candidate
+            return
+        chunks.append(current)
+        current = piece
+
+    for unit in units:
+        if len(unit) <= max_chars:
+            append_piece(unit)
+            continue
+        word_parts = re.split(r"(?<=[,;:])\s+|\s+", unit)
+        word_parts = [part.strip() for part in word_parts if part and part.strip()]
+        if not word_parts:
+            word_parts = [unit]
+        for part in word_parts:
+            if len(part) <= max_chars:
+                append_piece(part)
+                continue
+            if current:
+                chunks.append(current)
+                current = ""
+            for start in range(0, len(part), max_chars):
+                piece = part[start:start + max_chars].strip()
+                if piece:
+                    chunks.append(piece)
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _tts_cache_key(text: str, opts: dict[str, Any]) -> str:
+    payload = {
+        "text": str(text or ""),
+        "lang": str(opts.get("lang") or ""),
+        "sex": str(opts.get("sex") or ""),
+        "tone": str(opts.get("tone") or ""),
+        "speed": str(opts.get("speed") or ""),
+        "output": str(opts.get("output") or ""),
+        "ai": bool(opts.get("ai")),
+        "backends": list(_tts_backend_sequence()),
+        "version": 2,
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8", errors="ignore")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _tts_cache_get(cache_key: str) -> tuple[bytes, dict[str, Any]] | None:
+    now = time.time()
+    with _TTS_CACHE_LOCK:
+        cached = _TTS_AUDIO_CACHE.get(cache_key)
+        if not cached:
+            return None
+        saved_at, audio_bytes, meta = cached
+        if now - float(saved_at) > float(_tts_cache_ttl_s()):
+            _TTS_AUDIO_CACHE.pop(cache_key, None)
+            return None
+        _TTS_AUDIO_CACHE.move_to_end(cache_key)
+        meta_copy = dict(meta or {})
+        meta_copy["cache_hit"] = True
+        return bytes(audio_bytes), meta_copy
+
+
+def _tts_cache_put(cache_key: str, audio_bytes: bytes, meta: dict[str, Any]) -> None:
+    with _TTS_CACHE_LOCK:
+        _TTS_AUDIO_CACHE[cache_key] = (time.time(), bytes(audio_bytes or b""), dict(meta or {}))
+        _TTS_AUDIO_CACHE.move_to_end(cache_key)
+        while len(_TTS_AUDIO_CACHE) > _tts_cache_max_entries():
+            _TTS_AUDIO_CACHE.popitem(last=False)
+
+
+def _tts_edge_voice_candidates(lang_key: str, sex_key: str, tone_key: str) -> list[str]:
+    def profile(
+        base: list[str],
+        *,
+        playful: list[str] | None = None,
+        young: list[str] | None = None,
+        young_key: str | None = None,
+    ) -> dict[str, list[str]]:
+        mapping = {"base": list(base)}
+        for key in _TTS_TONE_BASE_KEYS:
+            mapping[key] = list(base)
+        if playful:
+            mapping["playful"] = list(playful)
+            mapping["laughing"] = list(playful)
+        if young and young_key:
+            mapping[young_key] = list(young)
+        return mapping
+
+    voice_map = {
+        "uz": {
+            "female": profile(["uz-UZ-MadinaNeural"]),
+            "male": profile(["uz-UZ-SardorNeural"]),
+        },
+        "ru": {
+            "female": profile(
+                ["ru-RU-SvetlanaNeural", "ru-RU-DariyaNeural"],
+                playful=["ru-RU-DariyaNeural", "ru-RU-SvetlanaNeural"],
+                young=["ru-RU-DariyaNeural", "ru-RU-SvetlanaNeural"],
+                young_key="young_girl",
+            ),
+            "male": profile(["ru-RU-DmitryNeural"]),
+        },
+        "en": {
+            "female": profile(
+                ["en-US-JennyNeural", "en-US-AriaNeural"],
+                playful=["en-US-AnaNeural", "en-US-JennyNeural"],
+                young=["en-US-AnaNeural", "en-US-AriaNeural"],
+                young_key="young_girl",
+            ),
+            "male": profile(
+                ["en-US-AndrewNeural", "en-US-BrianNeural"],
+                playful=["en-US-BrianNeural", "en-US-AndrewNeural"],
+                young=["en-US-BrianNeural", "en-US-GuyNeural"],
+                young_key="young_boy",
+            ),
+        },
+        "hi": {
+            "female": profile(["hi-IN-SwaraNeural"]),
+            "male": profile(["hi-IN-MadhurNeural"]),
+        },
+        "ar": {
+            "female": profile(["ar-SA-ZariyahNeural"]),
+            "male": profile(["ar-SA-HamedNeural"]),
+        },
+    }
+    lang_map = voice_map.get(lang_key) or voice_map["en"]
+    sex_map = lang_map.get(sex_key) or lang_map["male"]
+    candidates = list(sex_map.get(tone_key) or sex_map["base"])
+    if tone_key not in {"playful", "laughing"}:
+        candidates.extend(sex_map.get("playful", []))
+    candidates.extend(sex_map["base"])
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        deduped.append(name)
+        seen.add(name)
+    return deduped
+
+
+def _tts_espeak_voice_candidates(lang_key: str, sex_key: str) -> list[str]:
+    variant = "f3" if sex_key == "female" else "m3"
+    base_map = {
+        "uz": ["uz", "tr", "en-us"],
+        "ru": ["ru", "ru+f3" if sex_key == "female" else "ru+m3", "en-us"],
+        "en": ["en-us", "en"],
+        "hi": ["hi", "en-us"],
+        "ar": ["ar", "en-us"],
+    }
+    candidates: list[str] = []
+    for base in base_map.get(lang_key, ["en-us"]):
+        clean = str(base or "").strip()
+        if not clean:
+            continue
+        if "+" not in clean:
+            candidates.append(f"{clean}+{variant}")
+        candidates.append(clean)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if item in seen:
+            continue
+        deduped.append(item)
+        seen.add(item)
+    return deduped
 
 
 def _tts_options_keyboard(session: dict, lang: str) -> InlineKeyboardMarkup:
@@ -695,65 +978,350 @@ def _tts_ollama_polish_text(text: str, lang_key: str) -> str:
     return out or text
 
 
-def _tts_build_audio_bytes_blocking(text: str, opts: dict) -> tuple[bytes, str]:
+def _tts_espeak_rate(speed_key: str, tone_key: str = "soft") -> int:
+    base = {"slow": 140, "normal": 175, "fast": 215}.get(speed_key, 175)
+    if tone_key == "playful":
+        return base + 12
+    if tone_key == "calm":
+        return base - 18
+    if tone_key == "serious":
+        return base - 8
+    if tone_key == "screaming":
+        return base + 25
+    if tone_key == "whispering":
+        return base - 25
+    return base
+
+
+def _tts_espeak_pitch(tone_key: str, sex_key: str = "male") -> int:
+    base = 45 if sex_key == "female" else 35
+    offsets = {
+        "soft": -4,
+        "playful": 8,
+        "calm": -7,
+        "serious": -6,
+        "screaming": 12,
+        "laughing": 10,
+        "whispering": -10,
+        "crying": 6,
+        "young_girl": 16,
+        "young_boy": 10,
+    }
+    return max(0, min(99, base + offsets.get(tone_key, 0)))
+
+
+def _tts_espeak_amplitude(tone_key: str) -> int:
+    base = 140
+    offsets = {
+        "soft": -15,
+        "calm": -10,
+        "serious": -5,
+        "screaming": 30,
+        "laughing": 10,
+        "whispering": -45,
+        "crying": -8,
+    }
+    return max(40, min(200, base + offsets.get(tone_key, 0)))
+
+
+def _tts_run_ffmpeg(cmd: list[str], *, code: str) -> safe_subprocess.SafeCompleted:
+    completed = safe_subprocess.run(
+        cmd,
+        timeout_s=_tts_ffmpeg_timeout_s(),
+        max_output_chars=12000,
+        text=False,
+    )
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "ffmpeg failed").strip()
+        raise _TTSBuildError(code, err[-1200:], backend="ffmpeg")
+    return completed
+
+
+def _tts_finalize_chunk_wav(src_path: str, dst_path: str) -> None:
+    _tts_run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            src_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "24000",
+            "-c:a",
+            "pcm_s16le",
+            dst_path,
+        ],
+        code="audio_processing_failed",
+    )
+    if not os.path.exists(dst_path):
+        raise _TTSBuildError("audio_processing_failed", "normalized wav file missing", backend="ffmpeg")
+
+
+def _tts_final_audio_filters() -> str:
+    custom = str(os.getenv("TTS_AUDIO_FILTERS", "") or "").strip()
+    if custom:
+        return custom
+    filters = [
+        "silenceremove=start_periods=1:start_duration=0.08:start_threshold=-50dB",
+        "highpass=f=70",
+        "lowpass=f=7600",
+        "loudnorm=I=-18:TP=-1.5:LRA=11",
+    ]
+    return ",".join(filters)
+
+
+def _tts_render_final_audio(wav_paths: list[str], out_path: str, output_key: str) -> None:
+    if not wav_paths:
+        raise _TTSBuildError("audio_processing_failed", "no chunk audio files to merge", backend="ffmpeg")
+    filelist_path = os.path.join(os.path.dirname(out_path), "concat.txt")
+    with open(filelist_path, "w", encoding="utf-8") as fh:
+        for wav_path in wav_paths:
+            fh.write(f"file '{os.path.abspath(wav_path)}'\n")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        filelist_path,
+    ]
+    filters = _tts_final_audio_filters()
+    if filters:
+        cmd.extend(["-af", filters])
+    cmd.extend(["-ac", "1", "-ar", "24000"])
+    if output_key == "voice":
+        cmd.extend([
+            "-c:a",
+            "libopus",
+            "-b:a",
+            str(os.getenv("TTS_VOICE_OPUS_BITRATE", "32k") or "32k"),
+            "-application",
+            "voip",
+            out_path,
+        ])
+    else:
+        cmd.extend([
+            "-codec:a",
+            "libmp3lame",
+            "-q:a",
+            str(os.getenv("TTS_AUDIO_MP3_QUALITY", "4") or "4"),
+            out_path,
+        ])
+    _tts_run_ffmpeg(cmd, code="audio_processing_failed")
+    if not os.path.exists(out_path):
+        raise _TTSBuildError("audio_processing_failed", "final audio file missing", backend="ffmpeg")
+
+
+def _tts_generate_chunk_with_edge(
+    text: str,
+    out_path: str,
+    *,
+    lang_key: str,
+    sex_key: str,
+    tone_key: str,
+    speed_key: str,
+) -> dict[str, Any]:
+    if edge_tts is None:
+        raise _TTSBuildError("provider_missing", "edge-tts is not installed", backend="edge")
+    rate = _tts_edge_rate(speed_key, tone_key)
+    pitch = _tts_edge_pitch(tone_key, sex_key)
+    volume = _tts_edge_volume(tone_key)
+    last_error = ""
+    for voice in _tts_edge_voice_candidates(lang_key, sex_key, tone_key):
+        try:
+            asyncio.run(
+                _tts_edge_save_mp3_async(
+                    text=text,
+                    voice=voice,
+                    rate=rate,
+                    pitch=pitch,
+                    volume=volume,
+                    out_path=out_path,
+                )
+            )
+        except Exception as e:
+            last_error = f"{voice}: {str(e)[:400]}"
+            continue
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return {"backend": "edge", "voice": voice}
+        last_error = f"{voice}: empty output"
+    raise _TTSBuildError("provider_failed", last_error or "edge-tts failed to synthesize audio", backend="edge")
+
+
+def _tts_generate_chunk_with_espeak(
+    text: str,
+    out_path: str,
+    *,
+    lang_key: str,
+    sex_key: str,
+    tone_key: str,
+    speed_key: str,
+) -> dict[str, Any]:
+    if not shutil.which("espeak-ng"):
+        raise _TTSBuildError("provider_missing", "espeak-ng is not installed", backend="espeak")
+    rate = str(_tts_espeak_rate(speed_key, tone_key))
+    pitch = str(_tts_espeak_pitch(tone_key, sex_key))
+    amplitude = str(_tts_espeak_amplitude(tone_key))
+    last_error = ""
+    for voice in _tts_espeak_voice_candidates(lang_key, sex_key):
+        completed = safe_subprocess.run(
+            [
+                "espeak-ng",
+                "-v",
+                voice,
+                "-s",
+                rate,
+                "-p",
+                pitch,
+                "-a",
+                amplitude,
+                "-w",
+                out_path,
+            ],
+            timeout_s=60,
+            max_output_chars=8000,
+            text=True,
+            stdin_text=text,
+        )
+        if completed.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return {"backend": "espeak", "voice": voice}
+        last_error = (completed.stderr or completed.stdout or f"{voice}: espeak-ng failed").strip()
+    raise _TTSBuildError("provider_failed", last_error or "espeak-ng failed to synthesize audio", backend="espeak")
+
+
+def _tts_generate_request_audio(
+    text: str,
+    *,
+    lang_key: str,
+    sex_key: str,
+    tone_key: str,
+    speed_key: str,
+    output_key: str,
+    backends: tuple[str, ...],
+) -> tuple[bytes, dict[str, Any]]:
+    chunks = _tts_split_text_by_limit(text, _tts_chunk_max_chars())
+    if not chunks:
+        raise _TTSBuildError("tts_failed", "no text chunks available for synthesis")
+
+    with tempfile.TemporaryDirectory(prefix="tts_") as td:
+        backend_errors: list[str] = []
+        for backend in backends:
+            if not _tts_backend_available(backend):
+                backend_errors.append(f"{backend}: unavailable")
+                continue
+            chunk_wavs: list[str] = []
+            backend_voice = ""
+            try:
+                for idx, chunk in enumerate(chunks):
+                    raw_ext = ".mp3" if backend == "edge" else ".wav"
+                    raw_path = os.path.join(td, f"{backend}_chunk_{idx:03d}.raw{raw_ext}")
+                    if backend == "edge":
+                        meta = _tts_generate_chunk_with_edge(
+                            chunk,
+                            raw_path,
+                            lang_key=lang_key,
+                            sex_key=sex_key,
+                            tone_key=tone_key,
+                            speed_key=speed_key,
+                        )
+                    elif backend == "espeak":
+                        meta = _tts_generate_chunk_with_espeak(
+                            chunk,
+                            raw_path,
+                            lang_key=lang_key,
+                            sex_key=sex_key,
+                            tone_key=tone_key,
+                            speed_key=speed_key,
+                        )
+                    else:
+                        raise _TTSBuildError("provider_missing", f"unsupported backend: {backend}", backend=backend)
+                    backend_voice = str(meta.get("voice") or backend_voice)
+                    wav_path = os.path.join(td, f"{backend}_chunk_{idx:03d}.wav")
+                    _tts_finalize_chunk_wav(raw_path, wav_path)
+                    chunk_wavs.append(wav_path)
+                final_ext = ".ogg" if output_key == "voice" else ".mp3"
+                out_path = os.path.join(td, f"tts_final{final_ext}")
+                _tts_render_final_audio(chunk_wavs, out_path, output_key)
+                with open(out_path, "rb") as fh:
+                    return fh.read(), {
+                        "backend": backend,
+                        "voice": backend_voice,
+                        "chunk_count": len(chunks),
+                    }
+            except _TTSBuildError as e:
+                if e.code == "audio_processing_failed":
+                    raise
+                backend_errors.append(f"{backend}: {e.detail}")
+                logger.warning("TTS backend %s failed, trying next backend: %s", backend, e.detail)
+        raise _TTSBuildError(
+            "provider_failed",
+            " | ".join(backend_errors)[:1500] or "all TTS backends failed",
+        )
+
+
+def _tts_error_message(err: Exception, lang_ui: str) -> str:
+    msgs = _tts_texts(lang_ui)
+    if isinstance(err, _TTSBuildError):
+        if err.code == "tools_missing":
+            return msgs["tools_missing"]
+        if err.code == "too_long":
+            return msgs["too_long"]
+        if err.code in {"provider_missing", "provider_failed"}:
+            return msgs["provider_failed"]
+        if err.code == "audio_processing_failed":
+            return msgs["audio_failed"]
+    return MESSAGES[lang_ui]["error"]
+
+
+def _tts_build_audio_bytes_blocking(text: str, opts: dict) -> tuple[bytes, dict[str, Any]]:
     if not _tts_tools_available():
-        raise RuntimeError("Natural TTS tools missing")
+        raise _TTSBuildError("tools_missing", "ffmpeg or TTS backends are unavailable")
+
     lang_key = str(opts.get("lang") or "en")
     sex_key = str(opts.get("sex") or ("female" if str(opts.get("voice")) == "female" else "male"))
     tone_key = str(opts.get("tone") or "soft")
     speed_key = str(opts.get("speed") or "normal")
     output_key = str(opts.get("output") or "voice")
     use_ai = bool(opts.get("ai"))
-    effective_text = (text or "").strip()
+    effective_text = _tts_normalize_text(text)
+    if not effective_text:
+        raise _TTSBuildError("tts_failed", "empty text")
+    if len(effective_text) > _tts_max_input_chars():
+        raise _TTSBuildError("too_long", f"text length {len(effective_text)} exceeds limit")
+
+    cache_key = _tts_cache_key(effective_text, opts)
+    cached = _tts_cache_get(cache_key)
+    if cached:
+        return cached
+
     ai_used = False
     if use_ai:
         try:
-            effective_text = _tts_ollama_polish_text(effective_text, lang_key)
+            effective_text = _tts_normalize_text(_tts_ollama_polish_text(effective_text, lang_key))
             ai_used = True
         except Exception as e:
             logger.info("TTS Ollama cleanup fallback: %s", e)
     if tone_key not in _tts_allowed_tones(sex_key):
         tone_key = "soft"
-    edge_voice = _tts_edge_voice_name(lang_key, sex_key, tone_key)
-    edge_rate = _tts_edge_rate(speed_key, tone_key)
-    edge_pitch = _tts_edge_pitch(tone_key, sex_key)
-    edge_volume = _tts_edge_volume(tone_key)
-    with tempfile.TemporaryDirectory(prefix="tts_") as td:
-        mp3_path = os.path.join(td, "tts.mp3")
-        out_path = os.path.join(td, "tts.ogg" if output_key == "voice" else "tts.mp3")
-        try:
-            asyncio.run(_tts_edge_save_mp3_async(
-                text=effective_text,
-                voice=edge_voice,
-                rate=edge_rate,
-                pitch=edge_pitch,
-                volume=edge_volume,
-                out_path=mp3_path,
-            ))
-        except Exception as e:
-            raise RuntimeError(f"edge-tts failed: {str(e)[:400]}") from e
-        if not os.path.exists(mp3_path):
-            raise RuntimeError("edge-tts failed to generate audio")
-        if output_key == "voice":
-            ffmpeg_cmd = ["ffmpeg", "-y", "-i", mp3_path, "-c:a", "libopus", "-b:a", "32k", out_path]
-        else:
-            # Re-encode to normalize output for Telegram and reduce size.
-            ffmpeg_cmd = ["ffmpeg", "-y", "-i", mp3_path, "-codec:a", "libmp3lame", "-q:a", "4", out_path]
-        timeout_s = float(os.getenv("TTS_FFMPEG_TIMEOUT_S", "60") or "60")
-        p2 = safe_subprocess.run(ffmpeg_cmd, timeout_s=timeout_s, max_output_chars=8000, text=False)
-        if p2.returncode != 0:
-            raw_err = getattr(p2, "stderr", b"")
-            if isinstance(raw_err, bytes):
-                err_text = raw_err.decode("utf-8", errors="replace")
-            else:
-                err_text = str(raw_err or "")
-            err_text = (err_text or "ffmpeg failed").strip()
-            raise RuntimeError(err_text[-800:])
-        if not os.path.exists(out_path):
-            raise RuntimeError("ffmpeg output file missing")
-        with open(out_path, "rb") as f:
-            data = f.read()
-    return data, ("voice_ai" if ai_used else "voice")
+
+    audio_bytes, meta = _tts_generate_request_audio(
+        effective_text,
+        lang_key=lang_key,
+        sex_key=sex_key,
+        tone_key=tone_key,
+        speed_key=speed_key,
+        output_key=output_key,
+        backends=_tts_backend_sequence(),
+    )
+    result_meta = dict(meta or {})
+    result_meta["ai_used"] = ai_used
+    result_meta["cache_hit"] = False
+    _tts_cache_put(cache_key, audio_bytes, result_meta)
+    return audio_bytes, result_meta
 
 
 async def _tts_send_result(update: Update, audio_bytes: bytes, output_mode: str, caption: str):
@@ -780,7 +1348,7 @@ async def _tts_generate_and_send(update: Update, context: ContextTypes.DEFAULT_T
     if not clean:
         await target_message.reply_text(msgs["empty"])
         return False
-    if len(clean) > 12000:
+    if len(clean) > _tts_max_input_chars():
         await target_message.reply_text(msgs["too_long"])
         return False
     lang_key = str(opts.get("lang") or "auto")
@@ -790,20 +1358,23 @@ async def _tts_generate_and_send(update: Update, context: ContextTypes.DEFAULT_T
     opts["lang"] = lang_key
     status = await _send_with_retry(lambda: target_message.reply_text(msgs["working"]))
     try:
-        audio_bytes, mode_meta = await run_blocking(_tts_build_audio_bytes_blocking, clean, opts)
+        audio_bytes, meta = await run_blocking(_tts_build_audio_bytes_blocking, clean, opts)
     except Exception as e:
         logger.error("text_to_voice generation failed: %s", e, exc_info=True)
+        fail_text = _tts_error_message(e, lang_ui)
         if status:
             try:
-                await status.edit_text(f"{MESSAGES[lang_ui]['error']}\n{str(e)[:300]}")
+                await status.edit_text(fail_text)
             except Exception:
                 pass
         else:
-            await target_message.reply_text(f"{MESSAGES[lang_ui]['error']}\n{str(e)[:300]}")
+            await target_message.reply_text(fail_text)
         return False
     caption = msgs["caption"]
-    if bool(opts.get("ai")) and mode_meta == "voice_ai":
+    if bool(meta.get("ai_used")):
         caption += f"\n🤖 {msgs['ai_note']}"
+    if int(meta.get("chunk_count") or 1) > 1:
+        caption += f"\n{msgs['chunking_note']}"
     sent = await _tts_send_result(update, audio_bytes, str(opts.get("output") or "voice"), caption)
     if status:
         try:
@@ -837,6 +1408,11 @@ async def _tts_handle_text_input(update: Update, context: ContextTypes.DEFAULT_T
         return True
     if phase == "awaiting_text":
         session["text_buffer"] = txt
+        if len(str(session["text_buffer"])) > _tts_max_input_chars():
+            session["text_buffer"] = ""
+            _tts_save_session(context, session)
+            await update.message.reply_text(msgs["too_long"])
+            return True
         session["phase"] = "awaiting_confirm"
         session["expires_at"] = time.time() + 1800
         _tts_save_session(context, session)
@@ -852,6 +1428,11 @@ async def _tts_handle_text_input(update: Update, context: ContextTypes.DEFAULT_T
     if phase == "awaiting_confirm":
         cur = str(session.get("text_buffer") or "")
         session["text_buffer"] = f"{cur}\n{txt}".strip() if cur else txt
+        if len(str(session["text_buffer"])) > _tts_max_input_chars():
+            session["text_buffer"] = cur
+            _tts_save_session(context, session)
+            await update.message.reply_text(msgs["too_long"])
+            return True
         session["expires_at"] = time.time() + 1800
         _tts_save_session(context, session)
         await _tts_edit_or_send_prompt(

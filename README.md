@@ -326,8 +326,10 @@ Hybrid controls:
 ### 9.2 Text to Voice
 
 - Wizard-based session with voice/gender/tone/speed/output mode.
-- Uses `edge-tts` + `ffmpeg`.
+- Uses `ffmpeg` plus backend fallback (`edge-tts` first, `espeak-ng` if available).
 - Optional Ollama polishing can refine input text before synthesis.
+- Long text is chunked automatically and merged into one final voice/audio file.
+- Final audio is post-processed with ffmpeg filters and cached in memory for repeat requests.
 
 ### 9.3 Audio Editor
 
@@ -483,6 +485,15 @@ PostgreSQL remains source of truth; ES is derivative and rebuildable.
 - `AI_CHAT_OLLAMA_MODEL`
 - `AI_CHAT_OLLAMA_TIMEOUT`
 - `AI_TOOLS_OLLAMA_TIMEOUT`
+- `TTS_BACKENDS`
+- `TTS_MAX_INPUT_CHARS`
+- `TTS_CHUNK_MAX_CHARS`
+- `TTS_CACHE_TTL_S`
+- `TTS_CACHE_MAX_ENTRIES`
+- `TTS_FFMPEG_TIMEOUT_S`
+- `TTS_VOICE_OPUS_BITRATE`
+- `TTS_AUDIO_MP3_QUALITY`
+- `TTS_AUDIO_FILTERS`
 - `TTS_OLLAMA_MODEL`
 - `TTS_OLLAMA_TIMEOUT`
 - `PDF_MAKER_OLLAMA_MODEL`

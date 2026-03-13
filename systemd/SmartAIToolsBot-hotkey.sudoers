@@ -1,0 +1,3 @@
+muhammadaliabdullayev ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
+muhammadaliabdullayev ALL=(root) NOPASSWD: /usr/bin/systemctl restart SmartAIToolsBot-bot.service
+muhammadaliabdullayev ALL=(root) NOPASSWD: /usr/bin/systemctl restart SmartAIToolsBot-dashboard.service

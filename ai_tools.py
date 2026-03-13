@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
+from threading import Lock
 from typing import Any, Awaitable, Callable
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
@@ -952,6 +953,68 @@ def _ai_tool_quiz_setup_text(lang: str, count: int, interval_s: int) -> str:
         count=max(1, min(10, int(count or _AI_QUIZ_COUNT_CHOICES[1]))),
         interval=max(0, min(120, int(interval_s or _AI_QUIZ_INTERVAL_CHOICES[0]))),
     )
+
+
+def _ai_tool_mode_followup_payload(
+    mode: str,
+    lang_ui: str,
+    session: dict,
+    uid: int | None,
+) -> tuple[str, object | None]:
+    if mode == "translator":
+        target_lang = str(session.get("target_lang") or "en").lower()
+        if target_lang not in {"uz", "ru", "en"}:
+            target_lang = "en"
+        return (
+            _ai_tool_translator_setup_text(lang_ui, target_lang),
+            _ai_tool_translator_target_inline_keyboard(lang_ui, target_lang),
+        )
+
+    if mode == "quiz":
+        count = max(1, min(10, int(session.get("quiz_count") or _AI_QUIZ_COUNT_CHOICES[1])))
+        interval_s = max(0, min(120, int(session.get("quiz_interval_s") or _AI_QUIZ_INTERVAL_CHOICES[0])))
+        return (
+            _ai_tool_quiz_setup_text(lang_ui, count, interval_s),
+            _ai_tool_quiz_setup_inline_keyboard(count, interval_s),
+        )
+
+    if mode == "music":
+        duration_s = int(session.get("music_duration_s") or _AI_MUSIC_DURATION_CHOICES[1])
+        style_key = str(session.get("music_style") or _AI_MUSIC_STYLE_CHOICES[0]).lower()
+        if style_key not in _AI_MUSIC_STYLE_CHOICES:
+            style_key = _AI_MUSIC_STYLE_CHOICES[0]
+        return (
+            _ai_tool_music_setup_text(lang_ui, style_key, duration_s),
+            _ai_tool_music_setup_inline_keyboard(
+                lang_ui,
+                selected_style=style_key,
+                selected_duration=duration_s,
+            ),
+        )
+
+    prompt_text = _ai_tool_mode_prompt(mode, lang_ui)
+    return prompt_text, _main_menu_keyboard(lang_ui, "ai_tools", uid)
+
+
+async def _ai_tool_mode_send_followup_prompt(
+    target_message,
+    context: ContextTypes.DEFAULT_TYPE,
+    lang_ui: str,
+    mode: str,
+    session: dict,
+    uid: int | None,
+):
+    prompt_text, reply_markup = _ai_tool_mode_followup_payload(mode, lang_ui, session, uid)
+    await _send_with_retry(
+        lambda: target_message.reply_text(
+            prompt_text,
+            reply_markup=reply_markup,
+        )
+    )
+    try:
+        context.user_data["main_menu_section"] = "ai_tools"
+    except Exception:
+        pass
 
 
 def _ai_tool_lang_label(lang_key: str, ui_lang: str) -> str:
@@ -2505,6 +2568,22 @@ def _ai_tool_email_writer_blocking(user_text: str, reply_lang_hint: str) -> str:
     return _ai_chat_postprocess_reply(out, user_text)
 
 
+def _ai_tool_song_write_blocking(user_text: str, reply_lang_hint: str) -> str:
+    prompt = (
+        "You are a songwriter assistant.\n"
+        "Write original song lyrics from the user's theme, mood, or keywords.\n"
+        "Keep the output in the user's requested language or the language hint.\n"
+        "Return ONLY the song lyrics as plain text.\n"
+        "Do not add explanations, bullet points, notes, or markdown fences.\n"
+        "Use a clean structure with a title, verses, chorus, and an optional bridge when it fits.\n"
+        "Keep the lyrics coherent, memorable, and natural to sing.\n"
+        f"Language hint: {reply_lang_hint}\n\n"
+        f"Theme / keywords:\n{str(user_text or '')[:5000]}"
+    )
+    out, _ = _ai_tools_ollama_generate_blocking(prompt, temperature=0.7, num_predict=1200)
+    return _ai_chat_postprocess_reply(out, user_text)
+
+
 def _ai_music_backend() -> str:
     return "synth"
 
@@ -2667,55 +2746,8 @@ async def _ai_tool_mode_start_session_from_message(
         session["music_style"] = _AI_MUSIC_STYLE_CHOICES[0]
     _ai_tool_mode_save_session(context, session)
 
-    msgs = _ai_tool_mode_texts(lang_ui)
-    prompt_text = _ai_tool_mode_prompt(mode, lang_ui)
     uid = update.effective_user.id if update.effective_user else None
-
-    if mode == "translator":
-        target_lang = str(session.get("target_lang") or "en").lower()
-        if target_lang not in {"uz", "ru", "en"}:
-            target_lang = "en"
-        await _send_with_retry(
-            lambda: target_message.reply_text(
-                _ai_tool_translator_setup_text(lang_ui, target_lang),
-                reply_markup=_ai_tool_translator_target_inline_keyboard(lang_ui, target_lang),
-            )
-        )
-    elif mode == "quiz":
-        selected_count = max(1, min(10, int(session.get("quiz_count") or _AI_QUIZ_COUNT_CHOICES[1])))
-        selected_interval = max(0, min(120, int(session.get("quiz_interval_s") or _AI_QUIZ_INTERVAL_CHOICES[0])))
-        await _send_with_retry(
-            lambda: target_message.reply_text(
-                _ai_tool_quiz_setup_text(lang_ui, selected_count, selected_interval),
-                reply_markup=_ai_tool_quiz_setup_inline_keyboard(selected_count, selected_interval),
-            )
-        )
-    elif mode == "music":
-        selected_duration = int(session.get("music_duration_s") or _AI_MUSIC_DURATION_CHOICES[1])
-        selected_style = str(session.get("music_style") or _AI_MUSIC_STYLE_CHOICES[0]).lower()
-        if selected_style not in _AI_MUSIC_STYLE_CHOICES:
-            selected_style = _AI_MUSIC_STYLE_CHOICES[0]
-        await _send_with_retry(
-            lambda: target_message.reply_text(
-                _ai_tool_music_setup_text(lang_ui, selected_style, selected_duration),
-                reply_markup=_ai_tool_music_setup_inline_keyboard(
-                    lang_ui,
-                    selected_style=selected_style,
-                    selected_duration=selected_duration,
-                ),
-            )
-        )
-    else:
-        await _send_with_retry(
-            lambda: target_message.reply_text(
-                prompt_text,
-                reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
-            )
-        )
-    try:
-        context.user_data["main_menu_section"] = "ai_tools"
-    except Exception:
-        pass
+    await _ai_tool_mode_send_followup_prompt(target_message, context, lang_ui, mode, session, uid)
 
 
 async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_ui: str) -> bool:
@@ -2755,12 +2787,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
         if selected:
             session["target_lang"] = selected
             _ai_tool_mode_save_session(context, session)
-            await update.message.reply_text(
-                msgs.get("translator_target_set", "Target language set: {target}").format(
-                    target=_ai_tool_lang_label(selected, lang_ui)
-                ),
-                reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
-            )
+            await _ai_tool_mode_send_followup_prompt(update.message, context, lang_ui, mode, session, uid)
             return True
 
         src_explicit, tgt_explicit, body = _ai_tool_parse_translation_langs(user_text)
@@ -2769,6 +2796,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
             return True
         target_lang = tgt_explicit or str(session.get("target_lang") or "en")
         source_lang = src_explicit or _ai_tool_guess_translation_source_lang(body, lang_ui, target_lang)
+        session["target_lang"] = target_lang
         _ai_tool_mode_save_session(context, session)
         status = await _send_with_retry(lambda: update.message.reply_text(msgs["thinking"]))
         try:
@@ -2782,11 +2810,11 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
             )
             if status:
                 try:
-                    await status.edit_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+                    await status.edit_text(out)
                 except Exception:
-                    await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+                    await update.message.reply_text(out)
             else:
-                await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+                await update.message.reply_text(out)
             _ai_schedule_counter_increment(context, "ai_translator_uses", 1)
         except Exception:
             if status:
@@ -2796,6 +2824,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                     pass
             else:
                 await update.message.reply_text(msgs["failed"])
+        await _ai_tool_mode_send_followup_prompt(update.message, context, lang_ui, mode, session, uid)
         return True
 
     if mode == "grammar":
@@ -2808,11 +2837,11 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
             out = await run_blocking_heavy(_ai_tool_grammar_fix_blocking, user_text, lang_ui)
             if status:
                 try:
-                    await status.edit_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+                    await status.edit_text(out)
                 except Exception:
-                    await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+                    await update.message.reply_text(out)
             else:
-                await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+                await update.message.reply_text(out)
             _ai_schedule_counter_increment(context, "ai_grammar_fixes", 1)
         except Exception:
             if status:
@@ -2822,6 +2851,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                     pass
             else:
                 await update.message.reply_text(msgs["failed"])
+        await _ai_tool_mode_send_followup_prompt(update.message, context, lang_ui, mode, session, uid)
         return True
 
     if mode == "email":
@@ -2834,11 +2864,11 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
             out = await run_blocking_heavy(_ai_tool_email_writer_blocking, user_text, lang_ui)
             if status:
                 try:
-                    await status.edit_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+                    await status.edit_text(out)
                 except Exception:
-                    await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+                    await update.message.reply_text(out)
             else:
-                await update.message.reply_text(out, reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid))
+                await update.message.reply_text(out)
             _ai_schedule_counter_increment(context, "ai_email_writes", 1)
         except Exception:
             if status:
@@ -2848,6 +2878,36 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                     pass
             else:
                 await update.message.reply_text(msgs["failed"])
+        await _ai_tool_mode_send_followup_prompt(update.message, context, lang_ui, mode, session, uid)
+        return True
+
+    if mode == "song":
+        if not user_text:
+            await update.message.reply_text(msgs.get("song_empty", msgs["empty"]))
+            return True
+        _ai_tool_mode_save_session(context, session)
+        status = await _send_with_retry(lambda: update.message.reply_text(msgs.get("song_generating", msgs["thinking"])))
+        try:
+            reply_lang_hint = _ai_chat_guess_reply_lang(user_text, lang_ui)
+            out = await run_blocking_heavy(_ai_tool_song_write_blocking, user_text, reply_lang_hint)
+            if status:
+                try:
+                    await status.edit_text(out)
+                except Exception:
+                    await update.message.reply_text(out)
+            else:
+                await update.message.reply_text(out)
+            _ai_schedule_counter_increment(context, "ai_song_generated", 1)
+        except Exception:
+            fail_text = msgs.get("song_failed", msgs["failed"])
+            if status:
+                try:
+                    await status.edit_text(fail_text)
+                except Exception:
+                    pass
+            else:
+                await update.message.reply_text(fail_text)
+        await _ai_tool_mode_send_followup_prompt(update.message, context, lang_ui, mode, session, uid)
         return True
 
     if mode == "quiz":
@@ -2945,6 +3005,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                     pass
             else:
                 await update.message.reply_text(msgs["failed"])
+        await _ai_tool_mode_send_followup_prompt(update.message, context, lang_ui, mode, session, uid)
         return True
 
     if mode == "music":
@@ -2985,7 +3046,6 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                     caption=caption,
                     title="AI Music",
                     performer="SmartAIToolsBot",
-                    reply_markup=_main_menu_keyboard(lang_ui, "ai_tools", uid),
                 )
             )
             if status:
@@ -3004,6 +3064,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
                     pass
             else:
                 await update.message.reply_text(fail_text)
+        await _ai_tool_mode_send_followup_prompt(update.message, context, lang_ui, mode, session, uid)
         return True
 
     # Unknown or not implemented mode.

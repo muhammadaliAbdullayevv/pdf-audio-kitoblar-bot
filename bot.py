@@ -4268,7 +4268,7 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         context.user_data["main_menu_section"] = "ai_tools"
         await _pdfed_start_translation_session_from_message(update.message, update, context, lang)
         return True
-    if action in {"ai_translator", "ai_grammar", "ai_email_writer", "ai_quiz", "ai_music"}:
+    if action in {"ai_translator", "ai_grammar", "ai_email_writer", "ai_quiz", "ai_music", "ai_song"}:
         context.user_data["main_menu_section"] = "ai_tools"
         mode_map = {
             "ai_translator": "translator",
@@ -4276,6 +4276,7 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
             "ai_email_writer": "email",
             "ai_quiz": "quiz",
             "ai_music": "music",
+            "ai_song": "song",
         }
         await _ai_tool_mode_start_session_from_message(update.message, update, context, lang, mode_map[action])
         return True
@@ -4754,6 +4755,7 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ai_email_writes",
             "ai_quiz_generated",
             "ai_music_generated",
+            "ai_song_generated",
             "ai_pdf_created",
         ]
         counters = await run_blocking(db_get_counters, counter_keys)
@@ -4865,6 +4867,7 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- Email writes: {counters.get('ai_email_writes', 0)}",
             f"- Quiz generated: {counters.get('ai_quiz_generated', 0)}",
             f"- Music generated: {counters.get('ai_music_generated', 0)}",
+            f"- Song lyrics generated: {counters.get('ai_song_generated', 0)}",
             f"- PDF created: {counters.get('ai_pdf_created', 0)}",
         ]
 

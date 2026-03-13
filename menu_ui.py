@@ -96,6 +96,7 @@ def build_help_text(
             f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — matndan PDF tayyorlaydi.",
             f"{m.get('menu_ai_quiz', '📝 AI quiz generator')} — mavzu bo‘yicha Telegram quiz savollar yaratadi.",
             f"{m.get('menu_ai_music', '🎵 AI music generator')} — prompt bo‘yicha instrumental musiqa yaratadi (lokal).",
+            f"{m.get('menu_ai_song', '🎤 AI qo‘shiq generator')} — mavzu yoki kalit so‘zlardan qo‘shiq matni yozadi.",
         ]
         other_lines = [
             f"{m.get('menu_top_books', '🔥 Top kitoblar')} — eng mashhur kitoblar.",
@@ -135,6 +136,7 @@ def build_help_text(
             f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — создание PDF из текста.",
             f"{m.get('menu_ai_quiz', '📝 AI генератор викторины')} — создаёт Telegram quiz-вопросы по теме.",
             f"{m.get('menu_ai_music', '🎵 AI генератор музыки')} — создаёт инструментальную музыку по prompt (локально).",
+            f"{m.get('menu_ai_song', '🎤 AI генератор песни')} — пишет текст песни по теме или ключевым словам.",
         ]
         other_lines = [
             f"{m.get('menu_top_books', '🔥 Топ книг')} — самые популярные книги.",
@@ -174,6 +176,7 @@ def build_help_text(
             f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — create a PDF from text.",
             f"{m.get('menu_ai_quiz', '📝 AI Quiz Generator')} — generate Telegram quiz questions from a topic.",
             f"{m.get('menu_ai_music', '🎵 AI Music Generator')} — generate instrumental music from a prompt (local).",
+            f"{m.get('menu_ai_song', '🎤 AI Song Generator')} — write song lyrics from a theme or keywords.",
         ]
         other_lines = [
             f"{m.get('menu_top_books', '🔥 Top Books')} — most popular books.",
@@ -237,6 +240,7 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_pdf_editor": "PDF siqish, OCR, TXT/EPUB va suv belgisi.",
             "menu_ai_quiz": "mavzu bo'yicha Telegram quiz savollar yaratadi.",
             "menu_ai_music": "prompt bo'yicha instrumental musiqa yaratadi (lokal).",
+            "menu_ai_song": "mavzu yoki kalit so'zlardan qo'shiq matni yozadi.",
             "menu_top_books": "eng mashhur kitoblar.",
             "menu_movie_upload": "kinolarni saqlash uchun yuborish.",
             "menu_favorites": "saqlangan kitoblar.",
@@ -261,6 +265,7 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_pdf_editor": "сжатие PDF, OCR, TXT/EPUB и водяной знак.",
             "menu_ai_quiz": "создаёт Telegram quiz-вопросы по теме.",
             "menu_ai_music": "создаёт инструментальную музыку по prompt (локально).",
+            "menu_ai_song": "пишет текст песни по теме или ключевым словам.",
             "menu_top_books": "самые популярные книги.",
             "menu_movie_upload": "отправка фильмов для сохранения.",
             "menu_favorites": "сохранённые книги.",
@@ -285,6 +290,7 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_pdf_editor": "compress PDF, OCR, TXT/EPUB, and watermark.",
             "menu_ai_quiz": "generate Telegram quiz questions from a topic.",
             "menu_ai_music": "generate instrumental music from a prompt (local).",
+            "menu_ai_song": "write song lyrics from a theme or keywords.",
             "menu_top_books": "most popular books.",
             "menu_movie_upload": "send movies for storage.",
             "menu_favorites": "saved books.",
@@ -336,6 +342,7 @@ def main_menu_text_action(
         "menu_ai_email_writer": "ai_email_writer",
         "menu_ai_quiz": "ai_quiz",
         "menu_ai_music": "ai_music",
+        "menu_ai_song": "ai_song",
         "menu_back": "back",
     }
     for lang_key in ("uz", "ru", "en"):
