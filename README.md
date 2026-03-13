@@ -483,20 +483,10 @@ PostgreSQL remains source of truth; ES is derivative and rebuildable.
 - `AI_CHAT_OLLAMA_MODEL`
 - `AI_CHAT_OLLAMA_TIMEOUT`
 - `AI_TOOLS_OLLAMA_TIMEOUT`
-- `AI_MUSIC_BACKEND` (`auto`, `musicgen`, `synth`)
-- `AI_MUSIC_MODEL` (e.g., `facebook/musicgen-small`)
-- `AI_MUSIC_DEVICE` (`auto`, `cpu`, `cuda`)
-- `AI_MUSIC_ALLOW_SYNTH_FALLBACK` (`0`/`1`)
-- `AI_MUSIC_TEMPERATURE`
-- `AI_MUSIC_TOP_K`
-- `AI_MUSIC_CFG_COEF`
 - `TTS_OLLAMA_MODEL`
 - `TTS_OLLAMA_TIMEOUT`
 - `PDF_MAKER_OLLAMA_MODEL`
 - `PDF_MAKER_OLLAMA_TIMEOUT`
-
-For prompt-based MusicGen backend, install optional dependency in your bot venv:
-`pip install audiocraft`
 
 ## 12.8 AI translator (NLLB / hybrid)
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import array
 import base64
 import hashlib
 import io
@@ -16,7 +15,6 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
-from threading import Lock
 from typing import Any, Awaitable, Callable
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
@@ -68,8 +66,6 @@ _db_delete_user_quiz = None
 _db_mark_user_quiz_started = None
 _db_increment_user_quiz_share_count = None
 _db_increment_counter = None
-_MUSICGEN_CACHE: dict[tuple[str, str], dict] = {}
-_MUSICGEN_LOCK = Lock()
 _WEBAPP_URL = ""  # Web app removed; keep for backward-compatible function signature
 try:
     _MY_QUIZ_PAGE_SIZE = max(1, int(os.getenv("MY_QUIZ_PAGE_SIZE", "10") or "10"))
@@ -542,7 +538,6 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
             "music_done": "✅ Musiqa tayyor.",
             "music_caption": "🎵 AI musiqa (instrumental)\n⏱️ {seconds}s\n📝 {prompt}",
             "music_setup_text": "🎵 AI musiqa generator\n\n1) 🎨 Uslub: {style}\n2) ⏱️ Davomiylik: {seconds} soniya\n3) ✍️ Endi prompt yuboring.",
-            "music_unavailable": "⚠️ Lokal musiqa generatori hozir mavjud emas. Model/dependensiyalarni tekshiring.",
             "music_failed": "⚠️ Musiqa yaratib bo‘lmadi. Promptni soddalashtirib qayta urinib ko‘ring.",
             "music_mode_sound": "🎵 Sound Music",
             "music_mode_lyrics": "🎤 Lyrics Music",
@@ -679,7 +674,6 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
             "music_done": "✅ Музыка готова.",
             "music_caption": "🎵 AI музыка (инструментал)\n⏱️ {seconds}s\n📝 {prompt}",
             "music_setup_text": "🎵 AI генератор музыки\n\n1) 🎨 Стиль: {style}\n2) ⏱️ Длительность: {seconds} сек\n3) ✍️ Теперь отправьте prompt.",
-            "music_unavailable": "⚠️ Локальный генератор музыки недоступен. Проверьте модель/зависимости.",
             "music_failed": "⚠️ Не удалось сгенерировать музыку. Попробуйте упростить prompt.",
             "music_mode_sound": "🎵 Sound Music",
             "music_mode_lyrics": "🎤 Lyrics Music",
@@ -815,7 +809,6 @@ def _ai_tool_mode_texts(lang: str) -> dict[str, str]:
         "music_done": "✅ Music ready.",
         "music_caption": "🎵 AI music (instrumental)\n⏱️ {seconds}s\n📝 {prompt}",
         "music_setup_text": "🎵 AI Music Generator\n\n1) 🎨 Style: {style}\n2) ⏱️ Duration: {seconds}s\n3) ✍️ Now send your prompt text.",
-        "music_unavailable": "⚠️ Local music generator is unavailable. Check the model/dependencies.",
         "music_failed": "⚠️ Music generation failed. Try a simpler prompt.",
         "music_mode_sound": "🎵 Sound Music",
         "music_mode_lyrics": "🎤 Lyrics Music",
@@ -2513,27 +2506,7 @@ def _ai_tool_email_writer_blocking(user_text: str, reply_lang_hint: str) -> str:
 
 
 def _ai_music_backend() -> str:
-    raw = str(os.getenv("AI_MUSIC_BACKEND", "auto") or "").strip().lower()
-    aliases = {
-        "default": "auto",
-        "legacy": "synth",
-        "local": "synth",
-        "music-gen": "musicgen",
-    }
-    normalized = aliases.get(raw, raw)
-    if normalized not in {"auto", "musicgen", "synth"}:
-        return "auto"
-    return normalized
-
-
-def _ai_music_compose_prompt(prompt: str, style_key: str) -> str:
-    style = str(style_key or "lofi").lower()
-    style_hint = _AI_MUSIC_STYLE_HINTS.get(style, _AI_MUSIC_STYLE_HINTS["lofi"])
-    user_prompt = re.sub(r"\s+", " ", str(prompt or "").strip())
-    if not user_prompt:
-        user_prompt = "instrumental"
-    # Keep this concise for models that can be sensitive to long prompts.
-    return f"{style_hint}. Prompt: {user_prompt[:420]}"
+    return "synth"
 
 
 def _ai_music_pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int) -> bytes:
@@ -2544,109 +2517,6 @@ def _ai_music_pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int) -> bytes:
         wf.setframerate(max(8000, int(sample_rate or 22050)))
         wf.writeframes(bytes(pcm_bytes or b""))
     return buf.getvalue()
-
-
-def _ai_music_get_musicgen_bundle() -> dict:
-    model_name = str(os.getenv("AI_MUSIC_MODEL", "facebook/musicgen-small") or "").strip() or "facebook/musicgen-small"
-    device = str(os.getenv("AI_MUSIC_DEVICE", "auto") or "").strip().lower() or "auto"
-    cache_key = (model_name, device)
-
-    with _MUSICGEN_LOCK:
-        cached = _MUSICGEN_CACHE.get(cache_key)
-        if cached:
-            return cached
-
-        try:
-            import torch  # type: ignore
-            from audiocraft.models import MusicGen  # type: ignore
-        except Exception as e:
-            raise RuntimeError("musicgen_requirements_missing") from e
-
-        resolved_device = device
-        if resolved_device == "auto":
-            resolved_device = "cuda" if getattr(torch, "cuda", None) and torch.cuda.is_available() else "cpu"
-        if resolved_device == "cuda" and (not getattr(torch, "cuda", None) or not torch.cuda.is_available()):
-            resolved_device = "cpu"
-
-        try:
-            model = MusicGen.get_pretrained(model_name, device=resolved_device)
-        except TypeError:
-            model = MusicGen.get_pretrained(model_name)
-            try:
-                if hasattr(model, "to"):
-                    model = model.to(resolved_device)
-            except Exception:
-                pass
-        except Exception as e:
-            raise RuntimeError(f"musicgen_model_load_failed: {e}") from e
-
-        bundle = {
-            "model": model,
-            "torch": torch,
-            "device": resolved_device,
-            "model_name": model_name,
-        }
-        _MUSICGEN_CACHE[cache_key] = bundle
-        return bundle
-
-
-def _ai_music_tensor_to_wav_bytes(audio_tensor: Any, torch_mod, sample_rate: int) -> bytes:
-    tensor = audio_tensor
-    if isinstance(tensor, (list, tuple)):
-        if not tensor:
-            raise RuntimeError("musicgen_empty_output")
-        tensor = tensor[0]
-    if not hasattr(tensor, "dim"):
-        raise RuntimeError("musicgen_invalid_output")
-
-    tensor = tensor.detach().float().cpu()
-    if tensor.dim() == 3:
-        tensor = tensor[0]
-    if tensor.dim() == 2:
-        # Mix stereo/multichannel to mono for smaller Telegram payload and compatibility.
-        if int(tensor.shape[0]) <= int(tensor.shape[1]):
-            tensor = tensor.mean(dim=0)
-        else:
-            tensor = tensor.mean(dim=1)
-    if tensor.dim() != 1:
-        raise RuntimeError("musicgen_invalid_shape")
-
-    tensor = tensor.clamp(-1.0, 1.0).mul(32767.0).to(dtype=torch_mod.int16).cpu()
-    try:
-        pcm = tensor.numpy().astype("<i2", copy=False).tobytes()
-    except Exception:
-        pcm = array.array("h", [int(x) for x in tensor.tolist()]).tobytes()
-    return _ai_music_pcm16_to_wav_bytes(pcm, sample_rate)
-
-
-def _ai_tool_music_generate_wav_musicgen_blocking(prompt: str, duration_s: int, style_key: str) -> bytes:
-    bundle = _ai_music_get_musicgen_bundle()
-    model = bundle["model"]
-    torch_mod = bundle["torch"]
-    style = str(style_key or "lofi").lower()
-    composed_prompt = _ai_music_compose_prompt(prompt, style)
-
-    temperature = max(0.1, min(2.0, float(os.getenv("AI_MUSIC_TEMPERATURE", "1.0") or "1.0")))
-    top_k = max(0, int(os.getenv("AI_MUSIC_TOP_K", "250") or "250"))
-    cfg_coef = max(0.1, float(os.getenv("AI_MUSIC_CFG_COEF", "3.0") or "3.0"))
-    sample_rate = int(getattr(model, "sample_rate", 32000) or 32000)
-
-    try:
-        model.set_generation_params(
-            duration=float(duration_s),
-            use_sampling=True,
-            temperature=temperature,
-            top_k=top_k,
-            cfg_coef=cfg_coef,
-        )
-    except TypeError:
-        model.set_generation_params(duration=float(duration_s))
-
-    with torch_mod.no_grad():
-        generated = model.generate([composed_prompt])
-    if generated is None:
-        raise RuntimeError("musicgen_empty_output")
-    return _ai_music_tensor_to_wav_bytes(generated, torch_mod, sample_rate)
 
 
 def _ai_tool_music_generate_wav_synth_blocking(prompt: str, duration_s: int, style_key: str) -> bytes:
@@ -2765,26 +2635,8 @@ def _ai_tool_music_generate_wav_blocking(prompt: str, duration_s: int, style_key
     style = str(style_key or "lofi").lower()
     if style not in _AI_MUSIC_STYLE_CHOICES:
         style = _AI_MUSIC_STYLE_CHOICES[0]
-
-    backend = _ai_music_backend()
-    if backend == "synth":
-        return _ai_tool_music_generate_wav_synth_blocking(prompt, duration_s, style)
-
-    if backend == "musicgen":
-        try:
-            return _ai_tool_music_generate_wav_musicgen_blocking(prompt, duration_s, style)
-        except Exception as e:
-            if _ai_env_bool("AI_MUSIC_ALLOW_SYNTH_FALLBACK", False):
-                logger.warning("MusicGen failed; fallback to synth is enabled: %s", e)
-                return _ai_tool_music_generate_wav_synth_blocking(prompt, duration_s, style)
-            raise
-
-    # auto
-    try:
-        return _ai_tool_music_generate_wav_musicgen_blocking(prompt, duration_s, style)
-    except Exception as e:
-        logger.warning("MusicGen unavailable in auto mode; using synth fallback: %s", e)
-        return _ai_tool_music_generate_wav_synth_blocking(prompt, duration_s, style)
+    _ai_music_backend()
+    return _ai_tool_music_generate_wav_synth_blocking(prompt, duration_s, style)
 
 
 async def _ai_tool_mode_start_session_from_message(
@@ -3144,11 +2996,7 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
             _ai_schedule_counter_increment(context, "ai_music_generated", 1)
         except Exception as e:
             logger.exception("ai music generation failed: %s", e)
-            err_text = str(e).lower()
-            if "musicgen_requirements_missing" in err_text or "musicgen_model_load_failed" in err_text:
-                fail_text = msgs.get("music_unavailable", msgs.get("music_failed", msgs["failed"]))
-            else:
-                fail_text = msgs.get("music_failed", msgs["failed"])
+            fail_text = msgs.get("music_failed", msgs["failed"])
             if status:
                 try:
                     await status.edit_text(fail_text)
