@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart AI Tools Bot Dashboard</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="dashboard-shell">
+    <header class="hero reveal" style="--delay: 0.04s;">
+      <div class="hero__left">
+        <p class="eyebrow">Local Control Room</p>
+        <h1>Smart AI Tools Bot</h1>
+        <p class="hero__subtitle">
+          Real-time operational dashboard for users, catalog growth, downloader quality, and infrastructure health.
+        </p>
+      </div>
+      <div class="hero__right">
+        <div id="svc-bot-api" class="status-chip status-chip--ok">
+          <span class="dot"></span>
+          Bot API Online
+        </div>
+        <div id="svc-db" class="status-chip status-chip--ok">
+          <span class="dot"></span>
+          PostgreSQL Healthy
+        </div>
+        <div id="svc-es" class="status-chip status-chip--warn">
+          <span class="dot"></span>
+          ES Degraded
+        </div>
+        <p id="last-updated" class="timestamp">Updated just now</p>
+        <p id="data-mode" class="timestamp"></p>
+        <p id="bot-restart-note" class="timestamp"></p>
+        <p id="reliability-note" class="timestamp"></p>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar reveal" style="--delay: 0.08s;">
+        <h2>Quick Views</h2>
+        <button class="nav-btn nav-btn--active" type="button" data-view="overview" data-target="section-overview">Overview</button>
+        <button class="nav-btn" type="button" data-view="catalog" data-target="panel-catalog">Catalog</button>
+        <button class="nav-btn" type="button" data-view="traffic" data-target="panel-search-quality">Search & Traffic</button>
+        <button class="nav-btn" type="button" data-view="downloader" data-target="panel-downloader-quality">Downloader</button>
+        <button class="nav-btn" type="button" data-view="reliability" data-target="panel-infra">Infra & Reliability</button>
+        <button class="nav-btn" type="button" data-view="users" data-target="panel-retention">User Insights</button>
+      </aside>
+
+      <section class="content">
+        <section class="toolbar reveal" style="--delay: 0.09s;" data-views="overview,traffic,users,catalog,downloader,reliability">
+          <div class="range-switch" role="group" aria-label="Select analytics range">
+            <button class="range-btn range-btn--active" type="button" data-range="today">Today</button>
+            <button class="range-btn" type="button" data-range="week">Week</button>
+            <button class="range-btn" type="button" data-range="month">Month</button>
+            <button class="range-btn" type="button" data-range="all">Overall</button>
+          </div>
+          <div class="toolbar-meta">
+            <p id="range-label" class="toolbar-title">Range: Today</p>
+            <p id="range-subtitle" class="toolbar-subtitle">Loading analytics window...</p>
+          </div>
+        </section>
+
+        <div class="section-head reveal" style="--delay: 0.095s;" data-views="overview,users,traffic,catalog,downloader">
+          <h2>Core Metrics</h2>
+          <p>Instant snapshot of platform activity and workload.</p>
+          <span class="range-context-badge" data-range-badge>Today</span>
+        </div>
+
+        <section id="section-overview" class="kpi-grid" data-views="overview,users,traffic,catalog,downloader">
+          <article class="kpi-card reveal" style="--delay: 0.10s;">
+            <p class="kpi-title">Current Users</p>
+            <p id="kpi-users-current" class="kpi-value">0</p>
+            <p id="kpi-users-current-meta" class="kpi-meta">0 allowed, 0 blocked</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.12s;">
+            <p class="kpi-title">New Users</p>
+            <p id="kpi-users-new" class="kpi-value">0</p>
+            <p id="kpi-users-new-meta" class="kpi-meta">0.0% vs previous window</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.14s;">
+            <p class="kpi-title">Left Users</p>
+            <p id="kpi-users-left" class="kpi-value">0</p>
+            <p id="kpi-users-left-meta" class="kpi-meta">0.0% vs previous window</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.16s;">
+            <p class="kpi-title">Total Books</p>
+            <p id="kpi-books-total" class="kpi-value">0</p>
+            <p id="kpi-books-total-meta" class="kpi-meta">0 not indexed</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.18s;">
+            <p class="kpi-title">New Books</p>
+            <p id="kpi-books-new" class="kpi-value">0</p>
+            <p id="kpi-books-new-meta" class="kpi-meta">0.0% vs previous window</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.20s;">
+            <p class="kpi-title">Total Movies</p>
+            <p id="kpi-movies-total" class="kpi-value">0</p>
+            <p id="kpi-movies-total-meta" class="kpi-meta">0 indexed</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.22s;">
+            <p class="kpi-title">New Movies</p>
+            <p id="kpi-movies-new" class="kpi-value">0</p>
+            <p id="kpi-movies-new-meta" class="kpi-meta">0.0% vs previous window</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.24s;">
+            <p class="kpi-title">Book Searches</p>
+            <p id="kpi-book-searches" class="kpi-value">0</p>
+            <p id="kpi-book-searches-meta" class="kpi-meta">0.0% vs previous window</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.26s;">
+            <p class="kpi-title">Movie Searches</p>
+            <p id="kpi-movie-searches" class="kpi-value">0</p>
+            <p id="kpi-movie-searches-meta" class="kpi-meta">0.0% vs previous window</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.28s;">
+            <p class="kpi-title">Book Downloads</p>
+            <p id="kpi-book-downloads" class="kpi-value">0</p>
+            <p id="kpi-book-downloads-meta" class="kpi-meta">0.0% vs previous window</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.30s;">
+            <p class="kpi-title">Movie Downloads</p>
+            <p id="kpi-movie-downloads" class="kpi-value">0</p>
+            <p id="kpi-movie-downloads-meta" class="kpi-meta">0.0% vs previous window</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.32s;">
+            <p class="kpi-title">Total Audios</p>
+            <p id="kpi-audios-total" class="kpi-value">0</p>
+            <p id="kpi-audios-total-meta" class="kpi-meta">0 parts</p>
+          </article>
+          <article class="kpi-card reveal" style="--delay: 0.34s;">
+            <p class="kpi-title">Added Audios</p>
+            <p id="kpi-audios-new" class="kpi-value">0</p>
+            <p id="kpi-audios-new-meta" class="kpi-meta">0.0% vs previous window</p>
+          </article>
+        </section>
+
+        <div class="section-head reveal" style="--delay: 0.30s;" data-views="overview,catalog,downloader,reliability">
+          <h2>Operations</h2>
+          <p>Catalog integrity, request flow, storage profile, and engagement signals.</p>
+          <span class="range-context-badge" data-range-badge>Today</span>
+        </div>
+
+        <section class="analytics-grid" data-views="overview,catalog,downloader,reliability">
+          <article id="panel-catalog" class="panel reveal" style="--delay: 0.34s;" data-views="overview,catalog,traffic">
+            <div class="panel__head">
+              <h3>Catalog Health</h3>
+              <p>Coverage and content depth</p>
+            </div>
+
+            <div class="meter-group">
+              <div class="meter-head">
+                <span>Book index coverage</span>
+                <strong id="catalog-books-ratio">0.0%</strong>
+              </div>
+              <div class="meter-track"><span id="catalog-books-meter" class="meter-fill"></span></div>
+              <p id="catalog-books-meta" class="meter-meta">0 indexed / 0 total</p>
+            </div>
+
+            <div class="meter-group">
+              <div class="meter-head">
+                <span>Movie index coverage</span>
+                <strong id="catalog-movies-ratio">0.0%</strong>
+              </div>
+              <div class="meter-track"><span id="catalog-movies-meter" class="meter-fill meter-fill--alt"></span></div>
+              <p id="catalog-movies-meta" class="meter-meta">0 indexed / 0 total</p>
+            </div>
+
+            <div class="meter-group">
+              <div class="meter-head">
+                <span>Books with audiobook</span>
+                <strong id="catalog-audio-ratio">0.0%</strong>
+              </div>
+              <div class="meter-track"><span id="catalog-audio-meter" class="meter-fill meter-fill--warm"></span></div>
+              <p id="catalog-audio-meta" class="meter-meta">0 linked audiobook books</p>
+            </div>
+
+            <div class="mini-grid">
+              <div class="mini-card"><span>Unindexed books</span><strong id="catalog-books-unindexed">0</strong></div>
+              <div class="mini-card"><span>Book downloads</span><strong id="catalog-books-downloads">0</strong></div>
+              <div class="mini-card"><span>Book searches</span><strong id="catalog-books-searches">0</strong></div>
+              <div class="mini-card"><span>Audio parts</span><strong id="catalog-audio-parts">0</strong></div>
+              <div class="mini-card"><span>Audio duration</span><strong id="catalog-audio-duration">0h</strong></div>
+            </div>
+          </article>
+
+          <article id="panel-requests" class="panel reveal" style="--delay: 0.38s;" data-views="overview,reliability,downloader">
+            <div class="panel__head">
+              <h3>Request Status</h3>
+              <p data-range-aware>Book and upload workflow health</p>
+            </div>
+
+            <div class="stack-group">
+              <div class="stack-head">
+                <span>Book requests</span>
+                <strong id="request-book-total">0 total</strong>
+              </div>
+              <div id="request-book-bar" class="stacked-bar" aria-label="Book request statuses"></div>
+              <ul id="request-book-legend" class="legend-list"></ul>
+            </div>
+
+            <div class="stack-group">
+              <div class="stack-head">
+                <span>Upload requests</span>
+                <strong id="request-upload-total">0 total</strong>
+              </div>
+              <div id="request-upload-bar" class="stacked-bar" aria-label="Upload request statuses"></div>
+              <ul id="request-upload-legend" class="legend-list"></ul>
+            </div>
+
+            <p id="request-queue-pending" class="panel-footnote">Queue pending: 0</p>
+          </article>
+
+          <article id="panel-storage" class="panel reveal" style="--delay: 0.42s;" data-views="overview,reliability,catalog">
+            <div class="panel__head">
+              <h3>Storage Footprint</h3>
+              <p>Current media size and composition</p>
+            </div>
+
+            <div class="storage-grid">
+              <div class="storage-row"><span>Total size</span><strong id="storage-total-size">0 B</strong></div>
+              <div class="storage-row"><span>Total files</span><strong id="storage-total-files">0</strong></div>
+              <div class="storage-row"><span>Books size</span><strong id="storage-book-size">0 B</strong></div>
+              <div class="storage-row"><span>Audio size</span><strong id="storage-audio-size">0 B</strong></div>
+              <div class="storage-row"><span>Avg book file</span><strong id="storage-avg-book-size">0 B</strong></div>
+              <div class="storage-row"><span>Avg audio file</span><strong id="storage-avg-audio-size">0 B</strong></div>
+            </div>
+
+            <div class="meter-group">
+              <div class="meter-head">
+                <span>Book storage share</span>
+                <strong id="storage-book-share">0.0%</strong>
+              </div>
+              <div class="meter-track"><span id="storage-book-share-meter" class="meter-fill"></span></div>
+            </div>
+          </article>
+
+          <article id="panel-engagement" class="panel reveal" style="--delay: 0.46s;" data-views="overview,downloader,users">
+            <div class="panel__head">
+              <h3>Engagement Snapshot</h3>
+              <p>Mixed scope: lifetime totals + selected-range deltas</p>
+            </div>
+
+            <div class="eng-grid">
+              <div class="eng-row"><span>Favorites (current)</span><strong id="eng-favorites-current">0</strong></div>
+              <div class="eng-row"><span>Favorites added</span><strong id="eng-favorites-added">0</strong></div>
+              <div class="eng-row"><span>Reactions (current)</span><strong id="eng-reactions-current">0</strong></div>
+              <div class="eng-row"><span>Reactions (lifetime)</span><strong id="eng-reactions-lifetime">0</strong></div>
+              <div class="eng-row"><span>AI actions</span><strong id="eng-ai-total">0</strong></div>
+              <div class="eng-row"><span>Downloader health</span><strong id="downloader-health">0.0%</strong></div>
+            </div>
+
+            <div class="eng-rows-grid">
+              <section class="eng-subpanel">
+                <h4>Reaction Mix</h4>
+                <ul id="reaction-mix-list" class="list-tight list-tight--cards"></ul>
+              </section>
+              <section class="eng-subpanel">
+                <h4>AI Breakdown</h4>
+                <ul id="ai-breakdown-list" class="list-tight list-tight--cards"></ul>
+              </section>
+              <section class="eng-subpanel eng-subpanel--wide">
+                <h4>Recent Issues</h4>
+                <ul id="downloader-issues-list" class="list-tight list-tight--issues"></ul>
+              </section>
+            </div>
+          </article>
+        </section>
+
+        <div class="section-head reveal" style="--delay: 0.47s;" data-views="users,traffic,downloader,reliability,catalog,overview">
+          <h2>Deep Analytics</h2>
+          <p>Behavior quality, conversion path, service throughput, and infrastructure condition.</p>
+          <span class="range-context-badge" data-range-badge>Today</span>
+        </div>
+
+        <section class="advanced-grid" data-views="users,traffic,downloader,reliability,catalog,overview">
+          <article id="panel-retention" class="panel reveal" style="--delay: 0.48s;" data-views="users,traffic,overview">
+            <div class="panel__head">
+              <h3>User Retention</h3>
+              <p data-range-aware>DAU / WAU / MAU and stickiness</p>
+            </div>
+            <div class="mini-grid mini-grid--three">
+              <div class="mini-card"><span>DAU</span><strong id="ret-dau">0</strong><em id="ret-dau-change">0.0%</em></div>
+              <div class="mini-card"><span>WAU</span><strong id="ret-wau">0</strong><em id="ret-wau-change">0.0%</em></div>
+              <div class="mini-card"><span>MAU</span><strong id="ret-mau">0</strong><em id="ret-mau-change">0.0%</em></div>
+              <div class="mini-card"><span>Active In Range</span><strong id="ret-active-range">0</strong><em id="ret-active-range-change">0.0%</em></div>
+              <div class="mini-card"><span>DAU/MAU</span><strong id="ret-stickiness">0.0%</strong><em>stickiness</em></div>
+            </div>
+          </article>
+
+          <article id="panel-funnel" class="panel reveal" style="--delay: 0.50s;" data-views="users,traffic,overview">
+            <div class="panel__head">
+              <h3>User Conversion Funnel</h3>
+              <p data-range-aware>New -> Active -> Search -> Download users</p>
+            </div>
+            <div class="funnel-grid">
+              <div class="storage-row"><span>New users</span><strong id="funnel-new">0</strong></div>
+              <div class="storage-row"><span>Active users</span><strong id="funnel-active">0</strong></div>
+              <div class="storage-row"><span>Search users</span><strong id="funnel-search">0</strong></div>
+              <div class="storage-row"><span>Download users</span><strong id="funnel-download">0</strong></div>
+            </div>
+            <ul id="funnel-steps" class="list-tight"></ul>
+            <p class="panel-footnote" id="funnel-rates">new→active 0% | active→search 0% | search→download 0%</p>
+          </article>
+
+          <article id="panel-search-quality" class="panel reveal" style="--delay: 0.52s;" data-views="traffic,overview">
+            <div class="panel__head">
+              <h3>Search Performance</h3>
+              <p data-range-aware>Conversion and request query quality</p>
+            </div>
+            <div class="mini-grid mini-grid--three">
+              <div class="mini-card"><span>Book searches</span><strong id="search-book-total">0</strong></div>
+              <div class="mini-card"><span>Movie searches</span><strong id="search-movie-total">0</strong></div>
+              <div class="mini-card"><span>Book downloads</span><strong id="search-book-download-total">0</strong></div>
+              <div class="mini-card"><span>Movie downloads</span><strong id="search-movie-download-total">0</strong></div>
+              <div class="mini-card"><span>Search->Download</span><strong id="search-conversion">0.0%</strong></div>
+              <div class="mini-card"><span>Request queries</span><strong id="search-request-queries">0</strong></div>
+              <div class="mini-card"><span>Zero-result</span><strong id="search-zero-rate">0.0%</strong></div>
+            </div>
+            <div class="dual-list">
+              <div>
+                <h4>Top Queries</h4>
+                <ul id="top-queries-list" class="list-tight"></ul>
+              </div>
+              <div>
+                <h4>Zero-result Queries</h4>
+                <ul id="zero-queries-list" class="list-tight"></ul>
+              </div>
+            </div>
+          </article>
+
+          <article id="panel-downloader-quality" class="panel reveal" style="--delay: 0.54s;" data-views="downloader,reliability,overview">
+            <div class="panel__head">
+              <h3>Downloader Quality</h3>
+              <p>Mixed scope: lifetime success counters + selected-range log issues</p>
+            </div>
+            <div class="mini-grid mini-grid--three">
+              <div class="mini-card"><span>Success</span><strong id="dl-success-total">0</strong></div>
+              <div class="mini-card"><span>Fail</span><strong id="dl-fail-total">0</strong></div>
+              <div class="mini-card"><span>Success rate</span><strong id="dl-success-rate">0.0%</strong></div>
+              <div class="mini-card"><span>Avg process time</span><strong id="dl-avg-sec">0.0s</strong></div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Platform</th><th>Success</th><th>Fail</th><th>Rate</th></tr>
+                </thead>
+                <tbody id="dl-platform-body"></tbody>
+              </table>
+            </div>
+            <ul id="dl-reasons-list" class="list-tight"></ul>
+          </article>
+
+          <article id="panel-queue-sla" class="panel reveal" style="--delay: 0.56s;" data-views="reliability,downloader,overview">
+            <div class="panel__head">
+              <h3>Processing Speed</h3>
+              <p data-range-aware>Pending age and request turnaround time</p>
+            </div>
+            <div class="storage-grid">
+              <div class="storage-row"><span>Pending upload requests</span><strong id="sla-pending">0</strong></div>
+              <div class="storage-row"><span>Oldest pending age</span><strong id="sla-oldest">0s</strong></div>
+              <div class="storage-row"><span>Avg upload resolve</span><strong id="sla-avg-resolve">0s</strong></div>
+              <div class="storage-row"><span>Avg accept turnaround</span><strong id="sla-avg-accept">0s</strong></div>
+              <div class="storage-row"><span>Avg reject turnaround</span><strong id="sla-avg-reject">0s</strong></div>
+              <div class="storage-row"><span>Avg book request resolve</span><strong id="sla-book-resolve">0s</strong></div>
+            </div>
+          </article>
+
+          <article id="panel-catalog-growth" class="panel reveal" style="--delay: 0.58s;" data-views="catalog,traffic,overview">
+            <div class="panel__head">
+              <h3>New Catalog Items</h3>
+              <p data-range-aware>Books, movies, audiobooks growth and indexing lag</p>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Day</th><th>Books+</th><th>Movies+</th><th>Audio+</th><th>Unindexed+</th></tr>
+                </thead>
+                <tbody id="growth-table-body"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article id="panel-audience" class="panel reveal" style="--delay: 0.60s;" data-views="users,traffic,overview">
+            <div class="panel__head">
+              <h3>Audience Behavior</h3>
+              <p data-range-aware>Language split</p>
+            </div>
+            <div class="dual-list">
+              <div>
+                <h4>Languages</h4>
+                <ul id="audience-lang-list" class="list-tight"></ul>
+              </div>
+            </div>
+            <p id="audience-geo-note" class="timestamp"></p>
+          </article>
+
+          <article id="panel-infra" class="panel reveal" style="--delay: 0.62s;" data-views="reliability,overview">
+            <div class="panel__head">
+              <h3>Infrastructure Health</h3>
+              <p>CPU, memory, disk, network, service runtime</p>
+            </div>
+            <div class="mini-grid mini-grid--three">
+              <div class="mini-card"><span>CPU</span><strong id="infra-cpu">0%</strong></div>
+              <div class="mini-card"><span>Memory</span><strong id="infra-mem">0%</strong></div>
+              <div class="mini-card"><span>Disk</span><strong id="infra-disk">0%</strong></div>
+              <div class="mini-card"><span>Network</span><strong id="infra-net">0 B/s</strong></div>
+              <div class="mini-card"><span>Dashboard uptime</span><strong id="infra-proc-up">0s</strong></div>
+              <div class="mini-card"><span>System uptime</span><strong id="infra-sys-up">0s</strong></div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Service</th><th>Status</th><th>Restarts</th><th>Uptime</th><th>PID</th></tr>
+                </thead>
+                <tbody id="infra-service-body"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <div class="section-head reveal" style="--delay: 0.63s;" data-views="overview,reliability,traffic">
+          <h2>Live Feed</h2>
+          <p>Recent system events and most used command patterns.</p>
+          <span class="range-context-badge" data-range-badge>Today</span>
+        </div>
+
+        <section class="bottom-grid" data-views="overview,reliability,traffic">
+          <article class="panel reveal" style="--delay: 0.64s;" data-views="overview,reliability,traffic">
+            <div class="panel__head">
+              <h3>Live System Events</h3>
+              <p data-range-aware>Latest service signals</p>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Service</th>
+                    <th>Message</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="events-body"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel reveal" style="--delay: 0.68s;" data-views="overview,traffic">
+            <div class="panel__head">
+              <h3>Most Used Features</h3>
+              <p data-range-aware>Usage share for selected time range</p>
+            </div>
+            <ul id="cmd-bars" class="cmd-bars"></ul>
+          </article>
+        </section>
+      </section>
+    </div>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

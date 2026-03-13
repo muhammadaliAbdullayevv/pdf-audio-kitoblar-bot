@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
 import os
@@ -16,6 +15,7 @@ from urllib.parse import urlparse
 import safe_subprocess
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,11 @@ _VIDEO_DL_VIDEO_BEST_KEY = "video_best"
 _VIDEO_DL_VIDEO_HEIGHT_OPTIONS = (144, 240, 360, 480, 720, 1080)
 _VIDEO_DL_PROGRESS_RE = re.compile(r"(?P<pct>\d+(?:\.\d+)?)%")
 _VIDEO_DL_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_VIDEO_DL_URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+_VIDEO_DL_BARE_URL_RE = re.compile(
+    r"(?<!@)\b(?:www\.)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:/[^\s<>\"]*)?\b",
+    re.IGNORECASE,
+)
 
 
 def _video_dl_texts(lang: str) -> dict[str, str]:
@@ -63,8 +68,8 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
         return {
             "start": (
                 "🎬 Video yuklab olish\n\n"
-                "YouTube, Instagram, Facebook, X yoki TikTok havolasini yuboring.\n"
-                "Masalan: https://youtu.be/..."
+                "Istalgan public video havolasini yuboring.\n"
+                "Masalan: https://example.com/video"
             ),
             "checking": "🔎 Havola tekshirilmoqda...",
             "choose_quality": "👇 Format/sifatni tanlang:",
@@ -74,15 +79,19 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
             "cancelled": "Video yuklab olish bekor qilindi.",
             "expired": "Sessiya tugadi. Pastdagi menyudan Video Downloader bo‘limini qayta tanlang.",
             "empty": "Iltimos, havola yuboring.",
-            "invalid_url": "❌ Noto‘g‘ri havola. YouTube/Instagram/Facebook/X/TikTok public link yuboring.",
-            "unsupported": "⚠️ Bu platforma hozir qo‘llab-quvvatlanmaydi. YouTube/Instagram/Facebook/X/TikTok link yuboring.",
+            "invalid_url": "❌ Havola topilmadi yoki noto‘g‘ri. Iltimos, to‘g‘ridan-to‘g‘ri URL yuboring.",
+            "unsupported": "⚠️ Bu platforma bilan ishlashda xatolik yuz berdi. Boshqa havola yuboring.",
             "tools_missing": "⚠️ `yt-dlp` topilmadi. Serverda o‘rnatish kerak.",
             "ffmpeg_missing": "⚠️ Audio yuklab olish uchun `ffmpeg` kerak.",
             "metadata_failed": "⚠️ Havola ma'lumotlarini olib bo‘lmadi. Linkni tekshirib qayta urinib ko‘ring.",
             "download_failed": "⚠️ Yuklab olishda xatolik yuz berdi. Keyinroq qayta urinib ko‘ring.",
+            "download_timeout": "⏱ Yuklab olish juda uzoq davom etdi. Iltimos, keyinroq qayta urinib ko‘ring.",
+            "send_timeout": "⏱ Telegramga yuborishda vaqt tugadi. Iltimos, qayta urinib ko‘ring.",
+            "send_rate_limited": "⏳ Telegram cheklovi sabab yuborish kechikdi. Birozdan keyin qayta urinib ko‘ring.",
+            "send_network_error": "🌐 Tarmoq xatosi sabab yuborib bo‘lmadi. Qayta urinib ko‘ring.",
             "file_too_large": "⚠️ Fayl juda katta ({size_mb} MB). Telegram uchun kichikroq format tanlang.",
             "link_too_large_all_video": (
-                "⚠️ Bu video hajmi bot yuborishi uchun juda katta (15 MB dan katta ko‘rinadi).\n"
+                "⚠️ Bu video hajmi bot yuborish limitidan katta ko‘rinadi.\n"
                 "📩 Iltimos, hajmi kichikroq video link yuboring."
             ),
             "test_limit_reached": (
@@ -117,8 +126,8 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
         return {
             "start": (
                 "🎬 Загрузка видео\n\n"
-                "Отправьте ссылку YouTube, Instagram, Facebook, X или TikTok.\n"
-                "Например: https://youtu.be/..."
+                "Отправьте любую публичную ссылку на видео.\n"
+                "Например: https://example.com/video"
             ),
             "checking": "🔎 Проверяю ссылку...",
             "choose_quality": "👇 Выберите формат/качество:",
@@ -128,15 +137,19 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
             "cancelled": "Загрузка видео отменена.",
             "expired": "Сессия истекла. Снова откройте Video Downloader через меню ниже.",
             "empty": "Пожалуйста, отправьте ссылку.",
-            "invalid_url": "❌ Неверная ссылка. Отправьте публичную ссылку YouTube/Instagram/Facebook/X/TikTok.",
-            "unsupported": "⚠️ Эта платформа пока не поддерживается. Отправьте ссылку YouTube, Instagram, Facebook, X или TikTok.",
+            "invalid_url": "❌ Ссылка не найдена или некорректна. Отправьте прямой URL.",
+            "unsupported": "⚠️ Не удалось обработать эту платформу. Отправьте другую ссылку.",
             "tools_missing": "⚠️ `yt-dlp` не найден. Его нужно установить на сервере.",
             "ffmpeg_missing": "⚠️ Для загрузки аудио нужен `ffmpeg`.",
             "metadata_failed": "⚠️ Не удалось получить данные по ссылке. Проверьте ссылку и попробуйте снова.",
             "download_failed": "⚠️ Ошибка загрузки. Попробуйте позже.",
+            "download_timeout": "⏱ Скачивание заняло слишком много времени. Попробуйте позже.",
+            "send_timeout": "⏱ Истекло время отправки в Telegram. Попробуйте снова.",
+            "send_rate_limited": "⏳ Ограничение Telegram. Повторите попытку немного позже.",
+            "send_network_error": "🌐 Сетевая ошибка при отправке. Попробуйте снова.",
             "file_too_large": "⚠️ Файл слишком большой ({size_mb} MB). Выберите меньший формат.",
             "link_too_large_all_video": (
-                "⚠️ Похоже, это видео слишком большое для отправки ботом (больше 15 MB).\n"
+                "⚠️ Похоже, это видео превышает лимит отправки бота.\n"
                 "📩 Пожалуйста, отправьте ссылку на видео меньшего размера."
             ),
             "test_limit_reached": (
@@ -170,8 +183,8 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
     return {
         "start": (
             "🎬 Video Downloader\n\n"
-            "Send a YouTube, Instagram, Facebook, X, or TikTok link.\n"
-            "Example: https://youtu.be/..."
+            "Send any public video link.\n"
+            "Example: https://example.com/video"
         ),
         "checking": "🔎 Checking link...",
         "choose_quality": "👇 Choose format/quality:",
@@ -181,15 +194,19 @@ def _video_dl_texts(lang: str) -> dict[str, str]:
         "cancelled": "Video downloader cancelled.",
         "expired": "Session expired. Please open Video Downloader again from the menu below.",
         "empty": "Please send a link.",
-        "invalid_url": "❌ Invalid link. Please send a public YouTube/Instagram/Facebook/X/TikTok link.",
-        "unsupported": "⚠️ This platform is not supported yet. Send a YouTube, Instagram, Facebook, X, or TikTok link.",
+        "invalid_url": "❌ Link not found or invalid. Please send a direct URL.",
+        "unsupported": "⚠️ Could not process this platform. Please send another link.",
         "tools_missing": "⚠️ `yt-dlp` is missing on the server.",
         "ffmpeg_missing": "⚠️ `ffmpeg` is required for audio download.",
         "metadata_failed": "⚠️ Could not read link metadata. Please check the link and try again.",
         "download_failed": "⚠️ Download failed. Please try again later.",
+        "download_timeout": "⏱ Download took too long. Please try again later.",
+        "send_timeout": "⏱ Sending to Telegram timed out. Please try again.",
+        "send_rate_limited": "⏳ Telegram rate limit hit. Please try again shortly.",
+        "send_network_error": "🌐 Network error while sending. Please try again.",
         "file_too_large": "⚠️ File is too large ({size_mb} MB). Choose a smaller format.",
         "link_too_large_all_video": (
-            "⚠️ This video looks too large for the bot to send (over 15 MB).\n"
+            "⚠️ This video looks larger than the bot upload limit.\n"
             "📩 Please send another video link with a smaller size."
         ),
         "test_limit_reached": (
@@ -235,6 +252,28 @@ def _video_dl_save_session(context: ContextTypes.DEFAULT_TYPE, session: dict):
     context.user_data[_VIDEO_DL_SESSION_KEY] = dict(session)
 
 
+def _video_dl_extract_url_candidate(text: str) -> str | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    match = _VIDEO_DL_URL_RE.search(raw)
+    candidate = match.group(0) if match else ""
+
+    if not candidate:
+        match = _VIDEO_DL_BARE_URL_RE.search(raw)
+        if match:
+            candidate = match.group(0)
+            if not candidate.lower().startswith(("http://", "https://")):
+                candidate = f"https://{candidate}"
+
+    if not candidate:
+        return None
+
+    candidate = candidate.strip().rstrip(".,!?;:)]}'\"")
+    return candidate or None
+
+
 def _video_dl_supported_url(url: str) -> tuple[bool, str | None]:
     try:
         parsed = urlparse(url.strip())
@@ -243,6 +282,8 @@ def _video_dl_supported_url(url: str) -> tuple[bool, str | None]:
     if parsed.scheme not in {"http", "https"}:
         return False, None
     host = (parsed.netloc or "").lower().split(":")[0]
+    if not host:
+        return False, None
     if host.startswith("www."):
         host = host[4:]
 
@@ -257,7 +298,7 @@ def _video_dl_supported_url(url: str) -> tuple[bool, str | None]:
     if host in {"tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"} or host.endswith(".tiktok.com"):
         return True, "tiktok"
 
-    return False, None
+    return True, "generic"
 
 
 def _video_dl_tools_available() -> bool:
@@ -327,15 +368,41 @@ def _video_dl_size_mb_label(size_bytes: int | float | None) -> str | None:
     return f"{mb:.1f} MB"
 
 
-def _video_dl_max_mb_limit() -> int:
+def _video_dl_local_mode_enabled() -> bool:
+    val = str(os.getenv("TELEGRAM_BOT_API_LOCAL_MODE", "")).strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _video_dl_unlimited_mode_enabled() -> bool:
+    force = str(os.getenv("VIDEO_DL_UNLIMITED", "")).strip().lower()
+    if force in {"1", "true", "yes", "on"}:
+        return True
+    if _video_dl_local_mode_enabled():
+        return True
+    raw = str(os.getenv("VIDEO_DL_MAX_MB", "")).strip()
+    if raw:
+        try:
+            if int(raw) <= 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _video_dl_max_mb_limit() -> int | None:
+    if _video_dl_unlimited_mode_enabled():
+        return None
     try:
-        return max(1, min(15, int(os.getenv("VIDEO_DL_MAX_MB", "15"))))
+        return max(1, int(os.getenv("VIDEO_DL_MAX_MB", "15")))
     except Exception:
         return 15
 
 
-def _video_dl_max_bytes_limit() -> int:
-    return _video_dl_max_mb_limit() * 1024 * 1024
+def _video_dl_max_bytes_limit() -> int | None:
+    max_mb = _video_dl_max_mb_limit()
+    if max_mb is None:
+        return None
+    return max_mb * 1024 * 1024
 
 
 def _video_dl_user_counter_key(user_id: int) -> str:
@@ -495,7 +562,7 @@ def _video_dl_quality_keyboard(lang: str, meta: dict | None = None, size_estimat
         qk = f"video_{h}"
         icon = "🎞️"
         if isinstance(est.get(qk), (int, float)):
-            icon = "⚡" if int(est[qk]) > max_bytes else "✅"
+            icon = "⚡" if (max_bytes is not None and int(est[qk]) > max_bytes) else "✅"
         video_buttons.append(
             InlineKeyboardButton(_label(f"{icon} {h}p", qk), callback_data=f"vdl:pick:{qk}")
         )
@@ -521,6 +588,9 @@ def _video_dl_quality_keyboard(lang: str, meta: dict | None = None, size_estimat
 def _video_dl_extract_metadata_blocking(url: str) -> dict:
     if not _video_dl_tools_available():
         raise RuntimeError("yt-dlp-missing")
+    max_output_chars = int(os.getenv("VIDEO_DL_META_MAX_OUTPUT_CHARS", "2000000") or "2000000")
+    if max_output_chars < 20000:
+        max_output_chars = 20000
     cmd = [
         "yt-dlp",
         "--dump-single-json",
@@ -530,10 +600,18 @@ def _video_dl_extract_metadata_blocking(url: str) -> dict:
         url,
     ]
     timeout_s = float(os.getenv("VIDEO_DL_META_TIMEOUT_S", "25") or "25")
-    p = safe_subprocess.run(cmd, timeout_s=timeout_s, max_output_chars=8000, text=True)
+    p = safe_subprocess.run(cmd, timeout_s=timeout_s, max_output_chars=max_output_chars, text=True)
     if p.returncode != 0:
         raise RuntimeError((p.stderr or p.stdout or "metadata failed").strip()[-800:])
-    data = json.loads((p.stdout or "{}").strip())
+    raw = (p.stdout or "").strip()
+    if not raw:
+        raise RuntimeError("empty metadata response")
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        if "…(truncated)…" in raw:
+            raise RuntimeError("metadata JSON truncated; increase VIDEO_DL_META_MAX_OUTPUT_CHARS") from e
+        raise
     formats = data.get("formats") or []
     heights = sorted(
         {
@@ -566,7 +644,7 @@ def _video_dl_preview_text(meta: dict, lang: str) -> str:
         size = est.get(qk)
         icon = t["quality_unknown_icon"]
         if isinstance(size, (int, float)) and int(size) > 0:
-            icon = t["quality_big_icon"] if int(size) > max_bytes else t["quality_ok_icon"]
+            icon = t["quality_big_icon"] if (max_bytes is not None and int(size) > max_bytes) else t["quality_ok_icon"]
         size_lbl = _video_dl_size_mb_label(size) or "—"
         quality_lines.append(f"{icon} {h}p: {size_lbl}")
     audio_size_lbl = _video_dl_size_mb_label(est.get("audio"))
@@ -602,6 +680,25 @@ def _video_dl_find_output_file(temp_dir: str, stdout_text: str) -> str | None:
     return files[0]
 
 
+async def _video_dl_send_media_with_retry(send_coro_factory, retries: int | None = None):
+    attempts = retries or int(os.getenv("VIDEO_DL_SEND_RETRIES", "6") or "6")
+    attempts = max(1, attempts)
+    last_err: Exception | None = None
+    for i in range(attempts):
+        try:
+            return await send_coro_factory()
+        except RetryAfter as e:
+            last_err = e
+            wait_s = float(getattr(e, "retry_after", 1) or 1) + 0.5
+            await asyncio.sleep(min(wait_s, 30.0))
+        except (TimedOut, NetworkError) as e:
+            last_err = e
+            await asyncio.sleep(min(1.0 * (2**i), 8.0))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("send-rate-limited")
+
+
 async def _video_dl_download_with_progress(
     url: str,
     quality: str,
@@ -621,7 +718,9 @@ async def _video_dl_download_with_progress(
         raise RuntimeError("unsupported-quality")
 
     t = _video_dl_texts(lang)
-    with tempfile.TemporaryDirectory(prefix="vdl_") as td:
+    td = tempfile.mkdtemp(prefix="vdl_")
+    keep_temp_dir = False
+    try:
         out_tpl = os.path.join(td, "%(title).80s [%(id)s].%(ext)s")
         cmd = [
             "yt-dlp",
@@ -728,18 +827,20 @@ async def _video_dl_download_with_progress(
             raise RuntimeError("download-output-missing")
 
         size_bytes = os.path.getsize(out_path)
-        if size_bytes > max_bytes:
+        if max_bytes is not None and size_bytes > max_bytes:
             raise RuntimeError(f"file-too-large:{size_bytes}:{max_mb}")
 
-        filename = os.path.basename(out_path)
-        with open(out_path, "rb") as f:
-            content = f.read()
+        keep_temp_dir = True
         return {
-            "filename": filename,
-            "bytes": content,
+            "temp_dir": td,
+            "file_path": out_path,
+            "filename": os.path.basename(out_path),
             "size_bytes": size_bytes,
-            "kind": "audio" if quality == "audio" else "video",
+            "kind": "audio" if quality == _VIDEO_DL_AUDIO_KEY else "video",
         }
+    finally:
+        if not keep_temp_dir:
+            shutil.rmtree(td, ignore_errors=True)
 
 
 async def _video_dl_send_result(update: Update, result: dict, title: str, lang: str):
@@ -749,17 +850,64 @@ async def _video_dl_send_result(update: Update, result: dict, title: str, lang: 
     t = _video_dl_texts(lang)
     caption_key = "caption_audio" if result.get("kind") == "audio" else "caption_video"
     caption = f"{t[caption_key]}\n📌 {title[:180]}"
-    data = bytes(result.get("bytes") or b"")
-    bio = io.BytesIO(data)
-    bio.name = str(result.get("filename") or ("audio.mp3" if result.get("kind") == "audio" else "video.mp4"))
+    file_path = str(result.get("file_path") or "").strip()
+    if not file_path or not os.path.exists(file_path):
+        raise RuntimeError("download-output-missing")
     if result.get("kind") == "audio":
-        return await _send_with_retry(lambda: target_message.reply_audio(audio=bio, caption=caption, title=title[:64]))
+        async def _send_audio():
+            with open(file_path, "rb") as audio_f:
+                return await target_message.reply_audio(
+                    audio=audio_f,
+                    caption=caption,
+                    title=title[:64],
+                    filename=str(result.get("filename") or "audio.mp3"),
+                )
+
+        return await _video_dl_send_media_with_retry(_send_audio)
     try:
-        return await _send_with_retry(lambda: target_message.reply_video(video=bio, caption=caption, supports_streaming=True))
+        async def _send_video():
+            with open(file_path, "rb") as video_f:
+                return await target_message.reply_video(
+                    video=video_f,
+                    caption=caption,
+                    supports_streaming=True,
+                    filename=str(result.get("filename") or "video.mp4"),
+                )
+
+        return await _video_dl_send_media_with_retry(_send_video)
     except Exception:
-        bio2 = io.BytesIO(data)
-        bio2.name = bio.name
-        return await _send_with_retry(lambda: target_message.reply_document(document=bio2, caption=caption))
+        async def _send_document():
+            with open(file_path, "rb") as doc_f:
+                return await target_message.reply_document(
+                    document=doc_f,
+                    caption=caption,
+                    filename=str(result.get("filename") or "video.mp4"),
+                )
+
+        return await _video_dl_send_media_with_retry(_send_document)
+
+
+def _video_dl_fail_reason(exc: Exception, raw_msg: str) -> str:
+    msg = str(raw_msg or "").lower()
+    if "yt-dlp-missing" in msg:
+        return "tools_missing"
+    if "ffmpeg-missing" in msg:
+        return "ffmpeg_missing"
+    if "download-timeout:" in msg or "timeout" in msg:
+        return "timeout"
+    if "retry after" in msg or "rate limit" in msg:
+        return "rate_limit"
+    if "file-too-large" in msg or "too large" in msg:
+        return "too_large"
+    if "invalid" in msg or "unsupported" in msg or "not found" in msg:
+        return "invalid"
+    if isinstance(exc, TimedOut):
+        return "send_timeout"
+    if isinstance(exc, NetworkError):
+        return "network"
+    if isinstance(exc, RetryAfter):
+        return "rate_limit"
+    return "other"
 
 
 async def _video_dl_run_download_job(
@@ -772,9 +920,12 @@ async def _video_dl_run_download_job(
     lang: str,
     status_msg,
     job_key: str,
+    platform: str = "generic",
 ):
     jobs = context.application.bot_data.setdefault("video_dl_jobs", {})
     t = _video_dl_texts(lang)
+    result: dict[str, Any] | None = None
+    started_mono = time.monotonic()
     try:
         result = await _video_dl_download_with_progress(url, quality, lang=lang, status_msg=status_msg)
         if status_msg:
@@ -786,8 +937,13 @@ async def _video_dl_run_download_job(
         if sent:
             try:
                 await run_blocking(db_increment_counter, "video_downloads", 1)
+                await run_blocking(db_increment_counter, "video_dl_jobs_total", 1)
+                await run_blocking(db_increment_counter, "video_dl_success_total", 1)
+                await run_blocking(db_increment_counter, f"video_dl_success_platform_{platform}", 1)
+                elapsed_ms = max(0, int((time.monotonic() - started_mono) * 1000))
+                await run_blocking(db_increment_counter, "video_dl_duration_total_ms", elapsed_ms)
             except Exception:
-                logger.exception("video downloader: failed to increment video_downloads counter")
+                logger.exception("video downloader: failed to increment success counters")
         if sent and update.effective_user:
             try:
                 await _video_dl_increment_user_download_count(context, int(update.effective_user.id))
@@ -800,12 +956,32 @@ async def _video_dl_run_download_job(
                 pass
     except Exception as e:
         msg = str(e)
-        logger.warning("video downloader job failed: %s", e, exc_info=True)
+        logger.error("video downloader job failed: %s", e, exc_info=True)
         fail = t["download_failed"]
+        fail_reason = _video_dl_fail_reason(e, msg)
+        try:
+            await run_blocking(db_increment_counter, "video_dl_jobs_total", 1)
+            await run_blocking(db_increment_counter, "video_dl_fail_total", 1)
+            await run_blocking(db_increment_counter, f"video_dl_fail_platform_{platform}", 1)
+            await run_blocking(db_increment_counter, f"video_dl_fail_reason_{fail_reason}", 1)
+            elapsed_ms = max(0, int((time.monotonic() - started_mono) * 1000))
+            await run_blocking(db_increment_counter, "video_dl_duration_total_ms", elapsed_ms)
+        except Exception:
+            logger.exception("video downloader: failed to increment failure counters")
         if "yt-dlp-missing" in msg:
             fail = t["tools_missing"]
         elif "ffmpeg-missing" in msg:
             fail = t["ffmpeg_missing"]
+        elif "download-timeout:" in msg:
+            fail = t["download_timeout"]
+        elif isinstance(e, TimedOut):
+            fail = t["send_timeout"]
+        elif isinstance(e, NetworkError):
+            fail = t["send_network_error"]
+        elif isinstance(e, RetryAfter):
+            fail = t["send_rate_limited"]
+        elif "retry after" in msg.lower():
+            fail = t["send_rate_limited"]
         elif msg.startswith("file-too-large:"):
             try:
                 size_bytes = int(msg.split(":")[1])
@@ -818,6 +994,9 @@ async def _video_dl_run_download_job(
             except Exception:
                 pass
     finally:
+        temp_dir = str((result or {}).get("temp_dir") or "").strip()
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         jobs.pop(job_key, None)
 
 
@@ -828,6 +1007,8 @@ def _video_dl_link_all_video_options_too_large(meta: dict) -> bool:
     if not known:
         return False
     max_bytes = _video_dl_max_bytes_limit()
+    if max_bytes is None:
+        return False
     return all(v > max_bytes for v in known)
 
 
@@ -887,23 +1068,22 @@ async def _video_dl_handle_text_input(update: Update, context: ContextTypes.DEFA
             await update.message.reply_text(t["choose_quality"])
             return True
 
-        ok, _platform = _video_dl_supported_url(txt)
+        normalized_url = _video_dl_extract_url_candidate(txt)
+        if not normalized_url:
+            await update.message.reply_text(t["invalid_url"])
+            return True
+
+        ok, _platform = _video_dl_supported_url(normalized_url)
         if not ok:
             await update.message.reply_text(t["invalid_url"])
             return True
         if not _video_dl_tools_available():
             await update.message.reply_text(t["tools_missing"])
             return True
-        if update.effective_user:
-            used_count = await _video_dl_get_user_download_count(context, int(update.effective_user.id))
-            if used_count >= 3:
-                _video_dl_clear_session(context)
-                await update.message.reply_text(t["test_limit_reached"])
-                return True
 
         status = await _send_with_retry(lambda: update.message.reply_text(t["checking"]))
         try:
-            meta = await run_blocking(_video_dl_extract_metadata_blocking, txt)
+            meta = await run_blocking(_video_dl_extract_metadata_blocking, normalized_url)
         except Exception as e:
             logger.info("video metadata extraction failed: %s", e)
             if status:
@@ -927,7 +1107,8 @@ async def _video_dl_handle_text_input(update: Update, context: ContextTypes.DEFA
             return True
 
         session["phase"] = "awaiting_quality"
-        session["url"] = txt
+        session["url"] = normalized_url
+        session["platform"] = str(_platform or "generic")
         session["meta"] = meta
         session["expires_at"] = time.time() + 1800
         _video_dl_save_session(context, session)
@@ -1054,7 +1235,8 @@ async def handle_video_downloader_callback(update: Update, context: ContextTypes
 
         est = dict(meta.get("size_estimates") or {})
         size_est = est.get(value)
-        if isinstance(size_est, (int, float)) and int(size_est) > _video_dl_max_bytes_limit():
+        max_bytes = _video_dl_max_bytes_limit()
+        if max_bytes is not None and isinstance(size_est, (int, float)) and int(size_est) > max_bytes:
             await safe_answer(query, t["file_too_large"].format(size_mb=max(1, round(int(size_est) / (1024 * 1024)))), show_alert=True)
             return
 
@@ -1079,6 +1261,7 @@ async def handle_video_downloader_callback(update: Update, context: ContextTypes
                 lang=lang,
                 status_msg=status_msg,
                 job_key=job_key,
+                platform=str(session.get("platform") or "generic"),
             )
         )
         jobs[job_key] = task

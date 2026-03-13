@@ -23,6 +23,7 @@ dist/
 .venv/
 venv/
 venv*/
+musicgen*/
 env/
 ENV/
 

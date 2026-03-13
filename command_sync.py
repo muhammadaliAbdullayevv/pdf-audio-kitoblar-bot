@@ -20,8 +20,6 @@ _MENU_BACKED_PUBLIC_COMMANDS = {
     "ramazon",
     "top",
     "top_users",
-    "upload",
-    "movie_upload",
 }
 
 _PUBLIC_PREFERRED_ORDER = ("start", "random", "language", "myprofile", "favorite", "request", "requests")

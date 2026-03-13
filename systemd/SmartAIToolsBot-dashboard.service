@@ -1,0 +1,22 @@
+[Unit]
+Description=SmartAIToolsBot - Local Admin Dashboard
+Wants=network-online.target SmartAIToolsBot.service SmartAIToolsBot-bot.service
+After=network-online.target SmartAIToolsBot.service SmartAIToolsBot-bot.service
+PartOf=SmartAIToolsBot-stack.target SmartAIToolsBot-bot.service
+
+[Service]
+Type=simple
+User=muhammadaliabdullayev
+Group=muhammadaliabdullayev
+WorkingDirectory=/home/muhammadaliabdullayev/Documents/SmartAIToolsBot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/smartaitoolsbot.env
+ExecStart=/home/muhammadaliabdullayev/Documents/SmartAIToolsBot/venv312/bin/python /home/muhammadaliabdullayev/Documents/SmartAIToolsBot/dashboard_server.py --host 127.0.0.1 --port 8091
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

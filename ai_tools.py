@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import array
 import base64
 import hashlib
 import io
@@ -460,6 +461,12 @@ _AI_QUIZ_COUNT_CHOICES = (3, 5, 10)
 _AI_QUIZ_INTERVAL_CHOICES = (0, 3, 5, 10)
 _AI_MUSIC_DURATION_CHOICES = (8, 15, 30)
 _AI_MUSIC_STYLE_CHOICES = ("lofi", "romantic", "calm", "epic")
+_AI_MUSIC_STYLE_HINTS = {
+    "lofi": "warm lo-fi hip hop, mellow groove, chill vinyl texture, no vocals",
+    "romantic": "romantic cinematic instrumental, gentle strings and piano, emotional, no vocals",
+    "calm": "calm ambient instrumental, soft pads, meditative, no vocals",
+    "epic": "epic cinematic instrumental, powerful drums, dramatic tension, no vocals",
+}
 
 
 def _ai_tool_mode_clear_session(context: ContextTypes.DEFAULT_TYPE):
@@ -2505,51 +2512,279 @@ def _ai_tool_email_writer_blocking(user_text: str, reply_lang_hint: str) -> str:
     return _ai_chat_postprocess_reply(out, user_text)
 
 
-def _ai_tool_music_generate_wav_blocking(prompt: str, duration_s: int, style_key: str) -> bytes:
-    duration_s = max(5, min(60, int(duration_s or 15)))
+def _ai_music_backend() -> str:
+    raw = str(os.getenv("AI_MUSIC_BACKEND", "auto") or "").strip().lower()
+    aliases = {
+        "default": "auto",
+        "legacy": "synth",
+        "local": "synth",
+        "music-gen": "musicgen",
+    }
+    normalized = aliases.get(raw, raw)
+    if normalized not in {"auto", "musicgen", "synth"}:
+        return "auto"
+    return normalized
+
+
+def _ai_music_compose_prompt(prompt: str, style_key: str) -> str:
     style = str(style_key or "lofi").lower()
-    sample_rate = 22050
-    total_samples = int(sample_rate * duration_s)
-    seed = hashlib.sha256(f"{style}|{prompt}".encode("utf-8", errors="ignore")).digest()
-    base = 150.0 + float(seed[0] % 180)
-    shifts = [0.0, 1.26, 1.5, 1.89]
-    if style == "romantic":
-        shifts = [0.0, 1.25, 1.6, 2.0]
-    elif style == "calm":
-        shifts = [0.0, 1.2, 1.4, 1.7]
-    elif style == "epic":
-        shifts = [0.0, 1.33, 1.78, 2.24]
-    beat_len = {"lofi": 0.80, "romantic": 0.68, "calm": 1.10, "epic": 0.46}.get(style, 0.8)
-    gain = {"lofi": 0.33, "romantic": 0.34, "calm": 0.28, "epic": 0.38}.get(style, 0.32)
+    style_hint = _AI_MUSIC_STYLE_HINTS.get(style, _AI_MUSIC_STYLE_HINTS["lofi"])
+    user_prompt = re.sub(r"\s+", " ", str(prompt or "").strip())
+    if not user_prompt:
+        user_prompt = "instrumental"
+    # Keep this concise for models that can be sensitive to long prompts.
+    return f"{style_hint}. Prompt: {user_prompt[:420]}"
 
-    pcm = bytearray()
-    for i in range(total_samples):
-        t = i / sample_rate
-        seg = int(t / beat_len) % 4
-        f = base * shifts[seg]
-        wobble = 1.0 + 0.01 * math.sin(2.0 * math.pi * 0.9 * t)
-        s1 = math.sin(2.0 * math.pi * (f * wobble) * t)
-        s2 = math.sin(2.0 * math.pi * (f * 0.5) * t)
-        s3 = math.sin(2.0 * math.pi * (f * 2.0) * t)
-        sample = 0.62 * s1 + 0.22 * s2 + 0.16 * s3
-        if style == "epic":
-            sample += 0.10 * math.sin(2.0 * math.pi * 55.0 * t)
-        elif style == "lofi":
-            sample += 0.03 * math.sin(2.0 * math.pi * 3.0 * t)
 
-        fade_in = min(1.0, t / 0.25)
-        fade_out = min(1.0, max(0.0, (duration_s - t) / 0.45))
-        env = min(fade_in, fade_out)
-        sample = max(-1.0, min(1.0, sample * gain * env))
-        pcm.extend(struct.pack("<h", int(sample * 32767.0)))
-
+def _ai_music_pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(bytes(pcm))
+        wf.setframerate(max(8000, int(sample_rate or 22050)))
+        wf.writeframes(bytes(pcm_bytes or b""))
     return buf.getvalue()
+
+
+def _ai_music_get_musicgen_bundle() -> dict:
+    model_name = str(os.getenv("AI_MUSIC_MODEL", "facebook/musicgen-small") or "").strip() or "facebook/musicgen-small"
+    device = str(os.getenv("AI_MUSIC_DEVICE", "auto") or "").strip().lower() or "auto"
+    cache_key = (model_name, device)
+
+    with _MUSICGEN_LOCK:
+        cached = _MUSICGEN_CACHE.get(cache_key)
+        if cached:
+            return cached
+
+        try:
+            import torch  # type: ignore
+            from audiocraft.models import MusicGen  # type: ignore
+        except Exception as e:
+            raise RuntimeError("musicgen_requirements_missing") from e
+
+        resolved_device = device
+        if resolved_device == "auto":
+            resolved_device = "cuda" if getattr(torch, "cuda", None) and torch.cuda.is_available() else "cpu"
+        if resolved_device == "cuda" and (not getattr(torch, "cuda", None) or not torch.cuda.is_available()):
+            resolved_device = "cpu"
+
+        try:
+            model = MusicGen.get_pretrained(model_name, device=resolved_device)
+        except TypeError:
+            model = MusicGen.get_pretrained(model_name)
+            try:
+                if hasattr(model, "to"):
+                    model = model.to(resolved_device)
+            except Exception:
+                pass
+        except Exception as e:
+            raise RuntimeError(f"musicgen_model_load_failed: {e}") from e
+
+        bundle = {
+            "model": model,
+            "torch": torch,
+            "device": resolved_device,
+            "model_name": model_name,
+        }
+        _MUSICGEN_CACHE[cache_key] = bundle
+        return bundle
+
+
+def _ai_music_tensor_to_wav_bytes(audio_tensor: Any, torch_mod, sample_rate: int) -> bytes:
+    tensor = audio_tensor
+    if isinstance(tensor, (list, tuple)):
+        if not tensor:
+            raise RuntimeError("musicgen_empty_output")
+        tensor = tensor[0]
+    if not hasattr(tensor, "dim"):
+        raise RuntimeError("musicgen_invalid_output")
+
+    tensor = tensor.detach().float().cpu()
+    if tensor.dim() == 3:
+        tensor = tensor[0]
+    if tensor.dim() == 2:
+        # Mix stereo/multichannel to mono for smaller Telegram payload and compatibility.
+        if int(tensor.shape[0]) <= int(tensor.shape[1]):
+            tensor = tensor.mean(dim=0)
+        else:
+            tensor = tensor.mean(dim=1)
+    if tensor.dim() != 1:
+        raise RuntimeError("musicgen_invalid_shape")
+
+    tensor = tensor.clamp(-1.0, 1.0).mul(32767.0).to(dtype=torch_mod.int16).cpu()
+    try:
+        pcm = tensor.numpy().astype("<i2", copy=False).tobytes()
+    except Exception:
+        pcm = array.array("h", [int(x) for x in tensor.tolist()]).tobytes()
+    return _ai_music_pcm16_to_wav_bytes(pcm, sample_rate)
+
+
+def _ai_tool_music_generate_wav_musicgen_blocking(prompt: str, duration_s: int, style_key: str) -> bytes:
+    bundle = _ai_music_get_musicgen_bundle()
+    model = bundle["model"]
+    torch_mod = bundle["torch"]
+    style = str(style_key or "lofi").lower()
+    composed_prompt = _ai_music_compose_prompt(prompt, style)
+
+    temperature = max(0.1, min(2.0, float(os.getenv("AI_MUSIC_TEMPERATURE", "1.0") or "1.0")))
+    top_k = max(0, int(os.getenv("AI_MUSIC_TOP_K", "250") or "250"))
+    cfg_coef = max(0.1, float(os.getenv("AI_MUSIC_CFG_COEF", "3.0") or "3.0"))
+    sample_rate = int(getattr(model, "sample_rate", 32000) or 32000)
+
+    try:
+        model.set_generation_params(
+            duration=float(duration_s),
+            use_sampling=True,
+            temperature=temperature,
+            top_k=top_k,
+            cfg_coef=cfg_coef,
+        )
+    except TypeError:
+        model.set_generation_params(duration=float(duration_s))
+
+    with torch_mod.no_grad():
+        generated = model.generate([composed_prompt])
+    if generated is None:
+        raise RuntimeError("musicgen_empty_output")
+    return _ai_music_tensor_to_wav_bytes(generated, torch_mod, sample_rate)
+
+
+def _ai_tool_music_generate_wav_synth_blocking(prompt: str, duration_s: int, style_key: str) -> bytes:
+    # Rich fallback synthesizer: deterministic per-prompt composition (no simple speed reuse).
+    duration_s = max(5, min(60, int(duration_s or 15)))
+    style = str(style_key or "lofi").lower()
+    sample_rate = 22050
+    total_samples = int(sample_rate * duration_s)
+
+    style_profiles = {
+        "lofi": {"tempo": 78, "gain": 0.31, "kick_hz": 52.0, "hat": 0.09, "bright": 0.11, "root": 57},
+        "romantic": {"tempo": 92, "gain": 0.30, "kick_hz": 58.0, "hat": 0.07, "bright": 0.13, "root": 60},
+        "calm": {"tempo": 66, "gain": 0.27, "kick_hz": 46.0, "hat": 0.05, "bright": 0.08, "root": 55},
+        "epic": {"tempo": 120, "gain": 0.33, "kick_hz": 62.0, "hat": 0.12, "bright": 0.17, "root": 53},
+    }
+    profile = style_profiles.get(style, style_profiles["lofi"])
+
+    clean_prompt = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+    tokens = re.findall(r"[a-z0-9']+", clean_prompt)[:48]
+    if not tokens:
+        tokens = ["instrumental"]
+    seed = hashlib.sha256(f"{style}|{clean_prompt}".encode("utf-8", errors="ignore")).digest()
+
+    mood_minor_words = {"sad", "dark", "lonely", "night", "tension", "dramatic", "epic", "sokin", "g'amgin", "спокой", "груст"}
+    use_minor = (style in {"calm", "epic"}) or any(tok in mood_minor_words for tok in tokens)
+    scale = [0, 2, 3, 5, 7, 8, 10] if use_minor else [0, 2, 4, 5, 7, 9, 11]
+
+    root_midi = int(profile["root"]) + int(seed[5] % 12) - 6
+    root_midi = max(42, min(72, root_midi))
+    tempo = int(profile["tempo"]) + int(seed[6] % 11) - 5 + min(10, len(tokens) // 2)
+    tempo = max(58, min(155, tempo))
+    beat_len = 60.0 / float(tempo)
+    step_len = beat_len / (3.0 if style == "calm" else 4.0)
+    bar_len = beat_len * 4.0
+    swing = 0.06 if style in {"lofi", "romantic"} else (0.02 if style == "calm" else 0.0)
+
+    token_hashes: list[int] = []
+    for tok in tokens:
+        h = int(hashlib.blake2s(tok.encode("utf-8", errors="ignore"), digest_size=4).hexdigest(), 16)
+        token_hashes.append(h)
+    motif_len = max(8, min(32, len(token_hashes) * 2))
+    motif_freq: list[float] = []
+    for idx in range(motif_len):
+        h = token_hashes[idx % len(token_hashes)] ^ (int(seed[(idx * 5) % 32]) << 8)
+        interval = scale[h % len(scale)]
+        octave = (h >> 6) % 3  # 0..2 -> low/mid/high
+        midi = root_midi + interval + (octave - 1) * 12
+        midi = max(30, min(88, midi))
+        freq = 440.0 * (2.0 ** ((float(midi) - 69.0) / 12.0))
+        motif_freq.append(freq)
+
+    kick_hz = float(profile["kick_hz"]) + float((seed[8] % 8) - 4)
+    gain = float(profile["gain"])
+    hat_amount = float(profile["hat"])
+    bright = float(profile["bright"])
+
+    pcm = bytearray()
+    for i in range(total_samples):
+        t = float(i) / float(sample_rate)
+        beat_pos = t / beat_len
+        beat_int = int(beat_pos)
+        beat_phase = beat_pos - beat_int
+
+        step_raw = t / step_len
+        step_int = int(step_raw)
+        step_phase = step_raw - step_int
+        swing_shift = swing if (step_int % 2 == 1) else 0.0
+        motif_idx = int((step_raw + swing_shift) % len(motif_freq))
+
+        f = motif_freq[motif_idx]
+        f_alt = motif_freq[(motif_idx + 5) % len(motif_freq)] * (0.5 if style != "epic" else 1.0)
+
+        wobble = 1.0 + 0.015 * math.sin(2.0 * math.pi * (0.35 + bright) * t)
+        lead_env = math.exp(-3.6 * step_phase)
+        lead = math.sin(2.0 * math.pi * (f * wobble) * t + 0.27 * math.sin(2.0 * math.pi * (f * 0.5) * t)) * lead_env
+
+        pad_phase = (t % bar_len) / bar_len
+        pad_env = 0.45 - 0.30 * math.cos(2.0 * math.pi * pad_phase)
+        pad = (
+            0.50 * math.sin(2.0 * math.pi * (f * 0.5) * t)
+            + 0.30 * math.sin(2.0 * math.pi * (f * 1.5) * t + 0.1)
+            + 0.20 * math.sin(2.0 * math.pi * (f_alt * 0.75) * t + 0.2)
+        ) * pad_env
+
+        bass_freq = max(35.0, min(180.0, f_alt * 0.5))
+        bass_env = math.exp(-5.0 * beat_phase)
+        bass = math.sin(2.0 * math.pi * bass_freq * t) * bass_env
+
+        kick_env = math.exp(-30.0 * beat_phase)
+        kick = math.sin(2.0 * math.pi * kick_hz * t) * kick_env if beat_phase < 0.30 else 0.0
+
+        noise_seed = ((i * 1103515245) + int.from_bytes(seed[12:16], "little")) & 0x7FFFFFFF
+        noise = (float(noise_seed) / 1073741824.0) - 1.0
+        half_beat = beat_len * 0.5
+        hat_phase = (t % half_beat) / half_beat if half_beat > 0 else 0.0
+        hat_env = math.exp(-35.0 * hat_phase)
+        hat = noise * hat_env * hat_amount
+
+        sample = (0.55 * lead) + (0.26 * pad) + (0.23 * bass) + (0.19 * kick) + (0.12 * hat)
+        if style == "epic":
+            sample += 0.06 * math.sin(2.0 * math.pi * 110.0 * t)
+        if style == "calm":
+            sample *= 0.86
+
+        fade_in = min(1.0, t / 0.35)
+        fade_out = min(1.0, max(0.0, (duration_s - t) / 0.55))
+        env = min(fade_in, fade_out)
+        out = max(-1.0, min(1.0, sample * gain * env))
+        pcm.extend(struct.pack("<h", int(out * 32767.0)))
+
+    return _ai_music_pcm16_to_wav_bytes(bytes(pcm), sample_rate)
+
+
+def _ai_tool_music_generate_wav_blocking(prompt: str, duration_s: int, style_key: str) -> bytes:
+    duration_s = max(5, min(60, int(duration_s or 15)))
+    style = str(style_key or "lofi").lower()
+    if style not in _AI_MUSIC_STYLE_CHOICES:
+        style = _AI_MUSIC_STYLE_CHOICES[0]
+
+    backend = _ai_music_backend()
+    if backend == "synth":
+        return _ai_tool_music_generate_wav_synth_blocking(prompt, duration_s, style)
+
+    if backend == "musicgen":
+        try:
+            return _ai_tool_music_generate_wav_musicgen_blocking(prompt, duration_s, style)
+        except Exception as e:
+            if _ai_env_bool("AI_MUSIC_ALLOW_SYNTH_FALLBACK", False):
+                logger.warning("MusicGen failed; fallback to synth is enabled: %s", e)
+                return _ai_tool_music_generate_wav_synth_blocking(prompt, duration_s, style)
+            raise
+
+    # auto
+    try:
+        return _ai_tool_music_generate_wav_musicgen_blocking(prompt, duration_s, style)
+    except Exception as e:
+        logger.warning("MusicGen unavailable in auto mode; using synth fallback: %s", e)
+        return _ai_tool_music_generate_wav_synth_blocking(prompt, duration_s, style)
 
 
 async def _ai_tool_mode_start_session_from_message(
@@ -2909,7 +3144,11 @@ async def _ai_tool_mode_handle_text_input(update: Update, context: ContextTypes.
             _ai_schedule_counter_increment(context, "ai_music_generated", 1)
         except Exception as e:
             logger.exception("ai music generation failed: %s", e)
-            fail_text = msgs.get("music_failed", msgs["failed"])
+            err_text = str(e).lower()
+            if "musicgen_requirements_missing" in err_text or "musicgen_model_load_failed" in err_text:
+                fail_text = msgs.get("music_unavailable", msgs.get("music_failed", msgs["failed"]))
+            else:
+                fail_text = msgs.get("music_failed", msgs["failed"])
             if status:
                 try:
                     await status.edit_text(fail_text)

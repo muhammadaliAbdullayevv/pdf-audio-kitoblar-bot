@@ -5,7 +5,7 @@ import json
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, date
-from typing import Iterable
+from typing import Any, Iterable
 
 try:
     import psycopg2
@@ -102,6 +102,16 @@ def _apply_schema_migrations(cur) -> None:
                 );
                 """,
                 "CREATE INDEX IF NOT EXISTS idx_movie_reactions_movie ON movie_reactions (movie_id);",
+            ],
+        ),
+        (
+            6,
+            "analytics: split movie search/download counters for daily and per-user stats",
+            [
+                "ALTER TABLE analytics_daily ADD COLUMN IF NOT EXISTS movie_searches INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE analytics_daily ADD COLUMN IF NOT EXISTS movie_downloads INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE analytics_daily_users ADD COLUMN IF NOT EXISTS movie_searches INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE analytics_daily_users ADD COLUMN IF NOT EXISTS movie_downloads INTEGER NOT NULL DEFAULT 0;",
             ],
         ),
     ]
@@ -467,7 +477,9 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS analytics_daily (
                     day DATE PRIMARY KEY,
                     searches INTEGER NOT NULL DEFAULT 0,
-                    buttons INTEGER NOT NULL DEFAULT 0
+                    buttons INTEGER NOT NULL DEFAULT 0,
+                    movie_searches INTEGER NOT NULL DEFAULT 0,
+                    movie_downloads INTEGER NOT NULL DEFAULT 0
                 );
                 """
             )
@@ -478,10 +490,16 @@ def init_db():
                     user_id BIGINT NOT NULL,
                     searches INTEGER NOT NULL DEFAULT 0,
                     buttons INTEGER NOT NULL DEFAULT 0,
+                    movie_searches INTEGER NOT NULL DEFAULT 0,
+                    movie_downloads INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (day, user_id)
                 );
                 """
             )
+            cur.execute("ALTER TABLE analytics_daily ADD COLUMN IF NOT EXISTS movie_searches INTEGER NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE analytics_daily ADD COLUMN IF NOT EXISTS movie_downloads INTEGER NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE analytics_daily_users ADD COLUMN IF NOT EXISTS movie_searches INTEGER NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE analytics_daily_users ADD COLUMN IF NOT EXISTS movie_downloads INTEGER NOT NULL DEFAULT 0;")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS analytics_counters (
@@ -1229,61 +1247,169 @@ def add_recent(user_id: int, book_id: str, title: str, max_recents: int):
 # --- Analytics ---
 
 def increment_analytics(key: str, amount: int = 1):
-    if key not in {"searches", "buttons"}:
+    valid_keys = {"searches", "buttons", "movie_searches", "movie_downloads"}
+    if key not in valid_keys:
         return 0
     today = date.today()
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO analytics_daily (day, searches, buttons)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (day) DO UPDATE SET
-                    searches = analytics_daily.searches + EXCLUDED.searches,
-                    buttons = analytics_daily.buttons + EXCLUDED.buttons
-                """,
-                (today, amount if key == "searches" else 0, amount if key == "buttons" else 0),
-            )
-            cur.execute("SELECT searches, buttons FROM analytics_daily WHERE day=%s", (today,))
-            row = cur.fetchone()
-            if not row:
-                return 0
-            return row[0] if key == "searches" else row[1]
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO analytics_daily (day, searches, buttons, movie_searches, movie_downloads)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (day) DO UPDATE SET
+                        searches = analytics_daily.searches + EXCLUDED.searches,
+                        buttons = analytics_daily.buttons + EXCLUDED.buttons,
+                        movie_searches = analytics_daily.movie_searches + EXCLUDED.movie_searches,
+                        movie_downloads = analytics_daily.movie_downloads + EXCLUDED.movie_downloads
+                    """,
+                    (
+                        today,
+                        amount if key == "searches" else 0,
+                        amount if key == "buttons" else 0,
+                        amount if key == "movie_searches" else 0,
+                        amount if key == "movie_downloads" else 0,
+                    ),
+                )
+                cur.execute(
+                    "SELECT searches, buttons, movie_searches, movie_downloads FROM analytics_daily WHERE day=%s",
+                    (today,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                key_idx = {"searches": 0, "buttons": 1, "movie_searches": 2, "movie_downloads": 3}
+                return int(row[key_idx[key]] or 0)
+            except Exception as e:
+                # Backward compatibility while DB schema is being migrated.
+                err = str(e).lower()
+                if "movie_searches" not in err and "movie_downloads" not in err:
+                    raise
+                conn.rollback()
+                if key not in {"searches", "buttons"}:
+                    return 0
+                cur.execute(
+                    """
+                    INSERT INTO analytics_daily (day, searches, buttons)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (day) DO UPDATE SET
+                        searches = analytics_daily.searches + EXCLUDED.searches,
+                        buttons = analytics_daily.buttons + EXCLUDED.buttons
+                    """,
+                    (today, amount if key == "searches" else 0, amount if key == "buttons" else 0),
+                )
+                cur.execute("SELECT searches, buttons FROM analytics_daily WHERE day=%s", (today,))
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                return int(row[0] or 0) if key == "searches" else int(row[1] or 0)
 
 
 def increment_user_analytics(user_id: int, key: str, amount: int = 1):
-    if key not in {"searches", "buttons"}:
+    valid_keys = {"searches", "buttons", "movie_searches", "movie_downloads"}
+    if key not in valid_keys:
         return 0
     today = date.today()
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO analytics_daily_users (day, user_id, searches, buttons)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (day, user_id) DO UPDATE SET
-                    searches = analytics_daily_users.searches + EXCLUDED.searches,
-                    buttons = analytics_daily_users.buttons + EXCLUDED.buttons
-                """,
-                (today, user_id, amount if key == "searches" else 0, amount if key == "buttons" else 0),
-            )
-            cur.execute(
-                "SELECT searches, buttons FROM analytics_daily_users WHERE day=%s AND user_id=%s",
-                (today, user_id),
-            )
-            row = cur.fetchone()
-            if not row:
-                return 0
-            return row[0] if key == "searches" else row[1]
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO analytics_daily_users (day, user_id, searches, buttons, movie_searches, movie_downloads)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (day, user_id) DO UPDATE SET
+                        searches = analytics_daily_users.searches + EXCLUDED.searches,
+                        buttons = analytics_daily_users.buttons + EXCLUDED.buttons,
+                        movie_searches = analytics_daily_users.movie_searches + EXCLUDED.movie_searches,
+                        movie_downloads = analytics_daily_users.movie_downloads + EXCLUDED.movie_downloads
+                    """,
+                    (
+                        today,
+                        user_id,
+                        amount if key == "searches" else 0,
+                        amount if key == "buttons" else 0,
+                        amount if key == "movie_searches" else 0,
+                        amount if key == "movie_downloads" else 0,
+                    ),
+                )
+                cur.execute(
+                    """
+                    SELECT searches, buttons, movie_searches, movie_downloads
+                    FROM analytics_daily_users
+                    WHERE day=%s AND user_id=%s
+                    """,
+                    (today, user_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                key_idx = {"searches": 0, "buttons": 1, "movie_searches": 2, "movie_downloads": 3}
+                return int(row[key_idx[key]] or 0)
+            except Exception as e:
+                err = str(e).lower()
+                if "movie_searches" not in err and "movie_downloads" not in err:
+                    raise
+                conn.rollback()
+                if key not in {"searches", "buttons"}:
+                    return 0
+                cur.execute(
+                    """
+                    INSERT INTO analytics_daily_users (day, user_id, searches, buttons)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (day, user_id) DO UPDATE SET
+                        searches = analytics_daily_users.searches + EXCLUDED.searches,
+                        buttons = analytics_daily_users.buttons + EXCLUDED.buttons
+                    """,
+                    (today, user_id, amount if key == "searches" else 0, amount if key == "buttons" else 0),
+                )
+                cur.execute(
+                    "SELECT searches, buttons FROM analytics_daily_users WHERE day=%s AND user_id=%s",
+                    (today, user_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                return int(row[0] or 0) if key == "searches" else int(row[1] or 0)
 
 
 def get_analytics_map():
     data: dict[str, dict] = {}
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT day, searches, buttons FROM analytics_daily")
-            for day, searches, buttons in cur.fetchall():
-                data[str(day)] = {"searches": int(searches), "buttons": int(buttons)}
+            try:
+                cur.execute("SELECT day, searches, buttons, movie_searches, movie_downloads FROM analytics_daily")
+                rows = cur.fetchall()
+                for day, searches, buttons, movie_searches, movie_downloads in rows:
+                    total_searches = int(searches or 0)
+                    total_downloads = int(buttons or 0)
+                    movie_s = int(movie_searches or 0)
+                    movie_d = int(movie_downloads or 0)
+                    data[str(day)] = {
+                        "searches": total_searches,
+                        "buttons": total_downloads,
+                        "movie_searches": movie_s,
+                        "movie_downloads": movie_d,
+                        "book_searches": max(0, total_searches - movie_s),
+                        "book_downloads": max(0, total_downloads - movie_d),
+                    }
+            except Exception as e:
+                err = str(e).lower()
+                if "movie_searches" not in err and "movie_downloads" not in err:
+                    raise
+                conn.rollback()
+                cur.execute("SELECT day, searches, buttons FROM analytics_daily")
+                for day, searches, buttons in cur.fetchall():
+                    total_searches = int(searches or 0)
+                    total_downloads = int(buttons or 0)
+                    data[str(day)] = {
+                        "searches": total_searches,
+                        "buttons": total_downloads,
+                        "movie_searches": 0,
+                        "movie_downloads": 0,
+                        "book_searches": total_searches,
+                        "book_downloads": total_downloads,
+                    }
     return data
 
 
@@ -1323,14 +1449,52 @@ def get_counters(keys: list[str] | None = None) -> dict[str, int]:
 def get_daily_analytics(day: date):
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT searches, buttons FROM analytics_daily WHERE day=%s",
-                (day,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return {"searches": 0, "downloads": 0}
-            return {"searches": int(row[0] or 0), "downloads": int(row[1] or 0)}
+            try:
+                cur.execute(
+                    "SELECT searches, buttons, movie_searches, movie_downloads FROM analytics_daily WHERE day=%s",
+                    (day,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {
+                        "searches": 0,
+                        "downloads": 0,
+                        "movie_searches": 0,
+                        "movie_downloads": 0,
+                        "book_searches": 0,
+                        "book_downloads": 0,
+                    }
+                total_searches = int(row[0] or 0)
+                total_downloads = int(row[1] or 0)
+                movie_searches = int(row[2] or 0)
+                movie_downloads = int(row[3] or 0)
+                return {
+                    "searches": total_searches,
+                    "downloads": total_downloads,
+                    "movie_searches": movie_searches,
+                    "movie_downloads": movie_downloads,
+                    "book_searches": max(0, total_searches - movie_searches),
+                    "book_downloads": max(0, total_downloads - movie_downloads),
+                }
+            except Exception as e:
+                err = str(e).lower()
+                if "movie_searches" not in err and "movie_downloads" not in err:
+                    raise
+                conn.rollback()
+                cur.execute("SELECT searches, buttons FROM analytics_daily WHERE day=%s", (day,))
+                row = cur.fetchone()
+                if not row:
+                    return {"searches": 0, "downloads": 0, "movie_searches": 0, "movie_downloads": 0, "book_searches": 0, "book_downloads": 0}
+                total_searches = int(row[0] or 0)
+                total_downloads = int(row[1] or 0)
+                return {
+                    "searches": total_searches,
+                    "downloads": total_downloads,
+                    "movie_searches": 0,
+                    "movie_downloads": 0,
+                    "book_searches": total_searches,
+                    "book_downloads": total_downloads,
+                }
 
 
 def backfill_counters_if_empty() -> bool:
@@ -1726,6 +1890,76 @@ VARIANT_TOKENS = {
     "uzbek", "ozbek", "uzbekcha", "ozbekcha", "uzb", "ozb",
     "first", "second", "third", "fourth", "fifth", "fivth", "sixth",
 }
+
+
+_BOOK_ADULT_FILTER_PATTERNS = (
+    re.compile(r"(?<!\d)18\s*\+"),
+    re.compile(r"\b18\s*yosh\b"),
+    re.compile(r"\b18\s*plus\b"),
+    re.compile(r"\badult\b"),
+    re.compile(r"\bnsfw\b"),
+    re.compile(r"\bporn\w*\b"),
+    re.compile(r"\berot\w*\b"),
+    re.compile(r"\bsex\b"),
+    re.compile(r"\bseks\b"),
+    re.compile(r"\bxxx\b"),
+    re.compile(r"\bhentai\b"),
+    re.compile(r"\bonlyfans\b"),
+    re.compile(r"\bэрот\w*\b"),
+    re.compile(r"\bпорн\w*\b"),
+    re.compile(r"\bсекс\w*\b"),
+    re.compile(r"\bjinsiy\b"),
+    re.compile(r"\bvoyaga\s+yetgan\w*\b"),
+)
+
+
+def _extra_book_adult_keywords() -> list[str]:
+    raw = str(os.getenv("BOOK_ADULT_FILTER_KEYWORDS", "") or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw.split(","):
+        token = str(item or "").strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def _book_filter_haystack(parts: list[Any]) -> str:
+    base = " ".join(str(p or "") for p in parts).lower()
+    base = re.sub(r"[\s_\-./|\\:;,(){}\[\]<>]+", " ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return base
+
+
+def is_book_adult_marked(book: dict | None = None, text: str | None = None) -> bool:
+    parts: list[Any] = []
+    if text:
+        parts.append(text)
+    if isinstance(book, dict):
+        parts.extend(
+            [
+                book.get("book_name"),
+                book.get("display_name"),
+                book.get("file_name"),
+                book.get("caption_text"),
+                book.get("search_text"),
+                book.get("path"),
+            ]
+        )
+    haystack = _book_filter_haystack(parts)
+    if not haystack:
+        return False
+    for pattern in _BOOK_ADULT_FILTER_PATTERNS:
+        if pattern.search(haystack):
+            return True
+    for token in _extra_book_adult_keywords():
+        if token in haystack:
+            return True
+    return False
 
 
 def _name_allows_duplicates(book_name: str) -> bool:
@@ -2457,6 +2691,16 @@ def get_top_books(limit: int = 20, offset: int = 0):
 
 
 def insert_book(book: dict):
+    if is_book_adult_marked(book):
+        try:
+            logger.info(
+                "insert_book: skipped by adult filter (display=%s, normalized=%s)",
+                str((book or {}).get("display_name") or "")[:120],
+                str((book or {}).get("book_name") or "")[:120],
+            )
+        except Exception:
+            pass
+        return False
     with db_conn() as conn:
         with conn.cursor() as cur:
             try:
@@ -2557,20 +2801,28 @@ def insert_movie(movie: dict):
 def bulk_upsert_books(books: list[dict]):
     if not books:
         return 0
-    values = [
-        (
-            b.get("id"),
-            b.get("book_name"),
-            b.get("display_name"),
-            b.get("file_id"),
-            b.get("file_unique_id"),
-            b.get("path"),
-            bool(b.get("indexed", False)),
+    values = []
+    skipped_adult = 0
+    for b in books:
+        if not b.get("id"):
+            continue
+        if is_book_adult_marked(b):
+            skipped_adult += 1
+            continue
+        values.append(
+            (
+                b.get("id"),
+                b.get("book_name"),
+                b.get("display_name"),
+                b.get("file_id"),
+                b.get("file_unique_id"),
+                b.get("path"),
+                bool(b.get("indexed", False)),
+            )
         )
-        for b in books
-        if b.get("id")
-    ]
     if not values:
+        if skipped_adult:
+            logger.info("bulk_upsert_books: skipped %s adult-marked book rows", skipped_adult)
         return 0
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -2589,6 +2841,8 @@ def bulk_upsert_books(books: list[dict]):
                 """,
                 values,
             )
+    if skipped_adult:
+        logger.info("bulk_upsert_books: upserted %s rows, skipped %s adult-marked rows", len(values), skipped_adult)
     return len(values)
 
 

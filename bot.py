@@ -74,6 +74,7 @@ from config import (
     COIN_REFERRAL,
     TOP_USERS_LIMIT,
     UPLOAD_CHANNEL_IDS,
+    AUDIO_UPLOAD_CHANNEL_IDS,
     AUDIO_UPLOAD_CHANNEL_ID,
     VIDEO_UPLOAD_CHANNEL_IDS,
     VIDEO_UPLOAD_CHANNEL_ID,
@@ -373,6 +374,7 @@ _BRIDGE_DB_SYMBOLS = (
 _SEARCH_FLOW_DEP_KEYS = (
     "MESSAGES",
     "AUDIT_CACHE_TTL",
+    "AUDIO_UPLOAD_CHANNEL_IDS",
     "AUDIO_UPLOAD_CHANNEL_ID",
     "ApplicationHandlerStop",
     "DB_RETRY_ATTEMPTS",
@@ -2783,39 +2785,68 @@ async def set_bot_commands(application):
     )
 
 
+BOT_DESCRIPTION_LONG = (
+    "📚 Smart AI Tools Bot\n"
+    "📖 Kitoblarni qidiring va yuklab oling.\n"
+    "🎧 Audio kitoblarni toping va tinglang.\n"
+    "\n"
+    "📚 Smart AI Tools Bot\n"
+    "📖 Search and download books.\n"
+    "🎧 Find and listen to audiobooks.\n"
+    "\n"
+    "👤 Owned and managed by @MuhammadaliAbdullayev"
+)
+
+BOT_SHORT_DESCRIPTION = "UZ/EN: Kitob va audio kitoblar | Books and audiobooks"
+
+# Clears stale per-language profile texts that may have been set manually in BotFather.
+# You can override this list at runtime with BOT_PROFILE_CLEAR_LANGUAGE_CODES (comma-separated).
+BOT_PROFILE_TEXT_CLEANUP_LOCALES = (
+    "ar",
+    "de",
+    "en-gb",
+    "en-us",
+    "es",
+    "es-419",
+    "fa",
+    "fr",
+    "id",
+    "it",
+    "ja",
+    "ko",
+    "kk",
+    "ms",
+    "pt",
+    "pt-br",
+    "th",
+    "tr",
+    "uk",
+    "uz-cyrl",
+    "vi",
+    "zh-cn",
+    "zh-hans",
+    "zh-hant",
+    "zh-tw",
+)
+
+
 BOT_PROFILE_TEXTS = {
     # Default fallback when Telegram language is not matched
     "default": {
-        "description": (
-            "📚 SmartAIToolsBot — books, audiobooks, and AI tools in one place.\n"
-            "🔎 Fast search, ⬇️ easy downloads, 🎧 quick listening.\n"
-            "👤 Owned and managed by @MuhammadaliAbdullayev"
-        ),
-        "about": "📚 Books + AI tools | 👤 @MuhammadaliAbdullayev",
+        "description": BOT_DESCRIPTION_LONG,
+        "about": BOT_SHORT_DESCRIPTION,
     },
     "en": {
-        "description": (
-            "📚 SmartAIToolsBot — books, audiobooks, and AI tools in one place.\n"
-            "🔎 Fast search, ⬇️ easy downloads, 🎧 quick listening.\n"
-            "👤 Owned and managed by @MuhammadaliAbdullayev"
-        ),
-        "about": "📚 Books + AI tools | 👤 @MuhammadaliAbdullayev",
+        "description": BOT_DESCRIPTION_LONG,
+        "about": BOT_SHORT_DESCRIPTION,
     },
     "uz": {
-        "description": (
-            "📚 SmartAIToolsBot — kitoblar, audiokitoblar va AI vositalar bir joyda.\n"
-            "🔎 Tez qidiruv, ⬇️ qulay yuklab olish, 🎧 tinglash.\n"
-            "👤 Owned and managed by @MuhammadaliAbdullayev"
-        ),
-        "about": "📚 Kitob + AI vositalar | 👤 @MuhammadaliAbdullayev",
+        "description": BOT_DESCRIPTION_LONG,
+        "about": BOT_SHORT_DESCRIPTION,
     },
     "ru": {
-        "description": (
-            "📚 SmartAIToolsBot — книги, аудиокниги и AI-инструменты в одном месте.\n"
-            "🔎 Быстрый поиск, ⬇️ удобные загрузки, 🎧 прослушивание.\n"
-            "👤 Owned and managed by @MuhammadaliAbdullayev"
-        ),
-        "about": "📚 Книги + AI | 👤 @MuhammadaliAbdullayev",
+        "description": BOT_DESCRIPTION_LONG,
+        "about": BOT_SHORT_DESCRIPTION,
     },
 }
 
@@ -2825,8 +2856,30 @@ def _clip_text(value: str, limit: int) -> str:
     return text[:limit] if len(text) > limit else text
 
 
+def _parse_lang_codes_csv(value: str) -> set[str]:
+    out: set[str] = set()
+    for raw in str(value or "").split(","):
+        code = raw.strip().lower()
+        if code:
+            out.add(code)
+    return out
+
+
 async def set_bot_profile_texts(application):
     bot = application.bot
+    supported_langs = {str(k).lower() for k in BOT_PROFILE_TEXTS.keys() if k != "default"}
+    cleanup_langs = _parse_lang_codes_csv(os.getenv("BOT_PROFILE_CLEAR_LANGUAGE_CODES", ""))
+    if not cleanup_langs:
+        cleanup_langs = {str(k).lower() for k in BOT_PROFILE_TEXT_CLEANUP_LOCALES}
+    cleanup_langs -= supported_langs
+
+    for lang_code in sorted(cleanup_langs):
+        try:
+            await bot.set_my_description(description="", language_code=lang_code)
+            await bot.set_my_short_description(short_description="", language_code=lang_code)
+        except Exception as e:
+            logger.debug("Profile text cleanup skipped for lang=%s: %s", lang_code, e)
+
     default_payload = BOT_PROFILE_TEXTS.get("default", BOT_PROFILE_TEXTS.get("en", {}))
     default_desc = _clip_text(default_payload.get("description", ""), 512)
     default_about = _clip_text(default_payload.get("about", ""), 120)
@@ -5912,10 +5965,13 @@ def main():
         video_channels_for_log = list(VIDEO_UPLOAD_CHANNEL_IDS or [])
         if not video_channels_for_log and VIDEO_UPLOAD_CHANNEL_ID:
             video_channels_for_log = [VIDEO_UPLOAD_CHANNEL_ID]
+        audio_channels_for_log = list(AUDIO_UPLOAD_CHANNEL_IDS or [])
+        if not audio_channels_for_log and AUDIO_UPLOAD_CHANNEL_ID:
+            audio_channels_for_log = [AUDIO_UPLOAD_CHANNEL_ID]
         logger.info(
             "Upload channels: books=%s audio=%s video=%s",
             ",".join(str(x) for x in (UPLOAD_CHANNEL_IDS or [])) or "none",
-            AUDIO_UPLOAD_CHANNEL_ID,
+            ",".join(str(x) for x in audio_channels_for_log) or "none",
             ",".join(str(x) for x in video_channels_for_log) or "none",
         )
 

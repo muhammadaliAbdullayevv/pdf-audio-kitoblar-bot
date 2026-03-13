@@ -105,6 +105,62 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+_BOOK_ADULT_FILTER_PATTERNS = (
+    re.compile(r"(?<!\d)18\s*\+"),
+    re.compile(r"\b18\s*yosh\b"),
+    re.compile(r"\b18\s*plus\b"),
+    re.compile(r"\badult\b"),
+    re.compile(r"\bnsfw\b"),
+    re.compile(r"\bporn\w*\b"),
+    re.compile(r"\berot\w*\b"),
+    re.compile(r"\bsex\b"),
+    re.compile(r"\bseks\b"),
+    re.compile(r"\bxxx\b"),
+    re.compile(r"\bhentai\b"),
+    re.compile(r"\bonlyfans\b"),
+    re.compile(r"\bэрот\w*\b"),
+    re.compile(r"\bпорн\w*\b"),
+    re.compile(r"\bсекс\w*\b"),
+    re.compile(r"\bjinsiy\b"),
+    re.compile(r"\bvoyaga\s+yetgan\w*\b"),
+)
+
+
+def _extra_book_adult_keywords() -> list[str]:
+    raw = str(os.getenv("BOOK_ADULT_FILTER_KEYWORDS", "") or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw.split(","):
+        token = str(item or "").strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def _book_filter_haystack(*parts: Any) -> str:
+    base = " ".join(str(p or "") for p in parts).lower()
+    base = re.sub(r"[\s_\-./|\\:;,(){}\[\]<>]+", " ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return base
+
+
+def _book_has_adult_markers(*parts: Any) -> bool:
+    haystack = _book_filter_haystack(*parts)
+    if not haystack:
+        return False
+    for pattern in _BOOK_ADULT_FILTER_PATTERNS:
+        if pattern.search(haystack):
+            return True
+    for token in _extra_book_adult_keywords():
+        if token in haystack:
+            return True
+    return False
+
+
 def _coerce_int_id_list(raw: Any) -> list[int]:
     values: list[Any]
     if raw is None:
@@ -1077,6 +1133,7 @@ async def _process_upload(
     file_name: str,
     lang: str,
     file_unique_id: str | None,
+    caption_text: str | None = None,
     receipt_id: str | None = None,
     uploader_user_id: int | None = None,
 ):
@@ -1090,6 +1147,28 @@ async def _process_upload(
         no_status_edits = _env_bool("UPLOAD_NO_STATUS_EDITS", False)
         book_name, _ = os.path.splitext(file_name)
         cleaned_name = clean_query(book_name)
+        if _book_has_adult_markers(file_name, book_name, cleaned_name, caption_text):
+            logger.info("Book upload skipped by adult filter: file_name=%s", file_name)
+            if receipt_id:
+                try:
+                    await run_blocking(
+                        db_update_upload_receipt,
+                        receipt_id,
+                        status="filtered",
+                        saved_to_db=False,
+                        saved_to_es=False,
+                        error="blocked_by_adult_filter",
+                    )
+                except Exception:
+                    logger.exception("Failed to update upload receipt as filtered")
+            blocked_msg = str(MESSAGES.get(lang, {}).get("upload_adult_filtered", "⚠️ This book was ignored by content filter."))
+            if status_msg:
+                await _send_status_with_retry(
+                    status_msg,
+                    f"{blocked_msg} {file_name}",
+                    reply_only=no_status_edits,
+                )
+            return
         # prevent duplicates - prioritize file_unique_id over name for accuracy
         existing = await run_blocking(db_find_duplicate_book, None, None, file_unique_id)
         logger.info(f"Duplicate check for {file_name}: {'FOUND' if existing else 'NOT FOUND'} (by file_unique_id)")
@@ -1444,6 +1523,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     file_name,
                     lang,
                     file_unique_id,
+                    caption_text=str(getattr(update.message, "caption", "") or ""),
                     receipt_id=receipt_id,
                     uploader_user_id=update.effective_user.id if update.effective_user else None,
                 )

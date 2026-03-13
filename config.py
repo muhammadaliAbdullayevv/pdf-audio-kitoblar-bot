@@ -37,6 +37,8 @@ ADMIN_ID = _env_int("TELEGRAM_ADMIN_ID", 0)
 REQUEST_CHAT_ID = _env_int("REQUEST_CHAT_ID", 0)
 _UPLOAD_CHANNEL_ID_RAW = os.getenv("UPLOAD_CHANNEL_ID", "").strip()
 _UPLOAD_CHANNEL_IDS_RAW = os.getenv("UPLOAD_CHANNEL_IDS", "").strip()
+_AUDIO_UPLOAD_CHANNEL_ID_RAW = os.getenv("AUDIO_UPLOAD_CHANNEL_ID", "").strip()
+_AUDIO_UPLOAD_CHANNEL_IDS_RAW = os.getenv("AUDIO_UPLOAD_CHANNEL_IDS", "").strip()
 _VIDEO_UPLOAD_CHANNEL_ID_RAW = os.getenv("VIDEO_UPLOAD_CHANNEL_ID", "").strip()
 _VIDEO_UPLOAD_CHANNEL_IDS_RAW = os.getenv("VIDEO_UPLOAD_CHANNEL_IDS", "").strip()
 
@@ -59,7 +61,14 @@ if not _ids:
 
 UPLOAD_CHANNEL_IDS = _ids
 UPLOAD_CHANNEL_ID = _ids[0] if _ids else _env_int("UPLOAD_CHANNEL_ID", 0)
-AUDIO_UPLOAD_CHANNEL_ID = _env_int("AUDIO_UPLOAD_CHANNEL_ID", 0)
+
+_audio_ids = _parse_id_list(_AUDIO_UPLOAD_CHANNEL_IDS_RAW)
+if not _audio_ids:
+    # Allow comma-separated IDs in AUDIO_UPLOAD_CHANNEL_ID as well.
+    _audio_ids = _parse_id_list(_AUDIO_UPLOAD_CHANNEL_ID_RAW)
+
+AUDIO_UPLOAD_CHANNEL_IDS = _audio_ids
+AUDIO_UPLOAD_CHANNEL_ID = _audio_ids[0] if _audio_ids else _env_int("AUDIO_UPLOAD_CHANNEL_ID", 0)
 
 _video_ids = _parse_id_list(_VIDEO_UPLOAD_CHANNEL_IDS_RAW)
 if not _video_ids:

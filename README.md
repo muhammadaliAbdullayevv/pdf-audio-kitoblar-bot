@@ -40,7 +40,7 @@ graph TD
 - Single instance protection:
   - A lock file is used to avoid duplicate long-polling instances.
 - Production orchestration:
-  - `SmartAIToolsBot-stack.target` runs both local Bot API and bot service together.
+  - `SmartAIToolsBot-stack.target` runs local Bot API, main bot, and dashboard service together.
 
 ### 1.3 Core backend services
 
@@ -438,6 +438,7 @@ PostgreSQL remains source of truth; ES is derivative and rebuildable.
 - `REQUEST_CHAT_ID`
 - `UPLOAD_CHANNEL_ID`
 - `UPLOAD_CHANNEL_IDS` (comma-separated)
+- `AUDIO_UPLOAD_CHANNEL_IDS` (comma-separated, recommended for round-robin audiobook storage)
 - `AUDIO_UPLOAD_CHANNEL_ID`
 - `VIDEO_UPLOAD_CHANNEL_IDS` (comma-separated, recommended for round-robin movie storage)
 - `VIDEO_UPLOAD_CHANNEL_ID`
@@ -482,10 +483,20 @@ PostgreSQL remains source of truth; ES is derivative and rebuildable.
 - `AI_CHAT_OLLAMA_MODEL`
 - `AI_CHAT_OLLAMA_TIMEOUT`
 - `AI_TOOLS_OLLAMA_TIMEOUT`
+- `AI_MUSIC_BACKEND` (`auto`, `musicgen`, `synth`)
+- `AI_MUSIC_MODEL` (e.g., `facebook/musicgen-small`)
+- `AI_MUSIC_DEVICE` (`auto`, `cpu`, `cuda`)
+- `AI_MUSIC_ALLOW_SYNTH_FALLBACK` (`0`/`1`)
+- `AI_MUSIC_TEMPERATURE`
+- `AI_MUSIC_TOP_K`
+- `AI_MUSIC_CFG_COEF`
 - `TTS_OLLAMA_MODEL`
 - `TTS_OLLAMA_TIMEOUT`
 - `PDF_MAKER_OLLAMA_MODEL`
 - `PDF_MAKER_OLLAMA_TIMEOUT`
+
+For prompt-based MusicGen backend, install optional dependency in your bot venv:
+`pip install audiocraft`
 
 ## 12.8 AI translator (NLLB / hybrid)
 
@@ -543,6 +554,7 @@ Recommended services:
 
 - `SmartAIToolsBot.service` (local Telegram Bot API)
 - `SmartAIToolsBot-bot.service` (main bot)
+- `SmartAIToolsBot-dashboard.service` (local web dashboard)
 - `SmartAIToolsBot-stack.target` (full stack target)
 
 Common commands:
@@ -550,8 +562,8 @@ Common commands:
 ```bash
 sudo systemctl enable --now SmartAIToolsBot-stack.target
 sudo systemctl restart SmartAIToolsBot-stack.target
-sudo systemctl status SmartAIToolsBot-stack.target SmartAIToolsBot.service SmartAIToolsBot-bot.service --no-pager
-sudo journalctl -fu SmartAIToolsBot.service -fu SmartAIToolsBot-bot.service -l
+sudo systemctl status SmartAIToolsBot-stack.target SmartAIToolsBot.service SmartAIToolsBot-bot.service SmartAIToolsBot-dashboard.service --no-pager
+sudo journalctl -fu SmartAIToolsBot.service -fu SmartAIToolsBot-bot.service -fu SmartAIToolsBot-dashboard.service -l
 ```
 
 Wi-Fi dispatcher integration:
@@ -573,7 +585,7 @@ sudo journalctl -u SmartAIToolsBot-bot.service -f -o short-precise
 Stack logs:
 
 ```bash
-sudo journalctl -fu SmartAIToolsBot.service -fu SmartAIToolsBot-bot.service -l
+sudo journalctl -fu SmartAIToolsBot.service -fu SmartAIToolsBot-bot.service -fu SmartAIToolsBot-dashboard.service -l
 ```
 
 Quick command scope sanity check (admin/private/group):
@@ -612,7 +624,7 @@ sudo systemctl cat SmartAIToolsBot-bot.service
 ### 16.3 Unit is masked
 
 ```bash
-sudo systemctl unmask SmartAIToolsBot.service SmartAIToolsBot-bot.service
+sudo systemctl unmask SmartAIToolsBot.service SmartAIToolsBot-bot.service SmartAIToolsBot-dashboard.service
 sudo systemctl daemon-reload
 sudo systemctl restart SmartAIToolsBot-stack.target
 ```

@@ -400,6 +400,72 @@ def _get_audio_channel_send_guard(context: ContextTypes.DEFAULT_TYPE, channel_id
     return lock, state
 
 
+def _coerce_int_id_list(raw: Any) -> list[int]:
+    values: list[Any]
+    if raw is None:
+        values = []
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = str(raw).split(",")
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in values:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            value = int(text)
+        except Exception:
+            continue
+        if value == 0 or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _resolve_audio_upload_channel_ids() -> list[int]:
+    # Preferred: AUDIO_UPLOAD_CHANNEL_IDS (list/comma-separated),
+    # with AUDIO_UPLOAD_CHANNEL_ID kept as backward-compatible fallback.
+    ids = _coerce_int_id_list(globals().get("AUDIO_UPLOAD_CHANNEL_IDS"))
+    if ids:
+        return ids
+    ids = _coerce_int_id_list(os.getenv("AUDIO_UPLOAD_CHANNEL_IDS", ""))
+    if ids:
+        return ids
+    ids = _coerce_int_id_list([globals().get("AUDIO_UPLOAD_CHANNEL_ID")])
+    if ids:
+        return ids
+    return _coerce_int_id_list([os.getenv("AUDIO_UPLOAD_CHANNEL_ID", "")])
+
+
+async def _pick_audio_upload_channel_id(
+    context: ContextTypes.DEFAULT_TYPE,
+    channel_ids: list[int] | None = None,
+) -> int | None:
+    ids = list(channel_ids or _resolve_audio_upload_channel_ids())
+    if not ids:
+        return None
+
+    app = getattr(context, "application", None)
+    if app is None:
+        return ids[0]
+
+    data = app.bot_data
+    lock = data.get("audio_upload_channel_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        data["audio_upload_channel_lock"] = lock
+
+    async with lock:
+        idx = int(data.get("audio_upload_channel_index", 0) or 0)
+        channel_id = ids[idx % len(ids)]
+        data["audio_upload_channel_index"] = idx + 1
+        return channel_id
+
+
 async def _can_show_delete_button(update: Update, user_id: int | None) -> bool:
     if not user_id:
         return False
@@ -1326,16 +1392,14 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
         raise ApplicationHandlerStop()
 
-    # Optional: persist audiobook media in a dedicated channel and use that message media file_id.
-    # Fall back to env lookup in case globals were not yet refreshed.
-    audio_channel_id = int(
-        globals().get("AUDIO_UPLOAD_CHANNEL_ID")
-        or os.getenv("AUDIO_UPLOAD_CHANNEL_ID", "0")
-        or "0"
-    )
+    # Optional: persist audiobook media in dedicated channels and use that message media file_id.
+    # If multiple channels are configured, pick one in round-robin.
+    audio_channel_ids = _resolve_audio_upload_channel_ids()
+    audio_channel_id = await _pick_audio_upload_channel_id(context, audio_channel_ids)
     if audio_channel_id:
         logger.info(
-            "Audiobook channel storage enabled: channel=%s audiobook=%s part_index=%s",
+            "Audiobook channel storage enabled: channels=%s selected=%s audiobook=%s part_index=%s",
+            ",".join(str(x) for x in (audio_channel_ids or [])) or str(audio_channel_id),
             audio_channel_id,
             audio_book_id,
             part_index,
@@ -1452,7 +1516,7 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     else:
         logger.info(
-            "Audiobook channel storage disabled (AUDIO_UPLOAD_CHANNEL_ID is 0). audiobook=%s part_index=%s",
+            "Audiobook channel storage disabled (AUDIO_UPLOAD_CHANNEL_IDS/AUDIO_UPLOAD_CHANNEL_ID is empty). audiobook=%s part_index=%s",
             audio_book_id,
             part_index,
         )
@@ -2330,6 +2394,8 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await _run_db_retry(increment_analytics, "searches", 1)
                     await _run_db_retry(increment_user_analytics, user_id, "searches", 1)
+                    await _run_db_retry(increment_analytics, "movie_searches", 1)
+                    await _run_db_retry(increment_user_analytics, user_id, "movie_searches", 1)
                     await _run_db_retry(db_increment_counter, "search_total", 1)
                     await _run_db_retry(db_increment_counter, "movie_search_total", 1)
                 except Exception as e:
@@ -2968,6 +3034,8 @@ async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_T
                 try:
                     await _run_db_retry(increment_analytics, "buttons", 1)
                     await _run_db_retry(increment_user_analytics, query.from_user.id, "buttons", 1)
+                    await _run_db_retry(increment_analytics, "movie_downloads", 1)
+                    await _run_db_retry(increment_user_analytics, query.from_user.id, "movie_downloads", 1)
                     await _run_db_retry(db_increment_counter, "download_total", 1)
                     await _run_db_retry(db_increment_counter, "movie_download_total", 1)
                 except Exception as e:
