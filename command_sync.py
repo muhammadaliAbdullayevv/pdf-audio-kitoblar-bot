@@ -122,24 +122,8 @@ def get_group_commands(lang: str = "en") -> list[BotCommand]:
 
 
 def get_group_admin_commands(lang: str = "en") -> list[BotCommand]:
-    localized = {
-        "en": [
-            BotCommand("group_read_start", "📘 Start group reading"),
-            BotCommand("group_read_status", "📊 Group reading status"),
-            BotCommand("group_read_end", "✅ End group reading"),
-        ],
-        "ru": [
-            BotCommand("group_read_start", "📘 Начать групповое чтение"),
-            BotCommand("group_read_status", "📊 Статус группового чтения"),
-            BotCommand("group_read_end", "✅ Завершить групповое чтение"),
-        ],
-        "uz": [
-            BotCommand("group_read_start", "📘 Guruhda o‘qishni boshlash"),
-            BotCommand("group_read_status", "📊 Guruh o‘qish holati"),
-            BotCommand("group_read_end", "✅ Guruh o‘qishni yakunlash"),
-        ],
-    }
-    return localized.get(lang, localized["en"])
+    del lang
+    return []
 
 
 def get_admin_commands(lang: str = "en") -> list[BotCommand]:

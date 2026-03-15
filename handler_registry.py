@@ -61,7 +61,6 @@ REQUIRED_DEP_KEYS = (
     "handle_user_select_callback",
     "handle_user_action_callback",
     "handle_request_callback",
-    "handle_group_read_callback",
     "broadcast_command_wrapper",
     "admin_panel_command",
     "smoke_command_wrapper",
@@ -75,9 +74,6 @@ REQUIRED_DEP_KEYS = (
     "my_quiz_command",
     "mystats_command",
     "myprofile_command",
-    "group_read_start_command",
-    "group_read_status_command",
-    "group_read_end_command",
     "inlinequery",
     "audit_command",
     "prune_command",
@@ -165,7 +161,6 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["handle_user_select_callback"], pattern="^user:"))
     app.add_handler(CallbackQueryHandler(d["handle_user_action_callback"], pattern="^uact:"))
     app.add_handler(CallbackQueryHandler(d["handle_request_callback"], pattern="^request:"))
-    app.add_handler(CallbackQueryHandler(d["handle_group_read_callback"], pattern="^gread:"))
     app.add_handler(CommandHandler("broadcast", d["broadcast_command_wrapper"]))
     app.add_handler(CommandHandler("admin", d["admin_panel_command"]))
     app.add_handler(CommandHandler("smoke", d["smoke_command_wrapper"]))
@@ -179,9 +174,6 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CommandHandler("my_quiz", d["my_quiz_command"]))
     app.add_handler(CommandHandler("mystats", d["mystats_command"]))
     app.add_handler(CommandHandler("myprofile", d["myprofile_command"]))
-    app.add_handler(CommandHandler("group_read_start", d["group_read_start_command"]))
-    app.add_handler(CommandHandler("group_read_status", d["group_read_status_command"]))
-    app.add_handler(CommandHandler("group_read_end", d["group_read_end_command"]))
     app.add_handler(InlineQueryHandler(d["inlinequery"]))
     app.add_handler(CommandHandler("audit", d["audit_command"]))
     app.add_handler(CommandHandler("prune", d["prune_command"]))
