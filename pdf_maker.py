@@ -890,7 +890,7 @@ def _pdf_maker_heuristic_auto_meta(text: str) -> dict:
         subtitle = " ".join(lines[1:3])[:120]
     elif lines:
         subtitle = (lines[0][:120] if len(lines[0]) > 25 else "")
-    if any(k in t for k in ["dua", "duosi", "ramazon", "iftor", "sahar", "saharlik"]):
+    if any(k in t for k in ["dua", "duosi"]):
         return {"style": "formal", "icon": "🕌", "accent_rgb": [0.78, 0.64, 0.35], "show_border": True, "subtitle": subtitle}
     if bullet_count >= 3:
         return {"style": "clean", "icon": "📝", "accent_rgb": [0.22, 0.43, 0.65], "show_border": True, "subtitle": subtitle}

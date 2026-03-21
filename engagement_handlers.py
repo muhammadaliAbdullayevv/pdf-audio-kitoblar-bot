@@ -159,14 +159,17 @@ async def _can_show_delete_button(update: Update, user_id: int | None) -> bool:
         msg = getattr(cb, "message", None) or getattr(update, "effective_message", None)
         chat_type = str(getattr(getattr(msg, "chat", None), "type", "") or "").lower()
     if chat_type in {"group", "supergroup"}:
-        owner_fn = globals().get("_is_owner_user")
-        if callable(owner_fn):
-            try:
-                return bool(owner_fn(user_id))
-            except Exception:
-                return False
         return False
     return True
+
+
+def _is_group_chat(update: Update) -> bool:
+    chat_type = str(getattr(update.effective_chat, "type", "") or "").lower()
+    if not chat_type:
+        cb = getattr(update, "callback_query", None)
+        msg = getattr(cb, "message", None) or getattr(update, "effective_message", None)
+        chat_type = str(getattr(getattr(msg, "chat", None), "type", "") or "").lower()
+    return chat_type in {"group", "supergroup"}
 
 
 def _invalidate_top_caches(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -611,12 +614,18 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
             user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
             is_fav_now = await run_blocking(is_favorited, query.from_user.id, book_id)
             can_delete = await _can_show_delete_button(update, query.from_user.id)
+            is_group_chat = _is_group_chat(update)
+            allow_management_buttons = not is_group_chat
             # Check if book has audiobook
             audio_book = await run_blocking(get_audio_book_for_book, book_id)
             has_ab = bool(audio_book)
-            can_add_ab = bool(_is_admin_user(query.from_user.id)) if callable(globals().get("_is_admin_user")) else False
+            can_add_ab = (
+                bool(_is_admin_user(query.from_user.id))
+                if allow_management_buttons and callable(globals().get("_is_admin_user"))
+                else False
+            )
             is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
-            show_listen_btn = has_ab if is_owner_user else True
+            show_listen_btn = has_ab if (is_group_chat or is_owner_user) else True
             ab_request_count = 0
             if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
                 try:
@@ -636,6 +645,7 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     can_add_audiobook=can_add_ab,
                     show_listen_button=show_listen_btn,
                     audiobook_request_count=ab_request_count,
+                    show_personal_state=not is_group_chat,
                 ),
             )
     except Exception:
@@ -711,12 +721,18 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
             user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
             is_fav_now = await run_blocking(is_favorited, query.from_user.id, book_id)
             can_delete = await _can_show_delete_button(update, query.from_user.id)
+            is_group_chat = _is_group_chat(update)
+            allow_management_buttons = not is_group_chat
             # Check if book has audiobook
             audio_book = await run_blocking(get_audio_book_for_book, book_id)
             has_ab = bool(audio_book)
-            can_add_ab = bool(_is_admin_user(query.from_user.id)) if callable(globals().get("_is_admin_user")) else False
+            can_add_ab = (
+                bool(_is_admin_user(query.from_user.id))
+                if allow_management_buttons and callable(globals().get("_is_admin_user"))
+                else False
+            )
             is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
-            show_listen_btn = has_ab if is_owner_user else True
+            show_listen_btn = has_ab if (is_group_chat or is_owner_user) else True
             ab_request_count = 0
             if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
                 try:
@@ -736,6 +752,7 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     can_add_audiobook=can_add_ab,
                     show_listen_button=show_listen_btn,
                     audiobook_request_count=ab_request_count,
+                    show_personal_state=not is_group_chat,
                 ),
             )
         await safe_answer(query)

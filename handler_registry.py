@@ -19,7 +19,6 @@ REQUIRED_DEP_KEYS = (
     "_touch_user_activity_callback",
     "start",
     "upload_command_wrapper",
-    "movie_upload_command",
     "handle_channel_post",
     "handle_photo_message",
     "handle_abook_audio",
@@ -27,7 +26,6 @@ REQUIRED_DEP_KEYS = (
     "handle_file",
     "search_books",
     "language_command_handler",
-    "ramazon_command",
     "pdf_maker_command",
     "pdf_editor_command",
     "text_to_voice_command",
@@ -118,7 +116,6 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["_touch_user_activity_callback"]), group=-1)
     app.add_handler(CommandHandler("start", d["start"]))
     app.add_handler(CommandHandler("upload", d["upload_command_wrapper"]))
-    app.add_handler(CommandHandler("movie_upload", d["movie_upload_command"]))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, d["handle_channel_post"]))
     app.add_handler(MessageHandler(filters.PHOTO, d["handle_photo_message"]))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | (filters.Document.ALL & filters.Document.MimeType("audio/")), d["handle_abook_audio"]))
@@ -127,7 +124,6 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(MessageHandler(filters.Document.ALL, d["handle_file"]))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, d["search_books"]))
     app.add_handler(CommandHandler("language", d["language_command_handler"]))
-    app.add_handler(CommandHandler("ramazon", d["ramazon_command"]))
     app.add_handler(CommandHandler("pdf_maker", d["pdf_maker_command"]))
     app.add_handler(CommandHandler("pdf_editor", d["pdf_editor_command"]))
     app.add_handler(CommandHandler("text_to_voice", d["text_to_voice_command"]))

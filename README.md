@@ -173,7 +173,6 @@ These commands are implemented and available, but intentionally not shown in the
 | `/pdf_editor` | PDF editor session | Public |
 | `/text_to_voice` | TTS wizard | Public |
 | `/sticker_tools` | Sticker tools session | Public |
-| `/ramazon` | Ramadan duas | Public |
 | `/top` | Top books | Public |
 | `/top_users` | Top users | Public |
 | `/mystats` | Personal stats | Public |

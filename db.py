@@ -114,6 +114,21 @@ def _apply_schema_migrations(cur) -> None:
                 "ALTER TABLE analytics_daily_users ADD COLUMN IF NOT EXISTS movie_downloads INTEGER NOT NULL DEFAULT 0;",
             ],
         ),
+        (
+            7,
+            "users: store separate group language preference",
+            [
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS group_language TEXT;",
+            ],
+        ),
+        (
+            8,
+            "movies: remove movie tables after feature deprecation",
+            [
+                "DROP TABLE IF EXISTS movie_reactions;",
+                "DROP TABLE IF EXISTS movies;",
+            ],
+        ),
     ]
     for version, note, stmts in migrations:
         if version in applied:
@@ -227,10 +242,12 @@ def init_db():
                     joined_date DATE,
                     left_date DATE,
                     language TEXT,
+                    group_language TEXT,
                     language_selected BOOLEAN
                 );
                 """
             )
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS group_language TEXT;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS delete_allowed BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stopped BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS coin_adjustment INTEGER NOT NULL DEFAULT 0;")
@@ -270,64 +287,8 @@ def init_db():
             except Exception as e:
                 # In case duplicates already exist, skip to avoid init failure
                 logger.warning("Could not create uniq_books_file_unique_id (skipping): %s", e)
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS movies (
-                    id TEXT PRIMARY KEY,
-                    movie_name TEXT,
-                    display_name TEXT,
-                    file_id TEXT,
-                    file_unique_id TEXT,
-                    path TEXT,
-                    mime_type TEXT,
-                    duration_seconds INTEGER,
-                    file_size BIGINT,
-                    channel_id BIGINT,
-                    channel_message_id BIGINT,
-                    release_year INTEGER,
-                    genre TEXT,
-                    movie_lang TEXT,
-                    country TEXT,
-                    rating TEXT,
-                    caption_text TEXT,
-                    search_text TEXT,
-                    indexed BOOLEAN NOT NULL DEFAULT FALSE,
-                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                    uploaded_by_user_id BIGINT,
-                    upload_source TEXT
-                );
-                """
-            )
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS file_unique_id TEXT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS path TEXT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS mime_type TEXT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS file_size BIGINT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS channel_id BIGINT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS channel_message_id BIGINT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS release_year INTEGER;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS genre TEXT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS movie_lang TEXT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS country TEXT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS rating TEXT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS caption_text TEXT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS search_text TEXT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS indexed BOOLEAN NOT NULL DEFAULT FALSE;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS uploaded_by_user_id BIGINT;")
-            cur.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS upload_source TEXT;")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_name ON movies (movie_name);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_created_at ON movies (created_at DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_channel_msg ON movies (channel_id, channel_message_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_release_year ON movies (release_year);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_genre ON movies (genre);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_lang ON movies (movie_lang);")
-            try:
-                cur.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uniq_movies_file_unique_id ON movies (file_unique_id) WHERE file_unique_id IS NOT NULL;"
-                )
-            except Exception as e:
-                logger.warning("Could not create uniq_movies_file_unique_id (skipping): %s", e)
+            cur.execute("DROP TABLE IF EXISTS movie_reactions;")
+            cur.execute("DROP TABLE IF EXISTS movies;")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS name_meanings (
@@ -412,18 +373,6 @@ def init_db():
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_book_reactions_book ON book_reactions (book_id);")
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS movie_reactions (
-                    movie_id TEXT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    reaction TEXT NOT NULL,
-                    ts TIMESTAMP NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (movie_id, user_id)
-                );
-                """
-            )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_movie_reactions_movie ON movie_reactions (movie_id);")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_favorites (
@@ -782,13 +731,13 @@ def search_users_by_name(query: str, limit: int = 30):
 def upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None,
                 blocked: bool, allowed: bool, joined_date: date | None, left_date: date | None,
                 language: str | None, delete_allowed: bool = False, stopped: bool = False,
-                language_selected: bool | None = None):
+                language_selected: bool | None = None, group_language: str | None = None):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO users (id, username, first_name, last_name, blocked, allowed, joined_date, left_date, language, delete_allowed, stopped, language_selected)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO users (id, username, first_name, last_name, blocked, allowed, joined_date, left_date, language, delete_allowed, stopped, language_selected, group_language)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (id) DO UPDATE SET
                     username=EXCLUDED.username,
                     first_name=EXCLUDED.first_name,
@@ -797,9 +746,11 @@ def upsert_user(user_id: int, username: str | None, first_name: str | None, last
                     allowed=EXCLUDED.allowed,
                     joined_date=EXCLUDED.joined_date,
                     left_date=EXCLUDED.left_date,
-                    language=EXCLUDED.language,
+                    language=COALESCE(EXCLUDED.language, users.language),
                     delete_allowed=EXCLUDED.delete_allowed,
-                    stopped=EXCLUDED.stopped
+                    stopped=EXCLUDED.stopped,
+                    language_selected=COALESCE(EXCLUDED.language_selected, users.language_selected),
+                    group_language=COALESCE(EXCLUDED.group_language, users.group_language)
                 """,
                 (
                     user_id,
@@ -814,6 +765,7 @@ def upsert_user(user_id: int, username: str | None, first_name: str | None, last
                     delete_allowed,
                     stopped,
                     language_selected,
+                    group_language,
                 ),
             )
 
@@ -822,6 +774,12 @@ def update_user_language(user_id: int, lang: str):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET language=%s, language_selected=TRUE WHERE id=%s", (lang, user_id))
+
+
+def update_user_group_language(user_id: int, lang: str):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET group_language=%s WHERE id=%s", (lang, user_id))
 
 
 def update_user_left_date(user_id: int, left_date: date | None):
@@ -1522,8 +1480,7 @@ def backfill_counters_if_empty() -> bool:
 
             cur.execute("SELECT reaction, COUNT(*) FROM book_reactions GROUP BY reaction")
             react_counts = {str(r): int(c or 0) for r, c in cur.fetchall()}
-            cur.execute("SELECT reaction, COUNT(*) FROM movie_reactions GROUP BY reaction")
-            movie_react_counts = {str(r): int(c or 0) for r, c in cur.fetchall()}
+            movie_react_counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
 
             counters = {
                 "search_total": int(search_total or 0),
@@ -1595,7 +1552,6 @@ def get_db_stats():
                 tables = [
                     "users",
                     "books",
-                    "movies",
                     "user_favorites",
                     "user_recents",
                     "analytics_daily",
@@ -1790,98 +1746,33 @@ def get_book_by_file_unique_id(file_unique_id: str):
 
 
 def list_movies(limit: int = 1000):
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM movies ORDER BY created_at DESC LIMIT %s",
-                (max(1, int(limit or 1000)),),
-            )
-            return cur.fetchall()
+    del limit
+    return []
 
 
 def list_unindexed_movies(limit: int = 1000):
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT *
-                FROM movies
-                WHERE indexed = FALSE
-                ORDER BY created_at ASC
-                LIMIT %s
-                """,
-                (max(1, int(limit or 1000)),),
-            )
-            return cur.fetchall()
+    del limit
+    return []
 
 
 def get_movie_by_id(movie_id: str):
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM movies WHERE id=%s", (str(movie_id),))
-            return cur.fetchone()
+    del movie_id
+    return None
 
 
 def get_movie_by_name(movie_name: str):
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM movies WHERE movie_name=%s", (movie_name,))
-            return cur.fetchone()
+    del movie_name
+    return None
 
 
 def get_movie_by_file_unique_id(file_unique_id: str):
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM movies WHERE file_unique_id=%s", (file_unique_id,))
-            return cur.fetchone()
+    del file_unique_id
+    return None
 
 
 def search_movies(query: str, limit: int = 20):
-    q = str(query or "").strip()
-    if not q:
-        return []
-    q_like = f"%{q}%"
-    q_prefix = f"{q}%"
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT *
-                FROM movies
-                WHERE movie_name ILIKE %s
-                   OR display_name ILIKE %s
-                   OR COALESCE(search_text, '') ILIKE %s
-                   OR COALESCE(genre, '') ILIKE %s
-                   OR COALESCE(movie_lang, '') ILIKE %s
-                   OR COALESCE(country, '') ILIKE %s
-                   OR COALESCE(caption_text, '') ILIKE %s
-                   OR CAST(COALESCE(release_year, 0) AS TEXT) ILIKE %s
-                ORDER BY
-                    CASE
-                        WHEN movie_name ILIKE %s THEN 0
-                        WHEN display_name ILIKE %s THEN 1
-                        WHEN COALESCE(search_text, '') ILIKE %s THEN 2
-                        ELSE 3
-                    END,
-                    created_at DESC
-                LIMIT %s
-                """,
-                (
-                    q_like,
-                    q_like,
-                    q_like,
-                    q_like,
-                    q_like,
-                    q_like,
-                    q_like,
-                    q_like,
-                    q_prefix,
-                    q_prefix,
-                    q_prefix,
-                    max(1, int(limit or 20)),
-                ),
-            )
-            return cur.fetchall()
+    del query, limit
+    return []
 
 
 VARIANT_TOKENS = {
@@ -1988,14 +1879,7 @@ def find_duplicate_book(book_name: str | None, path: str | None = None, file_uni
 
 
 def find_duplicate_movie(movie_name: str | None, file_unique_id: str | None = None):
-    if file_unique_id:
-        existing = get_movie_by_file_unique_id(file_unique_id)
-        if existing:
-            return existing
-    if movie_name and not _name_allows_duplicates(movie_name):
-        existing = get_movie_by_name(movie_name)
-        if existing:
-            return existing
+    del movie_name, file_unique_id
     return None
 
 def list_books_missing_file_unique_id(limit: int = 100):
@@ -2303,32 +2187,13 @@ def get_book_reaction_counts(book_id: str) -> dict[str, int]:
 
 
 def set_movie_reaction(user_id: int, movie_id: str, reaction: str):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO movie_reactions (movie_id, user_id, reaction)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (movie_id, user_id) DO UPDATE SET
-                    reaction = EXCLUDED.reaction,
-                    ts = NOW()
-                """,
-                (movie_id, user_id, reaction),
-            )
+    del user_id, movie_id, reaction
+    return None
 
 
 def get_movie_reaction_counts(movie_id: str) -> dict[str, int]:
-    counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT reaction, COUNT(*) FROM movie_reactions WHERE movie_id=%s GROUP BY reaction",
-                (movie_id,),
-            )
-            for reaction, count in cur.fetchall():
-                if reaction in counts:
-                    counts[reaction] = int(count)
-    return counts
+    del movie_id
+    return {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
 
 
 def get_book_favorite_count(book_id: str) -> int:
@@ -2520,14 +2385,7 @@ def get_reaction_totals() -> dict[str, int]:
 
 
 def get_movie_reaction_totals() -> dict[str, int]:
-    counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT reaction, COUNT(*) FROM movie_reactions GROUP BY reaction")
-            for reaction, count in cur.fetchall():
-                if reaction in counts:
-                    counts[reaction] = int(count or 0)
-    return counts
+    return {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
 
 
 def get_user_reaction(book_id: str, user_id: int) -> str | None:
@@ -2542,14 +2400,8 @@ def get_user_reaction(book_id: str, user_id: int) -> str | None:
 
 
 def get_user_movie_reaction(movie_id: str, user_id: int) -> str | None:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT reaction FROM movie_reactions WHERE movie_id=%s AND user_id=%s",
-                (movie_id, user_id),
-            )
-            row = cur.fetchone()
-            return row[0] if row else None
+    del movie_id, user_id
+    return None
 
 
 def award_reaction_action(user_id: int, book_id: str) -> bool:
@@ -2733,69 +2585,8 @@ def insert_book(book: dict):
 
 
 def insert_movie(movie: dict):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO movies (
-                        id, movie_name, display_name, file_id, file_unique_id, path,
-                        mime_type, duration_seconds, file_size, channel_id, channel_message_id,
-                        release_year, genre, movie_lang, country, rating, caption_text, search_text,
-                        indexed,
-                        uploaded_by_user_id, upload_source
-                    )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        movie_name=EXCLUDED.movie_name,
-                        display_name=EXCLUDED.display_name,
-                        file_id=EXCLUDED.file_id,
-                        file_unique_id=EXCLUDED.file_unique_id,
-                        path=EXCLUDED.path,
-                        mime_type=EXCLUDED.mime_type,
-                        duration_seconds=EXCLUDED.duration_seconds,
-                        file_size=EXCLUDED.file_size,
-                        channel_id=EXCLUDED.channel_id,
-                        channel_message_id=EXCLUDED.channel_message_id,
-                        release_year=EXCLUDED.release_year,
-                        genre=EXCLUDED.genre,
-                        movie_lang=EXCLUDED.movie_lang,
-                        country=EXCLUDED.country,
-                        rating=EXCLUDED.rating,
-                        caption_text=EXCLUDED.caption_text,
-                        search_text=EXCLUDED.search_text,
-                        indexed=EXCLUDED.indexed,
-                        uploaded_by_user_id=EXCLUDED.uploaded_by_user_id,
-                        upload_source=EXCLUDED.upload_source
-                    """,
-                    (
-                        movie.get("id"),
-                        movie.get("movie_name"),
-                        movie.get("display_name"),
-                        movie.get("file_id"),
-                        movie.get("file_unique_id"),
-                        movie.get("path"),
-                        movie.get("mime_type"),
-                        movie.get("duration_seconds"),
-                        movie.get("file_size"),
-                        movie.get("channel_id"),
-                        movie.get("channel_message_id"),
-                        movie.get("release_year"),
-                        movie.get("genre"),
-                        movie.get("movie_lang"),
-                        movie.get("country"),
-                        movie.get("rating"),
-                        movie.get("caption_text"),
-                        movie.get("search_text"),
-                        bool(movie.get("indexed", False)),
-                        movie.get("uploaded_by_user_id"),
-                        movie.get("upload_source"),
-                    ),
-                )
-                return True
-            except psycopg2.errors.UniqueViolation:
-                conn.rollback()
-                return False
+    del movie
+    return False
 
 
 def bulk_upsert_books(books: list[dict]):
@@ -2869,10 +2660,8 @@ def update_book_indexed(book_id: str, indexed: bool):
 
 
 def update_movie_indexed(movie_id: str, indexed: bool):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE movies SET indexed=%s WHERE id=%s", (indexed, movie_id))
-            return cur.rowcount
+    del movie_id, indexed
+    return 0
 
 
 def update_book_upload_meta(book_id: str, uploaded_by_user_id: int | None = None, upload_source: str | None = None):

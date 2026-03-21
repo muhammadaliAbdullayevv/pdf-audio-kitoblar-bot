@@ -53,7 +53,7 @@ _CONFIG_REQUIRED_KEYS = (
 
 _UPLOAD_MODE_KEY = "upload_mode_state"
 _UPLOAD_MODE_BOOK = "book"
-_UPLOAD_MODE_MOVIE = "movie"
+_UPLOAD_MODE_MOVIE = "movie_removed"
 
 
 def configure(deps: dict[str, Any]) -> None:
@@ -81,7 +81,7 @@ def _get_user_upload_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
         mode = str(context.user_data.get(_UPLOAD_MODE_KEY) or "").strip().lower()
     except Exception:
         mode = ""
-    if mode in {_UPLOAD_MODE_BOOK, _UPLOAD_MODE_MOVIE}:
+    if mode in {_UPLOAD_MODE_BOOK}:
         return mode
     return ""
 
@@ -753,46 +753,11 @@ def _movie_media_payload_from_message(msg) -> dict | None:
 
 
 async def movie_upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global upload_mode, movie_upload_mode
-    try:
-        lang = ensure_user_language(update, context)
-        if is_blocked(update.effective_user.id):
-            await update.message.reply_text(MESSAGES[lang]["blocked"])
-            return
-        if update.effective_user and await is_stopped_user(update.effective_user.id):
-            return
-        limited, wait_s = spam_check_message(update, context)
-        if limited:
-            await update.message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
-            return
-        await update_user_info(update, context)
-        if is_allowed(update.effective_user.id):
-            _set_user_upload_mode(context, _UPLOAD_MODE_MOVIE)
-            upload_mode = False
-            movie_upload_mode = True
-            await update.message.reply_text(
-                MESSAGES[lang].get("movie_upload_activated", "🎬 Movie upload mode activated. Send video files.")
-            )
-        else:
-            await update.message.reply_text(MESSAGES[lang]["not_authorized"])
-            keyboard = InlineKeyboardMarkup(
-                [[
-                    InlineKeyboardButton(MESSAGES[lang]["answer_yes"], callback_data="upload_help_movie_yes"),
-                    InlineKeyboardButton(MESSAGES[lang]["answer_no"], callback_data="upload_help_movie_no")
-                ]]
-            )
-            await update.message.reply_text(
-                MESSAGES[lang].get(
-                    "movie_upload_help_prompt",
-                    MESSAGES[lang].get("upload_help_prompt", "🎬 Do you want to add movies to the bot database?"),
-                ),
-                reply_markup=keyboard,
-            )
-    except Exception as e:
-        logger.error(f"/movie_upload failed: {e}")
-        lang = ensure_user_language(update, context)
-        await update.message.reply_text(MESSAGES[lang]["error"])
-        raise
+    lang = ensure_user_language(update, context)
+    await safe_reply(
+        update,
+        MESSAGES[lang].get("movie_feature_removed", "🎬 Movie feature has been removed. Please use book search instead."),
+    )
 
 
 async def _process_movie_upload(
@@ -1628,62 +1593,6 @@ def sync_unindexed_books():
 
 
 def sync_unindexed_movies():
-    """
-    Scan DB for movie entries with indexed=FALSE and push them into Elasticsearch.
-    """
-    if not es_available():
-        logger.error("Elasticsearch not available, skipping movie sync.")
-        return
-
-    try:
-        logger.info("🔄 Syncing unindexed movies to Elasticsearch...")
-        ensure_movies_index()
-        list_fn = globals().get("db_list_unindexed_movies")
-        if not callable(list_fn):
-            logger.error("db_list_unindexed_movies is unavailable; skipping movie sync.")
-            return
-
-        limit = max(1, _env_int("MOVIES_SYNC_BATCH_SIZE", 50000))
-        movies = list_fn(limit=limit) or []
-        count = 0
-
-        for movie in movies:
-            if movie.get("indexed", False):
-                continue
-            movie_id = str(movie.get("id") or "").strip()
-            if not movie_id:
-                continue
-            movie_name = movie.get("movie_name") or movie.get("display_name")
-            if not movie_name:
-                continue
-            out_id = index_movie(
-                movie_name,
-                file_id=movie.get("file_id"),
-                path=movie.get("path"),
-                movie_id=movie_id,
-                display_name=movie.get("display_name") or movie_name,
-                file_unique_id=movie.get("file_unique_id"),
-                mime_type=movie.get("mime_type"),
-                duration_seconds=movie.get("duration_seconds"),
-                file_size=movie.get("file_size"),
-                channel_id=movie.get("channel_id"),
-                channel_message_id=movie.get("channel_message_id"),
-                release_year=movie.get("release_year"),
-                genre=movie.get("genre"),
-                movie_lang=movie.get("movie_lang"),
-                country=movie.get("country"),
-                rating=movie.get("rating"),
-                caption_text=movie.get("caption_text"),
-                search_text=movie.get("search_text"),
-                indexed=True,
-                refresh="false",
-            )
-            if out_id:
-                update_movie_indexed(movie_id, True)
-                count += 1
-
-        logger.info(f"✅ Synced {count} previously unindexed movies into Elasticsearch.")
-    except Exception as e:
-        logger.error(f"Movie sync failed: {e}", exc_info=True)
+    logger.debug("Movie sync skipped: movie feature removed.")
         
 # --- Audit command ---

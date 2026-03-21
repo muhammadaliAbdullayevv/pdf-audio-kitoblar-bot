@@ -82,10 +82,10 @@ def build_help_text(
         notes_title = "ℹ️ Eslatma"
         main_lines = [
             f"{m.get('menu_search_books', '🔎 Kitob qidirish')} — kitob nomini yuborib qidiring.",
-            f"{m.get('menu_search_movies', '🎬 Kino qidirish')} — kino nomini yuborib qidiring.",
+            f"{m.get('menu_top_books', '🔥 Top kitoblar')} — eng mashhur kitoblar.",
             f"{m.get('menu_ai_tools', '🤖 AI vositalar')} — AI yordamchi bo‘limlari.",
+            f"{m.get('menu_video_downloader', '⬇️ Insta Youtub')} — video yuklab olish bo‘limi.",
             f"{m.get('menu_text_to_voice', '🎙️ Matndan ovoz')} — matndan audio yarating.",
-            f"{m.get('menu_ramadan_duas', '🌙 Ramazon duolari')} — Ramazon duolari bo‘limi.",
         ]
         ai_lines = [
             f"{m.get('menu_ai_chat', '💬 AI bilan chat')} — savollarga javob.",
@@ -99,8 +99,7 @@ def build_help_text(
             f"{m.get('menu_ai_song', '🎤 AI qo‘shiq generator')} — mavzu yoki kalit so‘zlardan qo‘shiq matni yozadi.",
         ]
         other_lines = [
-            f"{m.get('menu_top_books', '🔥 Top kitoblar')} — eng mashhur kitoblar.",
-            "⌨️ /upload va /movie_upload — yuklash buyruqlari (admin).",
+            "⌨️ /upload — yuklash buyrug‘i (admin).",
             f"{m.get('menu_pdf_editor', '🧰 PDF muharriri')} — PDF siqish, OCR, TXT/EPUB va suv belgisi.",
             f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — voice/mp3 format o‘zgartirish, kesish va nomini o‘zgartirish.",
             f"{m.get('menu_sticker_tools', '🧩 Sticker Tools')} — rasm/video dan sticker tayyorlash.",
@@ -122,10 +121,10 @@ def build_help_text(
         notes_title = "ℹ️ Примечание"
         main_lines = [
             f"{m.get('menu_search_books', '🔎 Поиск книг')} — отправьте название книги для поиска.",
-            f"{m.get('menu_search_movies', '🎬 Поиск фильмов')} — отправьте название фильма для поиска.",
+            f"{m.get('menu_top_books', '🔥 Топ книг')} — самые популярные книги.",
             f"{m.get('menu_ai_tools', '🤖 AI инструменты')} — раздел AI-помощников.",
+            f"{m.get('menu_video_downloader', '⬇️ Insta Youtub')} — раздел загрузки видео.",
             f"{m.get('menu_text_to_voice', '🎙️ Текст в голос')} — преобразование текста в аудио.",
-            f"{m.get('menu_ramadan_duas', '🌙 Дуa Рамадана')} — раздел с дуа.",
         ]
         ai_lines = [
             f"{m.get('menu_ai_chat', '💬 Чат с AI')} — ответы на вопросы.",
@@ -139,8 +138,7 @@ def build_help_text(
             f"{m.get('menu_ai_song', '🎤 AI генератор песни')} — пишет текст песни по теме или ключевым словам.",
         ]
         other_lines = [
-            f"{m.get('menu_top_books', '🔥 Топ книг')} — самые популярные книги.",
-            "⌨️ /upload и /movie_upload — команды загрузки (админ).",
+            "⌨️ /upload — команда загрузки (админ).",
             f"{m.get('menu_pdf_editor', '🧰 PDF редактор')} — сжатие PDF, OCR, TXT/EPUB и водяной знак.",
             f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — конвертация voice/mp3, обрезка и переименование.",
             f"{m.get('menu_sticker_tools', '🧩 Sticker Tools')} — создание стикеров из фото/видео.",
@@ -162,10 +160,10 @@ def build_help_text(
         notes_title = "ℹ️ Notes"
         main_lines = [
             f"{m.get('menu_search_books', '🔎 Search Books')} — send a book name to search.",
-            f"{m.get('menu_search_movies', '🎬 Search Movies')} — send a movie name to search.",
+            f"{m.get('menu_top_books', '🔥 Top Books')} — most popular books.",
             f"{m.get('menu_ai_tools', '🤖 AI Tools')} — AI assistant features.",
+            f"{m.get('menu_video_downloader', '⬇️ Insta Youtub')} — video downloader section.",
             f"{m.get('menu_text_to_voice', '🎙️ Text to Voice')} — convert text into audio.",
-            f"{m.get('menu_ramadan_duas', '🌙 Ramadan Duas')} — Ramadan duas section.",
         ]
         ai_lines = [
             f"{m.get('menu_ai_chat', '💬 Chat with AI')} — ask questions and chat.",
@@ -179,8 +177,7 @@ def build_help_text(
             f"{m.get('menu_ai_song', '🎤 AI Song Generator')} — write song lyrics from a theme or keywords.",
         ]
         other_lines = [
-            f"{m.get('menu_top_books', '🔥 Top Books')} — most popular books.",
-            "⌨️ /upload and /movie_upload — upload commands (admin).",
+            "⌨️ /upload — upload command (admin).",
             f"{m.get('menu_pdf_editor', '🧰 PDF Editor')} — compress PDF, OCR, TXT/EPUB, and watermark.",
             f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — convert voice/mp3, cut audio, and rename files.",
             f"{m.get('menu_sticker_tools', '🧩 Sticker Tools')} — make stickers from photo/video.",
@@ -208,8 +205,7 @@ def build_help_text(
         admin_title = "🛠 Admin Commands" if lang == "en" else "🛠 Admin Buyruqlari" if lang == "uz" else "🛠 Админ команды"
         admin_commands = [
             "/admin — Admin panel",
-            "/upload — Upload books", 
-            "/movie_upload — Upload movies",
+            "/upload — Upload books",
             "/broadcast — Send broadcast",
             "/requests — Manage requests",
             "/smoke — System health check",
@@ -230,7 +226,6 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_search_movies": "kino nomini yuborib qidiring.",
             "menu_ai_tools": "AI yordamchi bo'limlari.",
             "menu_text_to_voice": "matndan audio yarating.",
-            "menu_ramadan_duas": "Ramazon duolari bo'limi.",
             "menu_ai_chat": "savollarga javob.",
             "menu_ai_translator": "tarjima (aniq format: `uz>en: matn`).",
             "menu_ai_pdf_translator": "PDF/EPUB/DOCX/DOC/TXT/MD fayllarni tarjima qiladi.",
@@ -255,7 +250,6 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_search_movies": "отправьте название фильма для поиска.",
             "menu_ai_tools": "раздел AI-помощников.",
             "menu_text_to_voice": "преобразование текста в аудио.",
-            "menu_ramadan_duas": "раздел с дуа.",
             "menu_ai_chat": "ответы на вопросы.",
             "menu_ai_translator": "перевод (точный формат: `uz>en: текст`).",
             "menu_ai_pdf_translator": "переводит файлы PDF/EPUB/DOCX/DOC/TXT/MD.",
@@ -280,7 +274,6 @@ def get_item_description(key: str, lang: str) -> str:
             "menu_search_movies": "send a movie name to search.",
             "menu_ai_tools": "AI assistant features.",
             "menu_text_to_voice": "convert text into audio.",
-            "menu_ramadan_duas": "Ramadan duas section.",
             "menu_ai_chat": "ask questions and chat.",
             "menu_ai_translator": "translate text (best format: `uz>en: text`).",
             "menu_ai_pdf_translator": "translate PDF/EPUB/DOCX/DOC/TXT/MD files.",
@@ -332,7 +325,6 @@ def main_menu_text_action(
         "menu_name_meanings": "name_meanings",
         "menu_video_downloader": "video_downloader",
         "menu_contact_admin": "contact_admin",
-        "menu_ramadan_duas": "ramazon",
         "menu_help": "help",
         "menu_ai_tools": "ai_tools",
         "menu_ai_chat": "ai_chat",

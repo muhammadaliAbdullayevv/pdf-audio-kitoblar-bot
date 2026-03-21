@@ -12,9 +12,9 @@ import asyncio
 import fcntl
 import atexit
 import html
+from urllib.parse import quote_plus
 from logging.handlers import RotatingFileHandler
 from functools import partial
-from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from datetime import datetime
@@ -28,7 +28,7 @@ try:
     from telegram import InlineQueryResultCachedVideo
 except Exception:
     InlineQueryResultCachedVideo = None  # type: ignore
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update, InputFile
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, InputFile
 
 from urllib3.exceptions import InsecureRequestWarning
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
@@ -87,6 +87,7 @@ from db import (
     list_users,
     upsert_user,
     update_user_language,
+    update_user_group_language,
     update_user_left_date,
     set_user_allowed,
     set_user_delete_allowed,
@@ -1223,17 +1224,18 @@ def build_book_keyboard(
     can_add_audiobook: bool = False,
     show_listen_button: bool = True,
     audiobook_request_count: int = 0,
+    show_personal_state: bool = True,
 ) -> InlineKeyboardMarkup:
     like = counts.get("like", 0)
     dislike = counts.get("dislike", 0)
     berry = counts.get("berry", 0)
     whale = counts.get("whale", 0)
-    fav_label = "❌ Remove" if is_fav else "⭐ Favorite"
+    fav_label = "❌ Remove" if show_personal_state and is_fav else "⭐ Favorite"
     m = MESSAGES.get(lang, MESSAGES["en"])
     ## summary_label = m.get("summary_button", "🧠 Summarize")
 
     def label(key: str, emoji: str, count: int) -> str:
-        prefix = "★ " if user_reaction == key else ""
+        prefix = "★ " if show_personal_state and user_reaction == key else ""
         return f"{prefix}{emoji} {count}"
 
     rows: list[list[InlineKeyboardButton]] = [
@@ -2499,8 +2501,6 @@ async def set_bot_profile_texts(application):
     bot = application.bot
     supported_langs = {str(k).lower() for k in BOT_PROFILE_TEXTS.keys() if k != "default"}
     cleanup_langs = _parse_lang_codes_csv(os.getenv("BOT_PROFILE_CLEAR_LANGUAGE_CODES", ""))
-    if not cleanup_langs:
-        cleanup_langs = {str(k).lower() for k in BOT_PROFILE_TEXT_CLEANUP_LOCALES}
     cleanup_langs -= supported_langs
 
     for lang_code in sorted(cleanup_langs):
@@ -2527,6 +2527,8 @@ async def set_bot_profile_texts(application):
             continue
         desc = _clip_text(payload.get("description", ""), 512)
         about = _clip_text(payload.get("about", ""), 120)
+        if desc == default_desc and about == default_about:
+            continue
         try:
             if desc:
                 await bot.set_my_description(description=desc, language_code=lang_code)
@@ -2536,13 +2538,20 @@ async def set_bot_profile_texts(application):
             logger.warning("Failed to set bot profile texts for lang=%s: %s", lang_code, e)
 
 
-async def _sync_user_commands_if_needed(context: ContextTypes.DEFAULT_TYPE, user_id: int | None, lang: str):
+async def _sync_user_commands_if_needed(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int | None,
+    lang: str,
+    *,
+    force: bool = False,
+):
     await _command_sync.sync_user_commands_if_needed(
         context,
         user_id=user_id,
         lang=lang,
         owner_id=OWNER_ID,
         logger=logger,
+        force=force,
     )
 
 
@@ -3081,6 +3090,7 @@ def save_users(users):
                 delete_allowed=bool(u.get("delete_allowed", False)),
                 stopped=bool(u.get("stopped", False)),
                 language_selected=u.get("language_selected"),
+                group_language=u.get("group_language"),
             )
         logger.debug(f"Saved {len(users)} users to DB")
     except Exception as e:
@@ -3096,6 +3106,70 @@ def detect_language_code(code: str | None) -> str:
     if code.startswith("ru"):
         return "ru"
     return "en"
+
+
+def _is_group_chat(chat) -> bool:
+    return str(getattr(chat, "type", "") or "").lower() in {"group", "supergroup"}
+
+
+def _has_private_bot_start(user: dict | None) -> bool:
+    if not isinstance(user, dict):
+        return False
+    return bool(user.get("language_selected")) and bool(user.get("language"))
+
+
+async def _build_private_start_url(context: ContextTypes.DEFAULT_TYPE, payload: str = "group_start") -> str | None:
+    username = getattr(context.bot, "username", None)
+    if not username:
+        try:
+            me = await context.bot.get_me()
+            username = getattr(me, "username", None)
+        except Exception:
+            username = None
+    if not username:
+        return None
+    return f"https://t.me/{username}?start={payload}"
+
+
+async def _reply_group_private_start_prompt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    lang: str,
+) -> bool:
+    if not update.message:
+        return False
+    text = MESSAGES.get(lang, MESSAGES["en"]).get(
+        "group_private_start_required",
+        MESSAGES["en"]["group_private_start_required"],
+    )
+    start_url = await _build_private_start_url(context)
+    reply_markup = None
+    if start_url:
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(MESSAGES.get(lang, MESSAGES["en"]).get("group_private_start_button", "🚀 Start Bot"), url=start_url)]]
+        )
+    await _send_with_retry(lambda: update.message.reply_text(text, reply_markup=reply_markup))
+    return True
+
+
+async def _reply_group_language_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> bool:
+    if not update.message:
+        return False
+    text = MESSAGES.get(lang, MESSAGES["en"]).get("group_choose_language", MESSAGES["en"]["choose_language"])
+    await _send_with_retry(lambda: update.message.reply_text(text, reply_markup=get_language_keyboard()))
+    return True
+
+
+async def _send_group_search_ready_message(target_message, context: ContextTypes.DEFAULT_TYPE, lang: str):
+    if not target_message:
+        return None
+    text = MESSAGES.get(lang, MESSAGES["en"]).get("group_search_ready", MESSAGES["en"]["group_search_ready"])
+    return await _send_with_retry(
+        lambda: target_message.reply_text(
+            text,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    )
 
 
 def set_user_language(user_id: int, lang: str):
@@ -3117,15 +3191,48 @@ def set_user_language(user_id: int, lang: str):
         update_user_language(user_id, lang)
 
 
+def set_user_group_language(user_id: int, lang: str):
+    user = get_user(user_id)
+    if not user:
+        upsert_user(
+            user_id=user_id,
+            username=None,
+            first_name=None,
+            last_name=None,
+            blocked=False,
+            allowed=False,
+            joined_date=datetime.now().date(),
+            left_date=None,
+            language=None,
+            language_selected=False,
+            group_language=lang,
+        )
+    else:
+        update_user_group_language(user_id, lang)
+
+
 def ensure_user_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    if not update.effective_user:
+        return "en"
+    user = get_user_record(update.effective_user.id)
+    if _is_group_chat(getattr(update, "effective_chat", None)):
+        lang = context.user_data.get("group_language")
+        if lang:
+            return lang
+        if user and user.get("group_language"):
+            context.user_data["group_language"] = user["group_language"]
+            return str(user["group_language"])
+        if user and user.get("language") and bool(user.get("language_selected")) is True:
+            return str(user["language"])
+        return detect_language_code(getattr(update.effective_user, "language_code", None))
+
     lang = context.user_data.get("language")
     if lang:
         return lang
-    user = get_user_record(update.effective_user.id)
     if user and user.get("language") and bool(user.get("language_selected")) is True:
         context.user_data["language"] = user["language"]
-        return user["language"]
-    # Do not auto-apply Telegram locale. Force explicit language selection.
+        return str(user["language"])
+    # Do not auto-apply Telegram locale in private chat before explicit setup.
     context.user_data["language"] = "en"
     return "en"
 
@@ -3174,11 +3281,6 @@ async def update_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE | 
             retries=DB_RETRY_ATTEMPTS,
             base_delay=DB_RETRY_BASE_DELAY_SEC,
         )
-        if context:
-            _schedule_application_task(
-                context.application,
-                _sync_user_commands_if_needed(context, user.id, effective_lang),
-            )
     except Exception as e:
         logger.error(f"Failed to update user info: {e}")
 
@@ -3571,6 +3673,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_reply(update, MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
             return
 
+        user_record = get_user_record(update.effective_user.id) or {}
+        if _is_group_chat(update.effective_chat):
+            prompt_lang = detect_language_code(
+                user_record.get("group_language")
+                or user_record.get("language")
+                or getattr(update.effective_user, "language_code", None)
+            )
+            referrer_id = parse_referral_payload(context.args[0] if context.args else None)
+            if not _has_private_bot_start(user_record):
+                await _reply_group_private_start_prompt(update, context, prompt_lang)
+            elif user_record.get("group_language"):
+                await _send_group_search_ready_message(update.message, context, str(user_record.get("group_language") or prompt_lang))
+            else:
+                await _reply_group_language_prompt(update, context, prompt_lang)
+            _schedule_application_task(
+                context.application,
+                _post_start_background_sync(update, context, referrer_id),
+            )
+            return
+
         # Reset menu/search state until the user explicitly chooses a language.
         context.user_data.pop("main_menu_section", None)
         context.user_data["awaiting_book_search"] = False
@@ -3606,6 +3728,18 @@ async def language_command_handler(update: Update, context: ContextTypes.DEFAULT
     if limited:
         lang = ensure_user_language(update, context)
         await update.message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+        return
+    user_record = get_user_record(update.effective_user.id) or {}
+    if _is_group_chat(update.effective_chat):
+        prompt_lang = detect_language_code(
+            user_record.get("group_language")
+            or user_record.get("language")
+            or getattr(update.effective_user, "language_code", None)
+        )
+        if not _has_private_bot_start(user_record):
+            await _reply_group_private_start_prompt(update, context, prompt_lang)
+        else:
+            await _reply_group_language_prompt(update, context, prompt_lang)
         return
     lang = ensure_user_language(update, context)
     # Keep menu hidden/reset until language is explicitly chosen.
@@ -3847,10 +3981,11 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         return True
     context.user_data["awaiting_book_search"] = False
     if action == "search_movies":
-        context.user_data["awaiting_movie_search"] = True
-        context.user_data["search_mode"] = "movie"
+        context.user_data["awaiting_movie_search"] = False
+        context.user_data["awaiting_book_search"] = True
+        context.user_data["search_mode"] = "book"
         await update.message.reply_text(
-            m.get("menu_movie_search_prompt", "Send a movie name to search."),
+            f"{m.get('movie_feature_removed', '🎬 Movie feature has been removed. Please use book search instead.')}\n\n{m.get('menu_search_prompt', 'Send a book name to search.')}",
             reply_markup=_main_menu_keyboard(lang, "main", user_id),
         )
         context.user_data["main_menu_section"] = "main"
@@ -3934,11 +4069,6 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         context.user_data["_skip_spam_check_once"] = True
         await top_users_command(update, context)
         return True
-    if action == "ramazon":
-        context.user_data["main_menu_section"] = "other"
-        context.user_data["_skip_spam_check_once"] = True
-        await ramazon_command(update, context)
-        return True
     if action == "help":
         context.user_data["main_menu_section"] = "other"
         context.user_data["_skip_spam_check_once"] = True
@@ -3952,7 +4082,10 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     if action == "movie_upload":
         context.user_data["main_menu_section"] = "other"
         context.user_data["_skip_spam_check_once"] = True
-        await movie_upload_command(update, context)
+        await update.message.reply_text(
+            m.get("movie_feature_removed", "🎬 Movie feature has been removed. Please use book search instead."),
+            reply_markup=_main_menu_keyboard(lang, "other", user_id),
+        )
         return True
     if action == "video_downloader":
         context.user_data["main_menu_section"] = "video_downloader"
@@ -4040,86 +4173,80 @@ async def _send_animated_start_greeting(update: Update, context: ContextTypes.DE
     return True
 
 
+def _set_main_menu_ready_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["main_menu_section"] = "main"
+    context.user_data["awaiting_book_search"] = True
+    context.user_data["awaiting_movie_search"] = False
+    context.user_data["search_mode"] = "book"
+
+
 async def _edit_or_send_animated_start_greeting(query, context: ContextTypes.DEFAULT_TYPE, lang: str):
     final_text = _build_start_greeting_text(lang, getattr(query, "from_user", None))
+    target_message = getattr(query, "message", None)
     uid = getattr(getattr(query, "from_user", None), "id", None)
+    target_chat_id = getattr(getattr(target_message, "chat", None), "id", None) or uid
+    reply_markup = _main_menu_keyboard(lang, "main", uid)
+
+    async def _cleanup_old_picker():
+        if not target_message:
+            return
+        try:
+            await target_message.delete()
+        except Exception:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
     # Send main menu immediately; cleanup of old picker message is done in background.
     try:
-        sent = await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text=final_text,
-            reply_markup=_main_menu_keyboard(lang, "main", uid),
-            parse_mode="HTML",
+        sent = await _send_with_retry(
+            lambda: context.bot.send_message(
+                chat_id=target_chat_id,
+                text=final_text,
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+            )
         )
-        context.user_data["main_menu_section"] = "main"
-        context.user_data["awaiting_book_search"] = True
-        context.user_data["awaiting_movie_search"] = False
-        context.user_data["search_mode"] = "book"
-        if getattr(query, "message", None):
-            async def _cleanup_old_picker():
-                try:
-                    await query.message.delete()
-                except Exception:
-                    try:
-                        await query.edit_message_reply_markup(reply_markup=None)
-                    except Exception:
-                        pass
-
+        if sent is not None:
+            _set_main_menu_ready_state(context)
             _schedule_application_task(context.application, _cleanup_old_picker())
-        return sent
-    except Exception:
-        pass
+            return sent
+    except Exception as e:
+        logger.warning("Primary start greeting send failed for user %s in chat %s: %s", uid, target_chat_id, e)
 
-
-async def _send_ramazon_message_to_target(target_message, context: ContextTypes.DEFAULT_TYPE, lang: str):
-    text = MESSAGES.get(lang, {}).get("ramazon_text") or MESSAGES["uz"]["ramazon_text"]
-    share_text = text
-    share_label = MESSAGES.get(lang, {}).get("ramazon_share_button", "🔗 Share")
-    share_url = None
-    username = getattr(context.bot, "username", None)
-    if not username:
+    if target_message:
         try:
-            me = await context.bot.get_me()
-            username = getattr(me, "username", None)
-        except Exception:
-            username = None
-    if share_text:
-        share_text = share_text.replace("<blockquote>", "«").replace("</blockquote>", "»")
-    if username:
-        bot_mention = f"@{username}"
-        text = f"{text}\n\n{bot_mention}"
-        if share_text:
-            share_text = f"{share_text}\n\n{bot_mention}"
-            share_url = f"https://t.me/share/url?text={quote_plus(share_text)}"
-    reply_markup = None
-    if share_url:
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(share_label, url=share_url)]])
-    await target_message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+            sent = await _send_with_retry(
+                lambda: target_message.reply_text(
+                    final_text,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML",
+                )
+            )
+            if sent is not None:
+                _set_main_menu_ready_state(context)
+                _schedule_application_task(context.application, _cleanup_old_picker())
+                return sent
+        except Exception as e:
+            logger.error("Fallback start greeting send failed for user %s: %s", uid, e)
 
-
-async def ramazon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = ensure_user_language(update, context)
-    if update.effective_user and is_blocked(update.effective_user.id):
-        await update.message.reply_text(MESSAGES[lang]["blocked"])
-        return
-    if update.effective_user and await is_stopped_user(update.effective_user.id):
-        return
-    limited, wait_s = spam_check_message(update, context)
-    if limited:
-        await update.message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
-        return
-    await _send_ramazon_message_to_target(update.message, context, lang)
+    return None
 
 
 async def handle_language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     lang = query.data.split("_")[1]  # uz / en / ru
-    context.user_data["language"] = lang
+    is_group_context = _is_group_chat(getattr(query, "message", None).chat if getattr(query, "message", None) else None)
+    if is_group_context:
+        context.user_data["group_language"] = lang
+    else:
+        context.user_data["language"] = lang
     await safe_answer(query)
     async def _persist_language():
         try:
             await run_blocking_db_retry(
-                set_user_language,
+                set_user_group_language if is_group_context else set_user_language,
                 query.from_user.id,
                 lang,
                 retries=DB_RETRY_ATTEMPTS,
@@ -4129,22 +4256,29 @@ async def handle_language_callback(update: Update, context: ContextTypes.DEFAULT
             logger.error(f"Failed to persist user language {query.from_user.id}: {e}")
 
     _schedule_application_task(context.application, _persist_language())
-    await _edit_or_send_animated_start_greeting(query, context, lang)
+    if is_group_context:
+        sent = await _send_group_search_ready_message(getattr(query, "message", None), context, lang)
+        if getattr(query, "message", None):
+            try:
+                await query.message.delete()
+            except Exception:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+    else:
+        sent = await _edit_or_send_animated_start_greeting(query, context, lang)
     try:
-        uid = query.from_user.id
-        _schedule_application_task(
-            context.application,
-            _sync_user_commands_if_needed(context, uid, lang),
-        )
+        if not is_group_context:
+            uid = query.from_user.id
+            _schedule_application_task(
+                context.application,
+                _sync_user_commands_if_needed(context, uid, lang, force=True),
+            )
     except Exception as e:
         logger.error(f"Failed to update user commands language: {e}")
-    try:
-        context.user_data["main_menu_section"] = "main"
-        context.user_data["awaiting_book_search"] = True
-        context.user_data["awaiting_movie_search"] = False
-        context.user_data["search_mode"] = "book"
-    except Exception:
-        pass
+    if sent is None:
+        logger.error("Language selection completed but follow-up message was not delivered for user %s", query.from_user.id)
 
 
 # Upload flow extracted module bridge
@@ -4251,7 +4385,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_movie_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route video/GIF to sticker tools first, then fallback to movie upload flow."""
+    """Route video/GIF to sticker tools only."""
     sticker_handler = globals().get("_sticker_handle_media_input")
     if callable(sticker_handler):
         try:
@@ -4263,7 +4397,7 @@ async def handle_movie_video(update: Update, context: ContextTypes.DEFAULT_TYPE)
             raise
         except Exception as e:
             logger.warning("sticker tools video handler failed: %s", e, exc_info=True)
-    await _raw_handle_movie_video(update, context)
+    return
 
 
 def _format_bytes(bytes_count: int) -> str:
@@ -4337,8 +4471,6 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req_status = await run_blocking(db_get_request_status_counts)
         upload_status = await run_blocking(db_get_upload_request_status_counts)
         reaction_current = await run_blocking(db_get_reaction_totals)
-        movie_reaction_current = await run_blocking(db_get_movie_reaction_totals)
-        
         # --- New statistics ---
         try:
             audio_stats = await run_blocking(db_get_audio_book_stats)
@@ -4370,13 +4502,6 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "reaction_dislike",
             "reaction_berry",
             "reaction_whale",
-            "movie_reaction_like",
-            "movie_reaction_dislike",
-            "movie_reaction_berry",
-            "movie_reaction_whale",
-            "movie_search_total",
-            "movie_download_total",
-            "movie_share_total",
             "video_downloads",
             # AI Tools counters
             "ai_chat_sessions",
@@ -4474,9 +4599,6 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             MESSAGES[lang]["audit_section_events"],
             f"- {MESSAGES[lang]['audit_search_total']}: {counters.get('search_total', 0)}",
             f"- {MESSAGES[lang]['audit_download_total']}: {counters.get('download_total', 0)}",
-            f"- Movie searches: {counters.get('movie_search_total', 0)}",
-            f"- Movie downloads: {counters.get('movie_download_total', 0)}",
-            f"- Movie shares: {counters.get('movie_share_total', 0)}",
             f"- Video downloader downloads: {counters.get('video_downloads', 0)}",
             f"- {MESSAGES[lang]['audit_requests_created']}: {counters.get('request_created', 0)}",
             f"- {MESSAGES[lang]['audit_requests_cancelled']}: {counters.get('request_cancelled', 0)}",
@@ -4523,14 +4645,6 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- {MESSAGES[lang]['audit_reaction_current_dislike']}: {reaction_current.get('dislike', 0)}",
             f"- {MESSAGES[lang]['audit_reaction_current_berry']}: {reaction_current.get('berry', 0)}",
             f"- {MESSAGES[lang]['audit_reaction_current_whale']}: {reaction_current.get('whale', 0)}",
-            f"- 🎬 Movie 👍 (total): {counters.get('movie_reaction_like', 0)}",
-            f"- 🎬 Movie 👎 (total): {counters.get('movie_reaction_dislike', 0)}",
-            f"- 🎬 Movie 🍓 (total): {counters.get('movie_reaction_berry', 0)}",
-            f"- 🎬 Movie 🐳 (total): {counters.get('movie_reaction_whale', 0)}",
-            f"- 🎬 Movie 👍 (current): {movie_reaction_current.get('like', 0)}",
-            f"- 🎬 Movie 👎 (current): {movie_reaction_current.get('dislike', 0)}",
-            f"- 🎬 Movie 🍓 (current): {movie_reaction_current.get('berry', 0)}",
-            f"- 🎬 Movie 🐳 (current): {movie_reaction_current.get('whale', 0)}",
         ]
 
         report = "\n".join(lines)
@@ -4698,68 +4812,9 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.inline_query.answer([], cache_time=0)
         return
 
-    # Inline movie-share flow: triggered by movie keyboard share button.
     token = query.split()[0].strip()
     if token.startswith("mshare_"):
-        movie_id = token[len("mshare_"):].strip()
-        if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", movie_id or ""):
-            await update.inline_query.answer([], cache_time=0, is_personal=True)
-            return
-        try:
-            movie = await run_blocking(db_get_movie_by_id, movie_id)
-        except Exception as e:
-            logger.warning("inline movie share lookup failed for %s: %s", movie_id, e)
-            movie = None
-        if not movie:
-            await update.inline_query.answer([], cache_time=0, is_personal=True)
-            return
-
-        file_id = str(movie.get("file_id") or "").strip()
-        if not file_id:
-            await update.inline_query.answer([], cache_time=0, is_personal=True)
-            return
-
-        lang_ui = ensure_user_language(update, context)
-        title = str(movie.get("display_name") or movie.get("movie_name") or "Movie").strip() or "Movie"
-        raw_caption = str(movie.get("caption_text") or "").strip()
-        try:
-            base_caption = _search_flow._movie_caption_without_links(raw_caption) or title
-        except Exception:
-            base_caption = raw_caption or title
-        try:
-            share_caption = _search_flow._compose_movie_delivery_caption(base_caption, lang_ui)
-        except Exception:
-            share_caption = base_caption[:1024]
-
-        mime_type = str(movie.get("mime_type") or "").lower()
-        description = "Tap to send movie"
-        result_id = f"mshare:{movie_id}"
-        if InlineQueryResultCachedVideo is not None and mime_type.startswith("video/"):
-            results = [
-                InlineQueryResultCachedVideo(
-                    id=result_id,
-                    video_file_id=file_id,
-                    title=title[:64],
-                    description=description,
-                    caption=share_caption,
-                )
-            ]
-        else:
-            results = [
-                InlineQueryResultCachedDocument(
-                    id=result_id,
-                    title=title[:64],
-                    document_file_id=file_id,
-                    description=description,
-                    caption=share_caption,
-                )
-            ]
-
-        try:
-            await run_blocking(db_increment_counter, "movie_share_total", 1)
-        except Exception:
-            pass
-        await update.inline_query.answer(results, cache_time=0, is_personal=True)
+        await update.inline_query.answer([], cache_time=0, is_personal=True)
         return
 
     try:
@@ -5624,7 +5679,6 @@ def main():
             try:
                 es.info()
                 ensure_index()
-                ensure_movies_index()
                 es_status = "up"
                 es_health, es_count = get_es_health_summary(es)
             except Exception as e:
@@ -5671,7 +5725,6 @@ def main():
         _handler_registry.register_handlers(app, _build_handler_registry_deps())
 
         sync_unindexed_books()
-        sync_unindexed_movies()
 
         logger.debug("Handlers registered. Starting polling...")
         print("Bot is running...")

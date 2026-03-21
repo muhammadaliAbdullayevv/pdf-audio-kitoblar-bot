@@ -42,7 +42,7 @@ def build_main_menu_keyboard(
 
     if section == "other":
         keyboard = [
-            [m.get("menu_top_books", "🔥 Top Books"), m.get("menu_top_users", "🏆 Top Users")],
+            [m.get("menu_top_users", "🏆 Top Users")],
             [m.get("menu_audio_converter", "🎛️ Audio Editor"), m.get("menu_pdf_editor", "🧰 PDF Editor")],
             [m.get("menu_sticker_tools", "🧩 Sticker Tools"), m.get("menu_name_meanings", "🪪 Name Meanings")],
             [m.get("menu_contact_admin", "📞 Contact Admin"), m.get("menu_help", "❓ Help")],
@@ -105,11 +105,10 @@ def build_main_menu_keyboard(
             [m.get("menu_back", "⬅️ Back")],
         ]
     else:
-        first_row = [m.get("menu_search_books", "🔎 Search Books"), m.get("menu_search_movies", "🎬 Search Movies")]
         keyboard = [
-            first_row,
-            [m.get("menu_ai_tools", "🤖 AI Tools"), m.get("menu_text_to_voice", "🎙️ Text to Voice")],
-            [m.get("menu_video_downloader", "⬇️ Insta Youtub"), m.get("menu_ramadan_duas", "🌙 Ramadan Duas")],
+            [m.get("menu_search_books", "🔎 Search Books")],
+            [m.get("menu_top_books", "🔥 Top Books"), m.get("menu_ai_tools", "🤖 AI Tools")],
+            [m.get("menu_video_downloader", "⬇️ Insta Youtub"), m.get("menu_text_to_voice", "🎙️ Text to Voice")],
             [m.get("menu_other_functions", "🛠️ Other Functions")],
         ]
         if is_admin:

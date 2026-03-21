@@ -482,14 +482,17 @@ async def _can_show_delete_button(update: Update, user_id: int | None) -> bool:
         msg = getattr(cb, "message", None) or getattr(update, "effective_message", None)
         chat_type = str(getattr(getattr(msg, "chat", None), "type", "") or "").lower()
     if chat_type in {"group", "supergroup"}:
-        owner_fn = globals().get("_is_owner_user")
-        if callable(owner_fn):
-            try:
-                return bool(owner_fn(user_id))
-            except Exception:
-                return False
         return False
     return True
+
+
+def _is_group_chat(update: Update) -> bool:
+    chat_type = str(getattr(update.effective_chat, "type", "") or "").lower()
+    if not chat_type:
+        cb = getattr(update, "callback_query", None)
+        msg = getattr(cb, "message", None) or getattr(update, "effective_message", None)
+        chat_type = str(getattr(getattr(msg, "chat", None), "type", "") or "").lower()
+    return chat_type in {"group", "supergroup"}
 
 
 def prune_search_cache(cache: dict, max_items: int = 5, max_age_sec: int = 1800):
@@ -884,6 +887,14 @@ def build_movie_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
+def _movie_feature_removed_text(lang: str) -> str:
+    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
+    return msgs.get(
+        "movie_feature_removed",
+        "🎬 Movie feature has been removed. Please use book search instead.",
+    )
+
+
 def build_user_info_text(user: dict) -> str:
     name = " ".join([p for p in [user.get("first_name"), user.get("last_name")] if p]).strip() or "—"
     username = f"@{user.get('username')}" if user.get("username") else "—"
@@ -1183,7 +1194,7 @@ async def handle_audiobook_part_callback(update: Update, context: ContextTypes.D
     caption = f"{part_index}/{len(all_parts)}"
     # Build keyboard with delete button (admin only)
     kb = None
-    if _is_admin_user(query.from_user.id):
+    if _is_admin_user(query.from_user.id) and not _is_group_chat(update):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Delete Part", callback_data=f"apdel:{part_id}")]])
     try:
         await query.message.reply_audio(audio=file_id, caption=caption, reply_markup=kb)
@@ -1881,7 +1892,7 @@ async def handle_audiobook_part_play_callback(update: Update, context: ContextTy
     try:
         # Create keyboard with delete button for admins
         keyboard = []
-        if _is_admin_user(query.from_user.id):
+        if _is_admin_user(query.from_user.id) and not _is_group_chat(update):
             delete_button = InlineKeyboardButton("🗑️ Delete Audio", callback_data=f"apdel:{part_id}")
             keyboard.append([delete_button])
         
@@ -1906,6 +1917,9 @@ async def handle_audiobook_part_delete_callback(update: Update, context: Context
     if not query:
         return
     lang = ensure_user_language(update, context)
+    if _is_group_chat(update):
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
     if not _is_admin_user(query.from_user.id):
         await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
         return
@@ -1933,6 +1947,9 @@ async def handle_audiobook_delete_callback(update: Update, context: ContextTypes
     if not query:
         return
     lang = ensure_user_language(update, context)
+    if _is_group_chat(update):
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
     if not _is_admin_user(query.from_user.id):
         await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
         return
@@ -1956,6 +1973,9 @@ async def handle_audiobook_delete_by_book_callback(update: Update, context: Cont
     if not query:
         return
     lang = ensure_user_language(update, context)
+    if _is_group_chat(update):
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
     if not _is_admin_user(query.from_user.id):
         await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
         return
@@ -1993,6 +2013,9 @@ async def handle_audiobook_add_callback(update: Update, context: ContextTypes.DE
     if not query:
         return
     lang = ensure_user_language(update, context)
+    if _is_group_chat(update):
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
     if not _is_admin_user(query.from_user.id):
         await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
         return
@@ -2369,119 +2392,11 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if context.user_data.get("awaiting_movie_search"):
-            movie_query = (update.message.text or "").strip()
-            if not movie_query:
-                await update.message.reply_text(
-                    MESSAGES[lang].get("menu_movie_search_prompt", "Send a movie name to search.")
-                )
-                return
-            menu_action = _main_menu_text_action(movie_query)
-            if menu_action:
-                context.user_data["awaiting_movie_search"] = False
-                handled = await _handle_main_menu_action(update, context, lang, menu_action)
-                if handled:
-                    return
-
-            await _send_salute_reaction_for_message(update, context)
-            try:
-                progress_message = await update.message.reply_text(
-                    MESSAGES[lang].get("processing_movie_search", "🎬 Searching movies... please wait.")
-                )
-            except Exception:
-                progress_message = None
-
-            async def _record_movie_search_analytics() -> None:
-                try:
-                    await _run_db_retry(increment_analytics, "searches", 1)
-                    await _run_db_retry(increment_user_analytics, user_id, "searches", 1)
-                    await _run_db_retry(increment_analytics, "movie_searches", 1)
-                    await _run_db_retry(increment_user_analytics, user_id, "movie_searches", 1)
-                    await _run_db_retry(db_increment_counter, "search_total", 1)
-                    await _run_db_retry(db_increment_counter, "movie_search_total", 1)
-                except Exception as e:
-                    logger.warning("movie search analytics update failed: %s", e)
-
-            _schedule_bg_task(context, _record_movie_search_analytics())
-
-            entries: list[dict[str, str]] = []
-            cached_movie_entries = get_cached_movie_search_entries(movie_query)
-            if cached_movie_entries:
-                entries = cached_movie_entries[:MAX_SEARCH_RESULTS]
-
-            cleaned_movie_query = normalize(movie_query).lower()
-            translit_movie_query = transliterate_to_latin(cleaned_movie_query) if cleaned_movie_query else ""
-
-            # Prefer ES movie index for better search quality; fallback to DB when needed.
-            if not entries and cleaned_movie_query and es_available():
-                es_results = await run_blocking(search_movies_es, cleaned_movie_query, MAX_SEARCH_RESULTS)
-                if translit_movie_query and translit_movie_query != cleaned_movie_query:
-                    es_results += await run_blocking(search_movies_es, translit_movie_query, MAX_SEARCH_RESULTS)
-
-                unique_matches: dict[str, dict[str, Any]] = {}
-                existing_movie_id_cache: dict[str, bool] = {}
-                for movie, score, es_id in es_results:
-                    row = movie or {}
-                    mid = str(row.get("id") or es_id or "").strip()
-                    if not mid:
-                        continue
-                    exists_in_db = existing_movie_id_cache.get(mid)
-                    if exists_in_db is None:
-                        try:
-                            exists_in_db = bool(await run_blocking(db_get_movie_by_id, mid))
-                        except Exception as e:
-                            logger.warning("movie search DB existence check failed for id=%s: %s", mid, e)
-                            # Fail open if DB check transiently fails.
-                            exists_in_db = True
-                        existing_movie_id_cache[mid] = exists_in_db
-                    if not exists_in_db:
-                        continue
-                    title_base = str(row.get("display_name") or row.get("movie_name") or f"Movie {len(unique_matches) + 1}")
-                    year_val = row.get("release_year")
-                    title = f"{title_base} ({year_val})" if year_val and str(year_val) not in title_base else title_base
-                    prev = unique_matches.get(mid)
-                    try:
-                        current_score = float(score or 0.0)
-                    except Exception:
-                        current_score = 0.0
-                    if not prev or current_score > float(prev.get("score", 0.0) or 0.0):
-                        unique_matches[mid] = {"id": mid, "title": title, "score": current_score}
-                entries = [
-                    {"id": v["id"], "title": v["title"]}
-                    for v in sorted(unique_matches.values(), key=lambda e: e.get("score", 0.0), reverse=True)
-                ]
-
-            if not entries:
-                movies = await run_blocking(db_search_movies, movie_query, MAX_SEARCH_RESULTS)
-                for idx, movie in enumerate(movies, start=1):
-                    mid = str(movie.get("id") or "").strip()
-                    if mid:
-                        title_base = str(movie.get("display_name") or movie.get("movie_name") or f"Movie {idx}")
-                        year_val = movie.get("release_year")
-                        title = f"{title_base} ({year_val})" if year_val and str(year_val) not in title_base else title_base
-                        entries.append({
-                            "id": mid,
-                            "title": title,
-                        })
-                if entries:
-                    set_cached_movie_search_entries(movie_query, entries)
-            entries = entries[:MAX_SEARCH_RESULTS]
-
-            if not entries:
-                await _edit_progress_or_reply(
-                    progress_message,
-                    update.message,
-                    MESSAGES[lang].get("movie_not_found", MESSAGES[lang].get("not_found", "Not found.")),
-                )
-                return
-
-            query_id = cache_movie_search_results(context, movie_query, entries)
-            result_text, page_entries, pages = build_movie_results_text(movie_query, entries, 0, lang)
-            reply_markup = build_movie_results_keyboard(page_entries, 0, pages, query_id)
-            await _edit_progress_or_reply(
-                progress_message,
-                update.message,
-                result_text,
-                reply_markup=reply_markup,
+            context.user_data["awaiting_movie_search"] = False
+            context.user_data["awaiting_book_search"] = True
+            context.user_data["search_mode"] = "book"
+            await update.message.reply_text(
+                f"{_movie_feature_removed_text(lang)}\n\n{MESSAGES[lang].get('menu_search_prompt', 'Send a book name to search.')}"
             )
             return
 
@@ -2761,12 +2676,18 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         is_fav_now = await run_blocking(is_favorited, query.from_user.id, book_id)
         user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
         can_delete = await _can_show_delete_button(update, query.from_user.id)
+        is_group_chat = _is_group_chat(update)
+        allow_management_buttons = not is_group_chat
         # Audiobook flags: show listen if audiobook exists; allow add for admins
         audio_book = await run_blocking(get_audio_book_for_book, book_id)
         has_ab = bool(audio_book)
-        can_add_ab = bool(_is_admin_user(query.from_user.id)) if callable(globals().get("_is_admin_user")) else False
+        can_add_ab = (
+            bool(_is_admin_user(query.from_user.id))
+            if allow_management_buttons and callable(globals().get("_is_admin_user"))
+            else False
+        )
         is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
-        show_listen_btn = has_ab if is_owner_user else True
+        show_listen_btn = has_ab if (is_group_chat or is_owner_user) else True
         ab_request_count = 0
         if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
             try:
@@ -2784,6 +2705,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             can_add_audiobook=can_add_ab,
             show_listen_button=show_listen_btn,
             audiobook_request_count=ab_request_count,
+            show_personal_state=not is_group_chat,
         )
 
         # --- Case 1: File ID available (prefer cache) ---
@@ -2892,9 +2814,13 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                     # Recompute audiobook flags for refreshed keyboard
                     audio_book2 = await run_blocking(get_audio_book_for_book, book_id)
                     has_ab2 = bool(audio_book2)
-                    can_add_ab2 = bool(_is_admin_user(query.from_user.id)) if callable(globals().get("_is_admin_user")) else False
+                    can_add_ab2 = (
+                        bool(_is_admin_user(query.from_user.id))
+                        if allow_management_buttons and callable(globals().get("_is_admin_user"))
+                        else False
+                    )
                     is_owner_user2 = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
-                    show_listen_btn2 = has_ab2 if is_owner_user2 else True
+                    show_listen_btn2 = has_ab2 if (is_group_chat or is_owner_user2) else True
                     ab_request_count2 = 0
                     if can_add_ab2 and is_owner_user2 and callable(globals().get("count_pending_audiobook_requests")):
                         try:
@@ -2914,6 +2840,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             can_add_audiobook=can_add_ab2,
                             show_listen_button=show_listen_btn2,
                             audiobook_request_count=ab_request_count2,
+                            show_personal_state=not is_group_chat,
                         ),
                     )
             except Exception as e:
@@ -2935,248 +2862,27 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        query = update.callback_query
-        if update.effective_user and await is_stopped_user(update.effective_user.id):
-            if query:
-                await safe_answer(query)
-            return
-        lang = ensure_user_language(update, context)
-        limited, wait_s = spam_check_callback(update, context)
-        if limited:
-            await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
-            return
-        data = str(query.data or "").strip()
-        if not data.startswith("movie:"):
-            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
-            return
-        movie_id = data.split(":", 1)[1].strip()
-        movie = await run_blocking(db_get_movie_by_id, movie_id)
-        if not movie:
-            await safe_answer(query, MESSAGES[lang].get("movie_not_found", MESSAGES[lang]["book_not_found"]))
-            return
-
-        status_msg = None
-        try:
-            await context.bot.send_chat_action(chat_id=query.message.chat_id, action="upload_video")
-            status_msg = await query.message.reply_text(MESSAGES[lang].get("sending", "⏳ Sending..."))
-        except Exception:
-            pass
-
-        file_id = str(movie.get("file_id") or "").strip()
-        local_path = movie.get("path")
-        title = str(movie.get("display_name") or movie.get("movie_name") or "Movie")
-        raw_caption = str(movie.get("caption_text") or "").strip()
-        base_caption = _movie_caption_without_links(raw_caption) or title
-        delivery_caption = _compose_movie_delivery_caption(base_caption, lang)
-        reaction_counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
-        user_reaction = None
-        try:
-            reaction_counts = await run_blocking(db_get_movie_reaction_counts, movie_id)
-            user_reaction = await run_blocking(db_get_user_movie_reaction, movie_id, query.from_user.id)
-        except Exception:
-            reaction_counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
-            user_reaction = None
-        share_query = _build_movie_share_inline_query(movie_id)
-        movie_kb = build_movie_keyboard(
-            movie_id=movie_id,
-            counts=reaction_counts,
-            user_reaction=user_reaction,
-            lang=lang,
-            share_query=share_query,
-        )
-        sent_ok = False
-        if file_id:
-            try:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=file_id,
-                    caption=delivery_caption,
-                    reply_markup=movie_kb,
-                )
-                sent_ok = True
-            except Exception:
-                try:
-                    await context.bot.send_video(
-                        chat_id=query.message.chat_id,
-                        video=file_id,
-                        caption=delivery_caption,
-                        reply_markup=movie_kb,
-                    )
-                    sent_ok = True
-                except Exception:
-                    sent_ok = False
-
-        if (not sent_ok) and local_path and os.path.exists(local_path):
-            try:
-                with open(local_path, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=query.message.chat_id,
-                        document=InputFile(f, filename=os.path.basename(local_path)),
-                        caption=delivery_caption,
-                        reply_markup=movie_kb,
-                    )
-                sent_ok = True
-            except Exception:
-                sent_ok = False
-
-        if not sent_ok:
-            message = MESSAGES[lang].get("movie_unavailable", MESSAGES[lang]["book_unavailable"])
-            if status_msg:
-                try:
-                    await status_msg.edit_text(message)
-                except Exception:
-                    await query.message.reply_text(message)
-            else:
-                await query.message.reply_text(message)
-        else:
-            async def _record_movie_download_analytics() -> None:
-                try:
-                    await _run_db_retry(increment_analytics, "buttons", 1)
-                    await _run_db_retry(increment_user_analytics, query.from_user.id, "buttons", 1)
-                    await _run_db_retry(increment_analytics, "movie_downloads", 1)
-                    await _run_db_retry(increment_user_analytics, query.from_user.id, "movie_downloads", 1)
-                    await _run_db_retry(db_increment_counter, "download_total", 1)
-                    await _run_db_retry(db_increment_counter, "movie_download_total", 1)
-                except Exception as e:
-                    logger.warning("movie download analytics update failed: %s", e)
-
-            _schedule_bg_task(context, _record_movie_download_analytics())
-            if status_msg:
-                try:
-                    await status_msg.edit_text(MESSAGES[lang].get("sent", "✅ Sent."))
-                except Exception:
-                    pass
-
-        await safe_answer(query)
-    except Exception as e:
-        logger.error(f"handle_movie_selection failed: {e}", exc_info=True)
-        lang = ensure_user_language(update, context)
-        await update.callback_query.message.reply_text(MESSAGES[lang]["error"])
-        raise
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    await safe_answer(query, _movie_feature_removed_text(lang), show_alert=True)
 
 
 async def handle_movie_reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
-    if update.effective_user and await is_stopped_user(update.effective_user.id):
-        await safe_answer(query)
-        return
     lang = ensure_user_language(update, context)
-    limited, wait_s = spam_check_callback(update, context)
-    if limited:
-        await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
-        return
-    try:
-        _, movie_id, reaction = str(query.data or "").split(":", 2)
-    except Exception:
-        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
-        return
-
-    if reaction not in MOVIE_REACTION_EMOJI:
-        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
-        return
-
-    reaction_emojis = {
-        "whale": ("❤️", "🐳"),
-        "berry": ("😍", "🍓", "❤️"),
-        "like": ("🥰", "👍", "❤️"),
-        "dislike": ("😒", "💔"),
-    }.get(reaction, ("❤️",))
-    reaction_state_key, reaction_state_seq = _reserve_callback_reaction_seq(query, context)
-
-    try:
-        old_reaction = await run_blocking(db_get_user_movie_reaction, movie_id, query.from_user.id)
-        if old_reaction == reaction:
-            await _send_callback_reaction_with_fallbacks(
-                query,
-                context,
-                reaction_emojis,
-                state_key=reaction_state_key,
-                state_seq=reaction_state_seq,
-            )
-            await safe_answer(query)
-            return
-
-        await run_blocking(db_set_movie_reaction, query.from_user.id, movie_id, reaction)
-        await _run_db_retry(db_increment_counter, f"movie_reaction_{reaction}", 1)
-        await _send_callback_reaction_with_fallbacks(
-            query,
-            context,
-            reaction_emojis,
-            state_key=reaction_state_key,
-            state_seq=reaction_state_seq,
-        )
-
-        if query.message:
-            counts = await run_blocking(db_get_movie_reaction_counts, movie_id)
-            user_reaction = await run_blocking(db_get_user_movie_reaction, movie_id, query.from_user.id)
-            share_query = _build_movie_share_inline_query(movie_id)
-            try:
-                await query.message.edit_reply_markup(
-                    reply_markup=build_movie_keyboard(
-                        movie_id=movie_id,
-                        counts=counts,
-                        user_reaction=user_reaction,
-                        lang=lang,
-                        share_query=share_query,
-                    )
-                )
-            except Exception:
-                pass
-        await safe_answer(query)
-    except Exception as e:
-        logger.error("Movie reaction update failed: %s", e, exc_info=True)
-        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+    await safe_answer(query, _movie_feature_removed_text(lang), show_alert=True)
 
 
 async def handle_movie_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
-    if update.effective_user and await is_stopped_user(update.effective_user.id):
-        await safe_answer(query)
-        return
     lang = ensure_user_language(update, context)
-    limited, wait_s = spam_check_callback(update, context)
-    if limited:
-        await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
-        return
-    try:
-        _, movie_id = str(query.data or "").split(":", 1)
-    except Exception:
-        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
-        return
-
-    movie = await run_blocking(db_get_movie_by_id, movie_id)
-    if not movie:
-        await safe_answer(query, MESSAGES[lang].get("movie_not_found", MESSAGES[lang]["book_not_found"]), show_alert=True)
-        return
-    if not query.message:
-        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
-        return
-
-    share_url = _build_movie_share_url(movie, lang, context)
-    counts = await run_blocking(db_get_movie_reaction_counts, movie_id)
-    user_reaction = await run_blocking(db_get_user_movie_reaction, movie_id, query.from_user.id)
-    share_query = _build_movie_share_inline_query(movie_id)
-    try:
-        await query.message.edit_reply_markup(
-            reply_markup=build_movie_keyboard(
-                movie_id=movie_id,
-                counts=counts,
-                user_reaction=user_reaction,
-                lang=lang,
-                share_query=share_query,
-            )
-        )
-    except Exception:
-        pass
-    try:
-        await query.answer(MESSAGES.get(lang, MESSAGES.get("en", {})).get("movie_share_prompt", "Use share button")[:180], show_alert=False)
-    except Exception:
-        await safe_answer(query)
+    await safe_answer(query, _movie_feature_removed_text(lang), show_alert=True)
 
 
 async def handle_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3215,36 +2921,10 @@ async def handle_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_movie_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if update.effective_user and await is_stopped_user(update.effective_user.id):
-        if query:
-            await safe_answer(query)
+    if not query:
         return
     lang = ensure_user_language(update, context)
-    limited, wait_s = spam_check_callback(update, context)
-    if limited:
-        await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
-        return
-    try:
-        _, query_id, page_str = query.data.split(":")
-        page = int(page_str)
-    except Exception:
-        await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
-        return
-
-    cache = get_movie_search_cache(context, query_id)
-    if not cache:
-        await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
-        return
-
-    entries = cache.get("results", [])
-    result_text, page_entries, pages = build_movie_results_text(cache.get("query", ""), entries, page, lang)
-    reply_markup = build_movie_results_keyboard(page_entries, page, pages, query_id)
-
-    try:
-        await query.edit_message_text(result_text, reply_markup=reply_markup)
-    except Exception:
-        pass
-    await safe_answer(query)
+    await safe_answer(query, _movie_feature_removed_text(lang), show_alert=True)
 
 
 async def handle_user_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

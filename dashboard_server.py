@@ -136,7 +136,6 @@ def _detect_earliest_day(default_day: date) -> date:
       SELECT MIN(day)::date AS d FROM analytics_daily
       UNION ALL SELECT MIN(joined_date)::date FROM users
       UNION ALL SELECT MIN(DATE(created_at)) FROM books
-      UNION ALL SELECT MIN(DATE(created_at)) FROM movies
       UNION ALL SELECT MIN(DATE(created_at)) FROM audio_books
       UNION ALL SELECT MIN(DATE(created_at)) FROM book_requests
       UNION ALL SELECT MIN(DATE(created_at)) FROM upload_requests
@@ -280,7 +279,6 @@ def _fetch_daily_traffic_series(start_day: date, end_day: date, max_points: int 
 def _fetch_catalog_growth_series(start_day: date, end_day: date, max_points: int = 60) -> dict[str, Any]:
     start_dt, end_dt = _day_bounds(start_day, end_day)
     books_by_day: dict[date, int] = {}
-    movies_by_day: dict[date, int] = {}
     audio_by_day: dict[date, int] = {}
     unindexed_by_day: dict[date, int] = {}
 
@@ -315,19 +313,6 @@ def _fetch_catalog_growth_series(start_day: date, end_day: date, max_points: int
             cur.execute(
                 """
                 SELECT DATE(created_at) AS d, COUNT(*)
-                FROM movies
-                WHERE created_at >= %s AND created_at < %s
-                GROUP BY d
-                ORDER BY d ASC
-                """,
-                (start_dt, end_dt),
-            )
-            for d, cnt in cur.fetchall() or []:
-                movies_by_day[d] = _safe_int(cnt)
-
-            cur.execute(
-                """
-                SELECT DATE(created_at) AS d, COUNT(*)
                 FROM audio_books
                 WHERE created_at >= %s AND created_at < %s
                 GROUP BY d
@@ -348,7 +333,7 @@ def _fetch_catalog_growth_series(start_day: date, end_day: date, max_points: int
     while d <= end_day:
         labels.append(d.strftime("%b %d"))
         books_new.append(_safe_int(books_by_day.get(d, 0)))
-        movies_new.append(_safe_int(movies_by_day.get(d, 0)))
+        movies_new.append(0)
         audio_new.append(_safe_int(audio_by_day.get(d, 0)))
         unindexed_new.append(_safe_int(unindexed_by_day.get(d, 0)))
         d += timedelta(days=1)
@@ -516,16 +501,15 @@ def _fetch_catalog_additions(start_day: date, end_day: date) -> dict[str, int]:
                 """
                 SELECT
                     (SELECT COUNT(*) FROM books WHERE created_at >= %s AND created_at < %s) AS books_added,
-                    (SELECT COUNT(*) FROM movies WHERE created_at >= %s AND created_at < %s) AS movies_added,
                     (SELECT COUNT(*) FROM audio_books WHERE created_at >= %s AND created_at < %s) AS audios_added
                 """,
-                (start_dt, end_dt, start_dt, end_dt, start_dt, end_dt),
+                (start_dt, end_dt, start_dt, end_dt),
             )
-            row = cur.fetchone() or (0, 0, 0)
+            row = cur.fetchone() or (0, 0)
             return {
                 "books": _safe_int(row[0], 0),
-                "movies": _safe_int(row[1], 0),
-                "audios": _safe_int(row[2], 0),
+                "movies": 0,
+                "audios": _safe_int(row[1], 0),
             }
 
 
@@ -878,8 +862,7 @@ def _fetch_feature_usage(start_day: date, end_day: date) -> list[dict[str, Any]]
                 cur.execute("SELECT COUNT(*) FROM book_reactions WHERE ts >= %s AND ts < %s", (start_dt, end_dt))
                 metrics["Book Reactions"] = _safe_int((cur.fetchone() or [0])[0], 0)
 
-                cur.execute("SELECT COUNT(*) FROM movie_reactions WHERE ts >= %s AND ts < %s", (start_dt, end_dt))
-                metrics["Movie Reactions"] = _safe_int((cur.fetchone() or [0])[0], 0)
+                metrics["Movie Reactions"] = 0
 
                 cur.execute(
                     """
@@ -912,9 +895,7 @@ def _fetch_feature_usage(start_day: date, end_day: date) -> list[dict[str, Any]]
         return rows[:10]
     return [
         {"name": "Book Search", "count": 0, "pct": 0.0},
-        {"name": "Movie Search", "count": 0, "pct": 0.0},
         {"name": "Book Downloads", "count": 0, "pct": 0.0},
-        {"name": "Movie Downloads", "count": 0, "pct": 0.0},
         {"name": "Book Requests", "count": 0, "pct": 0.0},
         {"name": "Upload Requests", "count": 0, "pct": 0.0},
     ]
@@ -937,10 +918,6 @@ def _fetch_peak_hours(start_day: date, end_day: date) -> list[dict[str, Any]]:
       FROM book_reactions
       WHERE ts >= %s AND ts < %s
       UNION ALL
-      SELECT EXTRACT(HOUR FROM ts)::int AS hr
-      FROM movie_reactions
-      WHERE ts >= %s AND ts < %s
-      UNION ALL
       SELECT EXTRACT(HOUR FROM COALESCE(last_ts, ts))::int AS hr
       FROM user_recents
       WHERE COALESCE(last_ts, ts) >= %s AND COALESCE(last_ts, ts) < %s
@@ -953,7 +930,7 @@ def _fetch_peak_hours(start_day: date, end_day: date) -> list[dict[str, Any]]:
     try:
         with db_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (start_dt, end_dt, start_dt, end_dt, start_dt, end_dt, start_dt, end_dt, start_dt, end_dt))
+                cur.execute(sql, (start_dt, end_dt, start_dt, end_dt, start_dt, end_dt, start_dt, end_dt))
                 for hr, cnt in cur.fetchall() or []:
                     if hr is None:
                         continue
@@ -1622,7 +1599,7 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
     request_status = _fetch_status_counts_in_range("book_requests", start_dt, end_dt) if db_ok else {}
     upload_status = _fetch_status_counts_in_range("upload_requests", start_dt, end_dt) if db_ok else {}
     reactions = _safe_call("get_reaction_totals", get_reaction_totals, {"like": 0, "dislike": 0, "berry": 0, "whale": 0}) if db_ok else {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
-    movie_reactions = _safe_call("get_movie_reaction_totals", get_movie_reaction_totals, {"like": 0, "dislike": 0, "berry": 0, "whale": 0}) if db_ok else {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
+    movie_reactions = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
     book_totals = _safe_call("get_book_totals", get_book_totals, {"total": 0, "indexed": 0, "downloads": 0, "searches": 0}) if db_ok else {"total": 0, "indexed": 0, "downloads": 0, "searches": 0}
     audio_stats = _safe_call(
         "get_audio_book_stats",
@@ -1725,9 +1702,9 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
     books_unindexed = max(0, books_total - books_indexed)
     books_index_ratio = _ratio_pct(books_indexed, books_total)
 
-    movies_total = _safe_int(db_counts.get("movies", 0))
-    movies_indexed = _query_scalar("SELECT COUNT(*) FROM movies WHERE indexed = TRUE") if db_ok else 0
-    movies_index_ratio = _ratio_pct(movies_indexed, movies_total)
+    movies_total = 0
+    movies_indexed = 0
+    movies_index_ratio = 0.0
 
     audio_total = _safe_int(audio_stats.get("total_audiobooks", 0))
     audio_books_with_books = _safe_int(audio_stats.get("books_with_audiobooks", 0))
