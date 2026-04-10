@@ -32,6 +32,8 @@ downloads/
 tmp/
 *.log
 *.pid
+log_analysis.txt
+.codex
 *_result.txt
 *_results.txt
 *_test.txt
