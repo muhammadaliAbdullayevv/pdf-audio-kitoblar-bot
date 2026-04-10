@@ -35,7 +35,6 @@ from db import (  # noqa: E402
     get_counters,
     get_db_stats,
     get_favorites_total,
-    get_movie_reaction_totals,
     get_reaction_totals,
     get_storage_stats,
     get_user_status_counts,
@@ -325,7 +324,6 @@ def _fetch_catalog_growth_series(start_day: date, end_day: date, max_points: int
 
     labels: list[str] = []
     books_new: list[int] = []
-    movies_new: list[int] = []
     audio_new: list[int] = []
     unindexed_new: list[int] = []
 
@@ -333,18 +331,16 @@ def _fetch_catalog_growth_series(start_day: date, end_day: date, max_points: int
     while d <= end_day:
         labels.append(d.strftime("%b %d"))
         books_new.append(_safe_int(books_by_day.get(d, 0)))
-        movies_new.append(0)
         audio_new.append(_safe_int(audio_by_day.get(d, 0)))
         unindexed_new.append(_safe_int(unindexed_by_day.get(d, 0)))
         d += timedelta(days=1)
 
-    labels, series = _downsample_series(labels, [books_new, movies_new, audio_new, unindexed_new], max_points=max_points)
+    labels, series = _downsample_series(labels, [books_new, audio_new, unindexed_new], max_points=max_points)
     return {
         "labels": labels,
         "books_new": series[0],
-        "movies_new": series[1],
-        "audio_new": series[2],
-        "unindexed_new": series[3],
+        "audio_new": series[1],
+        "unindexed_new": series[2],
     }
 
 
@@ -508,7 +504,6 @@ def _fetch_catalog_additions(start_day: date, end_day: date) -> dict[str, int]:
             row = cur.fetchone() or (0, 0)
             return {
                 "books": _safe_int(row[0], 0),
-                "movies": 0,
                 "audios": _safe_int(row[1], 0),
             }
 
@@ -528,42 +523,13 @@ def _fetch_search_quality(start_day: date, end_day: date) -> dict[str, Any]:
     start_dt, end_dt = _day_bounds(start_day, end_day)
     with db_conn() as conn:
         with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    """
-                    SELECT
-                        COALESCE(SUM(searches), 0),
-                        COALESCE(SUM(buttons), 0),
-                        COALESCE(SUM(movie_searches), 0),
-                        COALESCE(SUM(movie_downloads), 0)
-                    FROM analytics_daily
-                    WHERE day >= %s AND day <= %s
-                    """,
-                    (start_day, end_day),
-                )
-                sums_row = cur.fetchone() or (0, 0, 0, 0)
-                searches_total = _safe_int(sums_row[0])
-                downloads_total = _safe_int(sums_row[1])
-                movie_searches_total = _safe_int(sums_row[2])
-                movie_downloads_total = _safe_int(sums_row[3])
-            except Exception as e:
-                # Compatibility for DBs where split columns are not migrated yet.
-                err = str(e).lower()
-                if "movie_searches" not in err and "movie_downloads" not in err:
-                    raise
-                logger.warning("analytics_daily split columns missing, using legacy totals: %s", e)
-                conn.rollback()
-                cur.execute(
-                    "SELECT COALESCE(SUM(searches), 0), COALESCE(SUM(buttons), 0) FROM analytics_daily WHERE day >= %s AND day <= %s",
-                    (start_day, end_day),
-                )
-                sums_row = cur.fetchone() or (0, 0)
-                searches_total = _safe_int(sums_row[0])
-                downloads_total = _safe_int(sums_row[1])
-                movie_searches_total = 0
-                movie_downloads_total = 0
-            book_searches_total = max(0, searches_total - movie_searches_total)
-            book_downloads_total = max(0, downloads_total - movie_downloads_total)
+            cur.execute(
+                "SELECT COALESCE(SUM(searches), 0), COALESCE(SUM(buttons), 0) FROM analytics_daily WHERE day >= %s AND day <= %s",
+                (start_day, end_day),
+            )
+            sums_row = cur.fetchone() or (0, 0)
+            searches_total = _safe_int(sums_row[0])
+            downloads_total = _safe_int(sums_row[1])
 
             cur.execute(
                 "SELECT COUNT(*) FROM book_requests WHERE created_at >= %s AND created_at < %s",
@@ -612,10 +578,8 @@ def _fetch_search_quality(start_day: date, end_day: date) -> dict[str, Any]:
     return {
         "searches_total": searches_total,
         "downloads_total": downloads_total,
-        "book_searches_total": book_searches_total,
-        "movie_searches_total": movie_searches_total,
-        "book_downloads_total": book_downloads_total,
-        "movie_downloads_total": movie_downloads_total,
+        "book_searches_total": searches_total,
+        "book_downloads_total": downloads_total,
         "conversion_pct": _ratio_pct(downloads_total, searches_total or 1),
         "request_queries_total": request_queries_total,
         "zero_result_total": zero_result_total,
@@ -794,61 +758,28 @@ def _fetch_feature_usage(start_day: date, end_day: date) -> list[dict[str, Any]]
     start_dt, end_dt = _day_bounds(start_day, end_day)
     metrics = {
         "Book Search": 0,
-        "Movie Search": 0,
         "Book Downloads": 0,
-        "Movie Downloads": 0,
         "Book Requests": 0,
         "Upload Requests": 0,
         "Favorites Added": 0,
         "Book Reactions": 0,
-        "Movie Reactions": 0,
         "Downloader Users": 0,
     }
 
     try:
         with db_conn() as conn:
             with conn.cursor() as cur:
-                try:
-                    cur.execute(
-                        """
-                        SELECT
-                            COALESCE(SUM(searches), 0),
-                            COALESCE(SUM(buttons), 0),
-                            COALESCE(SUM(movie_searches), 0),
-                            COALESCE(SUM(movie_downloads), 0)
-                        FROM analytics_daily
-                        WHERE day >= %s AND day <= %s
-                        """,
-                        (start_day, end_day),
-                    )
-                    row = cur.fetchone() or (0, 0, 0, 0)
-                    total_searches = _safe_int(row[0], 0)
-                    total_downloads = _safe_int(row[1], 0)
-                    movie_searches = _safe_int(row[2], 0)
-                    movie_downloads = _safe_int(row[3], 0)
-                except Exception as e:
-                    err = str(e).lower()
-                    if "movie_searches" not in err and "movie_downloads" not in err:
-                        raise
-                    logger.warning("feature_usage split columns missing, using legacy totals: %s", e)
-                    conn.rollback()
-                    cur.execute(
-                        """
-                        SELECT COALESCE(SUM(searches), 0), COALESCE(SUM(buttons), 0)
-                        FROM analytics_daily
-                        WHERE day >= %s AND day <= %s
-                        """,
-                        (start_day, end_day),
-                    )
-                    row = cur.fetchone() or (0, 0)
-                    total_searches = _safe_int(row[0], 0)
-                    total_downloads = _safe_int(row[1], 0)
-                    movie_searches = 0
-                    movie_downloads = 0
-                metrics["Movie Search"] = movie_searches
-                metrics["Movie Downloads"] = movie_downloads
-                metrics["Book Search"] = max(0, total_searches - movie_searches)
-                metrics["Book Downloads"] = max(0, total_downloads - movie_downloads)
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(searches), 0), COALESCE(SUM(buttons), 0)
+                    FROM analytics_daily
+                    WHERE day >= %s AND day <= %s
+                    """,
+                    (start_day, end_day),
+                )
+                row = cur.fetchone() or (0, 0)
+                metrics["Book Search"] = _safe_int(row[0], 0)
+                metrics["Book Downloads"] = _safe_int(row[1], 0)
 
                 cur.execute("SELECT COUNT(*) FROM book_requests WHERE created_at >= %s AND created_at < %s", (start_dt, end_dt))
                 metrics["Book Requests"] = _safe_int((cur.fetchone() or [0])[0], 0)
@@ -861,8 +792,6 @@ def _fetch_feature_usage(start_day: date, end_day: date) -> list[dict[str, Any]]
 
                 cur.execute("SELECT COUNT(*) FROM book_reactions WHERE ts >= %s AND ts < %s", (start_dt, end_dt))
                 metrics["Book Reactions"] = _safe_int((cur.fetchone() or [0])[0], 0)
-
-                metrics["Movie Reactions"] = 0
 
                 cur.execute(
                     """
@@ -1412,6 +1341,7 @@ def _feature_mix_from_counters(
     feature_usage: list[dict[str, Any]] | None = None,
     range_key: str = "week",
 ) -> list[dict[str, Any]]:
+    del counters, range_key
     usage_map: dict[str, int] = {}
     for row in feature_usage or []:
         name = str(row.get("name", "")).strip()
@@ -1431,27 +1361,17 @@ def _feature_mix_from_counters(
         _safe_int(usage_map.get("Book Requests", 0), 0)
         + _safe_int(usage_map.get("Upload Requests", 0), 0)
         + _safe_int(usage_map.get("Favorites Added", 0), 0)
-        + _safe_int(usage_map.get("Book Reactions", 0), 0)
-        + _safe_int(usage_map.get("Movie Reactions", 0), 0),
+        + _safe_int(usage_map.get("Book Reactions", 0), 0),
     )
 
-    use_lifetime = str(range_key or "").lower() == "all"
-    movie_search = 0
-    ai_tools = 0
-    if use_lifetime:
-        movie_search = _safe_int(counters.get("movie_search_total", 0)) + _safe_int(counters.get("movie_searches", 0))
-        ai_tools = sum(_safe_int(v) for k, v in counters.items() if str(k).startswith("ai_"))
-
-    if book_search + video_dl + other + movie_search + ai_tools <= 0:
+    if book_search + video_dl + other <= 0:
         book_search = max(0, _safe_int(searches_total))
         video_dl = max(0, _safe_int(downloads_total))
         other = 0
 
     raw = [
         {"name": "Book Search", "value": max(0, book_search), "color": "#2ca58d"},
-        {"name": "AI Tools", "value": max(0, ai_tools), "color": "#f2994a"},
         {"name": "Video Downloader", "value": max(0, video_dl), "color": "#3f88c5"},
-        {"name": "Movie Search", "value": max(0, movie_search), "color": "#ef6f6c"},
         {"name": "Other", "value": max(0, other), "color": "#7f8c9f"},
     ]
 
@@ -1496,7 +1416,7 @@ def _command_load_from_counters(counters: dict[str, int]) -> list[dict[str, Any]
             {"name": "/start", "count": 0},
             {"name": "Search Books", "count": 0},
             {"name": "Video Downloader", "count": 0},
-            {"name": "AI Tools", "count": 0},
+            {"name": "Other Functions", "count": 0},
         ]
     return [{"name": name, "count": count} for name, count in top]
 
@@ -1599,7 +1519,6 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
     request_status = _fetch_status_counts_in_range("book_requests", start_dt, end_dt) if db_ok else {}
     upload_status = _fetch_status_counts_in_range("upload_requests", start_dt, end_dt) if db_ok else {}
     reactions = _safe_call("get_reaction_totals", get_reaction_totals, {"like": 0, "dislike": 0, "berry": 0, "whale": 0}) if db_ok else {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
-    movie_reactions = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
     book_totals = _safe_call("get_book_totals", get_book_totals, {"total": 0, "indexed": 0, "downloads": 0, "searches": 0}) if db_ok else {"total": 0, "indexed": 0, "downloads": 0, "searches": 0}
     audio_stats = _safe_call(
         "get_audio_book_stats",
@@ -1663,9 +1582,7 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
         "searches_total": 0,
         "downloads_total": 0,
         "book_searches_total": 0,
-        "movie_searches_total": 0,
         "book_downloads_total": 0,
-        "movie_downloads_total": 0,
         "conversion_pct": 0.0,
         "request_queries_total": 0,
         "zero_result_total": 0,
@@ -1677,14 +1594,12 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
         "searches_total": 0,
         "downloads_total": 0,
         "book_searches_total": 0,
-        "movie_searches_total": 0,
         "book_downloads_total": 0,
-        "movie_downloads_total": 0,
     }
     user_changes = _fetch_user_join_leave_counts(start_day, end_day) if db_ok else {"joined": 0, "left": 0}
     user_changes_prev = _fetch_user_join_leave_counts(prev_start_day, prev_end_day) if db_ok else {"joined": 0, "left": 0}
-    catalog_additions = _fetch_catalog_additions(start_day, end_day) if db_ok else {"books": 0, "movies": 0, "audios": 0}
-    catalog_additions_prev = _fetch_catalog_additions(prev_start_day, prev_end_day) if db_ok else {"books": 0, "movies": 0, "audios": 0}
+    catalog_additions = _fetch_catalog_additions(start_day, end_day) if db_ok else {"books": 0, "audios": 0}
+    catalog_additions_prev = _fetch_catalog_additions(prev_start_day, prev_end_day) if db_ok else {"books": 0, "audios": 0}
     queue_sla = _fetch_queue_sla(start_day, end_day) if db_ok else {
         "pending_upload_count": 0,
         "oldest_pending_age_sec": 0,
@@ -1701,10 +1616,6 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
     books_indexed = _safe_int(book_totals.get("indexed", db_counts.get("books_indexed", 0)))
     books_unindexed = max(0, books_total - books_indexed)
     books_index_ratio = _ratio_pct(books_indexed, books_total)
-
-    movies_total = 0
-    movies_indexed = 0
-    movies_index_ratio = 0.0
 
     audio_total = _safe_int(audio_stats.get("total_audiobooks", 0))
     audio_books_with_books = _safe_int(audio_stats.get("books_with_audiobooks", 0))
@@ -1752,7 +1663,6 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
     catalog_growth = _fetch_catalog_growth_series(start_day, end_day, max_points=60) if db_ok else {
         "labels": [],
         "books_new": [],
-        "movies_new": [],
         "audio_new": [],
         "unindexed_new": [],
     }
@@ -1766,49 +1676,27 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
     searches_total_prev = _safe_int(search_quality_prev.get("searches_total", 0))
     downloads_total_prev = _safe_int(search_quality_prev.get("downloads_total", 0))
     book_searches_range = _safe_int(search_quality.get("book_searches_total", searches_total_range))
-    movie_searches_range = _safe_int(search_quality.get("movie_searches_total", 0))
     book_downloads_range = _safe_int(search_quality.get("book_downloads_total", downloads_total_range))
-    movie_downloads_range = _safe_int(search_quality.get("movie_downloads_total", 0))
     book_searches_prev = _safe_int(search_quality_prev.get("book_searches_total", searches_total_prev))
-    movie_searches_prev = _safe_int(search_quality_prev.get("movie_searches_total", 0))
     book_downloads_prev = _safe_int(search_quality_prev.get("book_downloads_total", downloads_total_prev))
-    movie_downloads_prev = _safe_int(search_quality_prev.get("movie_downloads_total", 0))
     joined_users_range = _safe_int(user_changes.get("joined", 0))
     left_users_range = _safe_int(user_changes.get("left", 0))
     joined_users_prev = _safe_int(user_changes_prev.get("joined", 0))
     left_users_prev = _safe_int(user_changes_prev.get("left", 0))
     added_books_range = _safe_int(catalog_additions.get("books", 0))
-    added_movies_range = _safe_int(catalog_additions.get("movies", 0))
     added_audios_range = _safe_int(catalog_additions.get("audios", 0))
     added_books_prev = _safe_int(catalog_additions_prev.get("books", 0))
-    added_movies_prev = _safe_int(catalog_additions_prev.get("movies", 0))
     added_audios_prev = _safe_int(catalog_additions_prev.get("audios", 0))
     active_users_range = _safe_int(funnel.get("active_users", 0))
     active_users_prev = _safe_int(retention.get("active_prev_in_range", 0))
 
     current_book_reaction_total = sum(_safe_int(v) for v in reactions.values())
-    current_movie_reaction_total = sum(_safe_int(v) for v in movie_reactions.values())
-
-    # Historical rows were stored only as combined searches/buttons.
-    # For all-time view, prefer lifetime movie counters to avoid over-attributing
-    # all legacy traffic to books.
-    if range_key_norm == "all":
-        movie_searches_lifetime = _safe_int(counters.get("movie_search_total", 0)) + _safe_int(counters.get("movie_searches", 0))
-        movie_downloads_lifetime = _safe_int(counters.get("movie_download_total", 0))
-        if movie_searches_lifetime > 0:
-            movie_searches_range = min(searches_total_range, max(movie_searches_range, movie_searches_lifetime))
-            book_searches_range = max(0, searches_total_range - movie_searches_range)
-        if movie_downloads_lifetime > 0:
-            movie_downloads_range = min(downloads_total_range, max(movie_downloads_range, movie_downloads_lifetime))
-            book_downloads_range = max(0, downloads_total_range - movie_downloads_range)
 
     # In all-time mode, "new/added" metrics should represent lifetime totals.
     if range_key_norm == "all":
         added_books_range = books_total
-        added_movies_range = movies_total
         added_audios_range = audio_total
         added_books_prev = 0
-        added_movies_prev = 0
         added_audios_prev = 0
 
     def _kpi_change(now_val: int, prev_val: int) -> str:
@@ -1822,28 +1710,9 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
         "berry": max(_safe_int(counters.get("reaction_berry", 0)), _safe_int(reactions.get("berry", 0))),
         "whale": max(_safe_int(counters.get("reaction_whale", 0)), _safe_int(reactions.get("whale", 0))),
     }
-    lifetime_movie_reactions = {
-        "like": max(_safe_int(counters.get("movie_reaction_like", 0)), _safe_int(movie_reactions.get("like", 0))),
-        "dislike": max(_safe_int(counters.get("movie_reaction_dislike", 0)), _safe_int(movie_reactions.get("dislike", 0))),
-        "berry": max(_safe_int(counters.get("movie_reaction_berry", 0)), _safe_int(movie_reactions.get("berry", 0))),
-        "whale": max(_safe_int(counters.get("movie_reaction_whale", 0)), _safe_int(movie_reactions.get("whale", 0))),
-    }
-
-    reaction_total_current = current_book_reaction_total + current_movie_reaction_total
-    reaction_total_range = _safe_int(next((x.get("count", 0) for x in feature_usage if x.get("name") == "Book Reactions"), 0)) + _safe_int(
-        next((x.get("count", 0) for x in feature_usage if x.get("name") == "Movie Reactions"), 0)
-    )
+    reaction_total_current = current_book_reaction_total
+    reaction_total_range = _safe_int(next((x.get("count", 0) for x in feature_usage if x.get("name") == "Book Reactions"), 0))
     favorites_added_range = _safe_int(next((x.get("count", 0) for x in feature_usage if x.get("name") == "Favorites Added"), 0))
-    ai_breakdown = {
-        "chat": _safe_int(counters.get("ai_chat_sessions", 0)),
-        "translator": _safe_int(counters.get("ai_translator_uses", 0)),
-        "grammar": _safe_int(counters.get("ai_grammar_fixes", 0)),
-        "email": _safe_int(counters.get("ai_email_writes", 0)),
-        "quiz": _safe_int(counters.get("ai_quiz_generated", 0)),
-        "music": _safe_int(counters.get("ai_music_generated", 0)),
-        "pdf": _safe_int(counters.get("ai_pdf_created", 0)),
-    }
-    ai_total = sum(ai_breakdown.values())
 
     command_rows = [
         {
@@ -1929,34 +1798,14 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
                 "change": _kpi_change(added_books_range, added_books_prev),
                 "scope": "range",
             },
-            "movies_total": {
-                "value": movies_total,
-                "change": f"{movies_indexed} indexed ({movies_index_ratio:.1f}%)",
-                "scope": "lifetime",
-            },
-            "movies_new": {
-                "value": added_movies_range,
-                "change": _kpi_change(added_movies_range, added_movies_prev),
-                "scope": "range",
-            },
             "book_searches": {
                 "value": book_searches_range,
                 "change": _kpi_change(book_searches_range, book_searches_prev),
                 "scope": "range",
             },
-            "movie_searches": {
-                "value": movie_searches_range,
-                "change": _kpi_change(movie_searches_range, movie_searches_prev),
-                "scope": "range",
-            },
             "book_downloads": {
                 "value": book_downloads_range,
                 "change": _kpi_change(book_downloads_range, book_downloads_prev),
-                "scope": "range",
-            },
-            "movie_downloads": {
-                "value": movie_downloads_range,
-                "change": _kpi_change(movie_downloads_range, movie_downloads_prev),
                 "scope": "range",
             },
             "searches": {
@@ -2005,9 +1854,6 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
             "books_index_ratio": books_index_ratio,
             "books_downloads_total": _safe_int(book_totals.get("downloads", 0)),
             "books_searches_total": _safe_int(book_totals.get("searches", 0)),
-            "movies_total": movies_total,
-            "movies_indexed": movies_indexed,
-            "movies_index_ratio": movies_index_ratio,
             "audio_books_total": audio_total,
             "audio_books_with_source_books": audio_books_with_books,
             "audio_parts_total": audio_parts_total,
@@ -2094,13 +1940,9 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
             "favorites_added_total": favorites_added_range,
             "favorites_removed_total": _safe_int(counters.get("favorite_removed", 0)),
             "book_reactions_current": reactions,
-            "movie_reactions_current": movie_reactions,
             "book_reactions_lifetime": lifetime_book_reactions,
-            "movie_reactions_lifetime": lifetime_movie_reactions,
             "reaction_total_current": reaction_total_range if reaction_total_range > 0 else reaction_total_current,
-            "reaction_total_lifetime": sum(lifetime_book_reactions.values()) + sum(lifetime_movie_reactions.values()),
-            "ai_total": ai_total,
-            "ai_breakdown": ai_breakdown,
+            "reaction_total_lifetime": sum(lifetime_book_reactions.values()),
             "favorites_per_active_user": round(_safe_float(favorites_total) / max(1, active_users_range), 2),
             "reactions_per_active_user": round(_safe_float(reaction_total_current) / max(1, active_users_range), 2),
         },
@@ -2119,7 +1961,6 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
             "users_allowed": users_allowed,
             "books_total": books_total,
             "books_indexed": books_indexed,
-            "movies_total": movies_total,
             "reactions_current_total": reaction_total_current,
             "queue_pending": _safe_int(queue_pending),
         },
@@ -2168,7 +2009,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Smart AI Tools Bot local dashboard server")
+    parser = argparse.ArgumentParser(description="Pdf va audio kitoblar local dashboard server")
     parser.add_argument("--host", default=os.getenv("DASHBOARD_HOST", "127.0.0.1"), help="Bind host")
     parser.add_argument(
         "--port",

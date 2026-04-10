@@ -14,7 +14,7 @@ from telegram import (
 )
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
-_PUBLIC_PREFERRED_ORDER = ("start", "random", "language", "myprofile", "favorite", "request", "requests")
+_PUBLIC_PREFERRED_ORDER = ("start", "random", "language", "help", "upload")
 _COMMAND_SYNC_BACKOFF_KEY = "command_sync_backoff_until"
 _USER_COMMANDS_LANG_CACHE_KEY = "user_commands_lang_cache"
 _USER_COMMANDS_LAST_SYNC_KEY = "user_commands_last_sync"
@@ -26,53 +26,23 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
         "en": [
             BotCommand("start", "🚀 Start / choose language"),
             BotCommand("random", "🎲 Get 10 random books"),
-            BotCommand("help", "❓ How to use the bot"),
-            BotCommand("pdf_maker", "📄 Make PDF from text"),
-            BotCommand("pdf_editor", "🧰 Edit PDF files"),
-            BotCommand("text_to_voice", "🎙️ Convert text to voice"),
-            BotCommand("myprofile", "👤 My profile"),
-            BotCommand("top", "🔥 Top books"),
-            BotCommand("top_users", "🏆 Top users"),
-            BotCommand("favorite", "⭐ Your favorites"),
-            BotCommand("request", "📝 Request a book"),
-            BotCommand("requests", "📋 Your requests"),
-            BotCommand("my_quiz", "📝 My saved quiz tests"),
             BotCommand("upload", "⬆️ Upload books to the bot"),
             BotCommand("language", "🌐 Change language"),
+            BotCommand("help", "❓ How to use the bot"),
         ],
         "ru": [
             BotCommand("start", "🚀 Запуск / выбор языка"),
             BotCommand("random", "🎲 10 случайных книг"),
-            BotCommand("help", "❓ Как пользоваться ботом"),
-            BotCommand("pdf_maker", "📄 PDF из текста"),
-            BotCommand("pdf_editor", "🧰 Редактировать PDF"),
-            BotCommand("text_to_voice", "🎙️ Текст в голос"),
-            BotCommand("myprofile", "👤 Профиль"),
-            BotCommand("top", "🔥 Топ книги"),
-            BotCommand("top_users", "🏆 Топ пользователей"),
-            BotCommand("favorite", "⭐ Избранные книги"),
-            BotCommand("request", "📝 Запросить книгу"),
-            BotCommand("requests", "📋 Мои запросы"),
-            BotCommand("my_quiz", "📝 Мои quiz-тесты"),
             BotCommand("upload", "⬆️ Загружать книги в бота"),
             BotCommand("language", "🌐 Сменить язык"),
+            BotCommand("help", "❓ Как пользоваться ботом"),
         ],
         "uz": [
             BotCommand("start", "🚀 Botni ishga tushirish / til tanlash"),
             BotCommand("random", "🎲 10 ta tasodifiy kitob"),
-            BotCommand("help", "❓ Botdan foydalanish"),
-            BotCommand("pdf_maker", "📄 Matndan PDF yaratish"),
-            BotCommand("pdf_editor", "🧰 PDF fayl tahrirlash"),
-            BotCommand("text_to_voice", "🎙️ Matndan ovoz yaratish"),
-            BotCommand("myprofile", "👤 Profilim"),
-            BotCommand("top", "🔥 Top kitoblar"),
-            BotCommand("top_users", "🏆 Top foydalanuvchilar"),
-            BotCommand("favorite", "⭐ Sevimli kitoblar"),
-            BotCommand("request", "📝 Kitob so‘rash"),
-            BotCommand("requests", "📋 So‘rovlarim"),
-            BotCommand("my_quiz", "📝 Mening quiz testlarim"),
             BotCommand("upload", "⬆️ Botga kitob yuklash"),
             BotCommand("language", "🌐 Tilni o‘zgartirish"),
+            BotCommand("help", "❓ Botdan foydalanish"),
         ],
     }
     return localized.get(lang, localized["en"])
@@ -118,7 +88,7 @@ def _set_sync_backoff(application, seconds: float) -> None:
 def get_group_commands(lang: str = "en") -> list[BotCommand]:
     by_name = {cmd.command: cmd for cmd in get_public_commands(lang)}
     ordered: list[BotCommand] = []
-    for name in ("start", "language", "random"):
+    for name in ("start", "random", "language", "help", "upload"):
         cmd = by_name.get(name)
         if cmd:
             ordered.append(cmd)
@@ -131,31 +101,7 @@ def get_group_admin_commands(lang: str = "en") -> list[BotCommand]:
 
 
 def get_admin_commands(lang: str = "en") -> list[BotCommand]:
-    # Keep upload commands out of public menu, but include them for admin command menu.
-    base = list(get_public_commands_for_menu(lang))
-    by_name = {cmd.command: cmd for cmd in get_public_commands(lang)}
-    present = {cmd.command for cmd in base}
-    for name in ("upload",):
-        cmd = by_name.get(name)
-        if cmd and name not in present:
-            base.append(cmd)
-
-    return base + [
-        BotCommand("admin", "🛠️ Admin control panel"),
-        BotCommand("smoke", "🧪 Smoke test checklist (admin)"),
-        BotCommand("broadcast", "📣 Broadcast to all users (admin)"),
-        BotCommand("audit", "🧾 Audit stats (admin)"),
-        BotCommand("prune", "🧹 Remove blocked users (admin)"),
-        BotCommand("missing", "⚠️ Missing book files (admin)"),
-        BotCommand("db_dupes", "🧼 Clean DB duplicates (admin)"),
-        BotCommand("es_dupes", "🧼 Clean ES duplicates (admin)"),
-        BotCommand("dupes_status", "📊 Duplicate cleanup status (admin)"),
-        BotCommand("cancel_task", "🛑 Cancel background task (admin)"),
-        BotCommand("user", "👤 Search users (admin)"),
-        BotCommand("pause_bot", "⏸️ Pause the bot (admin)"),
-        BotCommand("resume_bot", "▶️ Resume the bot (admin)"),
-        BotCommand("upload_local_books", "⬆️ Upload local books (admin)"),
-    ]
+    return list(get_public_commands_for_menu(lang))
 
 
 async def set_bot_commands(

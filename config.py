@@ -1,5 +1,5 @@
 import os
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 _CONFIG_ERRORS: list[str] = []
 
@@ -28,19 +28,38 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_PATH = os.path.join(_BASE_DIR, ".env")
 _DOTENV_OVERRIDE = _env_bool("DOTENV_OVERRIDE", False)
 load_dotenv(dotenv_path=_ENV_PATH, override=_DOTENV_OVERRIDE)
+_PROJECT_DOTENV = dotenv_values(_ENV_PATH) if os.path.exists(_ENV_PATH) else {}
+
+
+def _env_project_first(name: str, default: str = "") -> str:
+    value = _PROJECT_DOTENV.get(name, None)
+    if value is not None:
+        text = str(value).strip()
+        if text:
+            return text
+    return str(os.getenv(name, default) or "").strip()
 
 # Load secrets/config from environment to avoid committing credentials.
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TOKEN = _env_project_first("TELEGRAM_BOT_TOKEN", "")
 OWNER_ID = _env_int("TELEGRAM_OWNER_ID", 0)
 # Legacy compatibility only. Runtime authorization is owner-only.
 ADMIN_ID = _env_int("TELEGRAM_ADMIN_ID", 0)
 REQUEST_CHAT_ID = _env_int("REQUEST_CHAT_ID", 0)
-_UPLOAD_CHANNEL_ID_RAW = os.getenv("UPLOAD_CHANNEL_ID", "").strip()
-_UPLOAD_CHANNEL_IDS_RAW = os.getenv("UPLOAD_CHANNEL_IDS", "").strip()
-_AUDIO_UPLOAD_CHANNEL_ID_RAW = os.getenv("AUDIO_UPLOAD_CHANNEL_ID", "").strip()
-_AUDIO_UPLOAD_CHANNEL_IDS_RAW = os.getenv("AUDIO_UPLOAD_CHANNEL_IDS", "").strip()
-_VIDEO_UPLOAD_CHANNEL_ID_RAW = os.getenv("VIDEO_UPLOAD_CHANNEL_ID", "").strip()
-_VIDEO_UPLOAD_CHANNEL_IDS_RAW = os.getenv("VIDEO_UPLOAD_CHANNEL_IDS", "").strip()
+try:
+    _req_project = _env_project_first("REQUEST_CHAT_ID", "")
+    if _req_project:
+        REQUEST_CHAT_ID = int(_req_project)
+except Exception:
+    pass
+_BOOK_STORAGE_CHANNEL_ID_RAW = _env_project_first("BOOK_STORAGE_CHANNEL_ID", "")
+try:
+    BOOK_STORAGE_CHANNEL_ID = int(_BOOK_STORAGE_CHANNEL_ID_RAW) if _BOOK_STORAGE_CHANNEL_ID_RAW else 0
+except Exception:
+    BOOK_STORAGE_CHANNEL_ID = 0
+_AUDIO_UPLOAD_CHANNEL_ID_RAW = _env_project_first("AUDIO_UPLOAD_CHANNEL_ID", "")
+_AUDIO_UPLOAD_CHANNEL_IDS_RAW = _env_project_first("AUDIO_UPLOAD_CHANNEL_IDS", "")
+_VIDEO_UPLOAD_CHANNEL_ID_RAW = _env_project_first("VIDEO_UPLOAD_CHANNEL_ID", "")
+_VIDEO_UPLOAD_CHANNEL_IDS_RAW = _env_project_first("VIDEO_UPLOAD_CHANNEL_IDS", "")
 
 def _parse_id_list(raw: str) -> list[int]:
     items = []
@@ -53,14 +72,6 @@ def _parse_id_list(raw: str) -> list[int]:
         except ValueError:
             continue
     return items
-
-_ids = _parse_id_list(_UPLOAD_CHANNEL_IDS_RAW)
-if not _ids:
-    # Allow comma-separated IDs in UPLOAD_CHANNEL_ID as well
-    _ids = _parse_id_list(_UPLOAD_CHANNEL_ID_RAW)
-
-UPLOAD_CHANNEL_IDS = _ids
-UPLOAD_CHANNEL_ID = _ids[0] if _ids else _env_int("UPLOAD_CHANNEL_ID", 0)
 
 _audio_ids = _parse_id_list(_AUDIO_UPLOAD_CHANNEL_IDS_RAW)
 if not _audio_ids:

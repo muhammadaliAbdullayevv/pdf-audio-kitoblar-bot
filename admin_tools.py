@@ -22,8 +22,6 @@ async def handle_admin_menu_action(
     es_dupes_command_fn,
     dupes_status_command_fn,
     cancel_task_command_fn,
-    admin_panel_send_upload_local_status_fn,
-    start_upload_local_books_fn,
 ) -> bool:
     if not update.message:
         return False
@@ -38,7 +36,7 @@ async def handle_admin_menu_action(
         await send_main_menu_fn(update, context, lang, "admin")
         return True
 
-    if action in {"admin_system", "admin_maintenance", "admin_duplicates", "admin_tasks", "admin_uploads"}:
+    if action in {"admin_system", "admin_maintenance", "admin_duplicates", "admin_tasks"}:
         if not admin_only():
             await update.message.reply_text(messages[lang]["admin_only"])
             return True
@@ -47,7 +45,6 @@ async def handle_admin_menu_action(
             "admin_maintenance": "admin_maintenance",
             "admin_duplicates": "admin_duplicates",
             "admin_tasks": "admin_tasks",
-            "admin_uploads": "admin_uploads",
         }
         await send_main_menu_fn(update, context, lang, section_map[action])
         return True
@@ -118,19 +115,6 @@ async def handle_admin_menu_action(
             await dupes_status_command_fn(update, context)
         elif action == "admin_cancel_task":
             await cancel_task_command_fn(update, context)
-        return True
-
-    if action in {"admin_upload_local_status", "admin_upload_local_all", "admin_upload_local_missing", "admin_upload_local_unique", "admin_upload_local_large"}:
-        if not admin_only():
-            await update.message.reply_text(messages[lang]["admin_only"])
-            return True
-        context.user_data["_skip_spam_check_once"] = True
-        if action == "admin_upload_local_status":
-            await admin_panel_send_upload_local_status_fn(update, context)
-        else:
-            mode = action.replace("admin_upload_local_", "")
-            await start_upload_local_books_fn(update, context, mode)
-        context.user_data["main_menu_section"] = "admin_uploads"
         return True
 
     return False

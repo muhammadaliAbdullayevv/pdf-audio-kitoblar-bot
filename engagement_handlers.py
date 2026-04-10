@@ -302,12 +302,15 @@ async def handle_user_action_callback(update: Update, context: ContextTypes.DEFA
     prev_stopped = bool(user.get("stopped"))
     prev_upload = bool(user.get("allowed"))
     prev_delete = bool(user.get("delete_allowed"))
+    prev_audio = bool(user.get("audio_allowed"))
     if action == "block":
         await run_blocking(set_user_blocked, user_id, not bool(user.get("blocked")))
     elif action == "upload":
         await run_blocking(set_user_allowed, user_id, not bool(user.get("allowed")))
     elif action == "del":
         await run_blocking(set_user_delete_allowed, user_id, not bool(user.get("delete_allowed")))
+    elif action == "audio":
+        await run_blocking(set_user_audio_allowed, user_id, not bool(user.get("audio_allowed")))
     elif action == "stop":
         await run_blocking(set_user_stopped, user_id, not bool(user.get("stopped")))
     elif action in {"bonus_add", "bonus_del"}:
@@ -350,6 +353,12 @@ async def handle_user_action_callback(update: Update, context: ContextTypes.DEFA
         notice_lang = user.get("language") or "en"
         try:
             await context.bot.send_message(chat_id=user_id, text=MESSAGES[notice_lang]["delete_allowed_notice"])
+        except Exception:
+            pass
+    if action == "audio" and not prev_audio and bool(user.get("audio_allowed")):
+        notice_lang = user.get("language") or "en"
+        try:
+            await context.bot.send_message(chat_id=user_id, text=MESSAGES[notice_lang]["audio_allowed_notice"])
         except Exception:
             pass
 
@@ -619,11 +628,12 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
             # Check if book has audiobook
             audio_book = await run_blocking(get_audio_book_for_book, book_id)
             has_ab = bool(audio_book)
-            can_add_ab = (
-                bool(_is_admin_user(query.from_user.id))
-                if allow_management_buttons and callable(globals().get("_is_admin_user"))
-                else False
-            )
+            can_add_ab = False
+            if allow_management_buttons and callable(globals().get("is_audio_allowed")):
+                try:
+                    can_add_ab = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+                except Exception:
+                    can_add_ab = False
             is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
             show_listen_btn = has_ab if (is_group_chat or is_owner_user) else True
             ab_request_count = 0
@@ -726,11 +736,12 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
             # Check if book has audiobook
             audio_book = await run_blocking(get_audio_book_for_book, book_id)
             has_ab = bool(audio_book)
-            can_add_ab = (
-                bool(_is_admin_user(query.from_user.id))
-                if allow_management_buttons and callable(globals().get("_is_admin_user"))
-                else False
-            )
+            can_add_ab = False
+            if allow_management_buttons and callable(globals().get("is_audio_allowed")):
+                try:
+                    can_add_ab = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+                except Exception:
+                    can_add_ab = False
             is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
             show_listen_btn = has_ab if (is_group_chat or is_owner_user) else True
             ab_request_count = 0

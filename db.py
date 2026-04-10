@@ -89,32 +89,6 @@ def _apply_schema_migrations(cur) -> None:
             ],
         ),
         (
-            5,
-            "movies: add movie_reactions table",
-            [
-                """
-                CREATE TABLE IF NOT EXISTS movie_reactions (
-                    movie_id TEXT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    reaction TEXT NOT NULL,
-                    ts TIMESTAMP NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (movie_id, user_id)
-                );
-                """,
-                "CREATE INDEX IF NOT EXISTS idx_movie_reactions_movie ON movie_reactions (movie_id);",
-            ],
-        ),
-        (
-            6,
-            "analytics: split movie search/download counters for daily and per-user stats",
-            [
-                "ALTER TABLE analytics_daily ADD COLUMN IF NOT EXISTS movie_searches INTEGER NOT NULL DEFAULT 0;",
-                "ALTER TABLE analytics_daily ADD COLUMN IF NOT EXISTS movie_downloads INTEGER NOT NULL DEFAULT 0;",
-                "ALTER TABLE analytics_daily_users ADD COLUMN IF NOT EXISTS movie_searches INTEGER NOT NULL DEFAULT 0;",
-                "ALTER TABLE analytics_daily_users ADD COLUMN IF NOT EXISTS movie_downloads INTEGER NOT NULL DEFAULT 0;",
-            ],
-        ),
-        (
             7,
             "users: store separate group language preference",
             [
@@ -127,6 +101,60 @@ def _apply_schema_migrations(cur) -> None:
             [
                 "DROP TABLE IF EXISTS movie_reactions;",
                 "DROP TABLE IF EXISTS movies;",
+            ],
+        ),
+        (
+            9,
+            "remove legacy movie analytics columns and quiz storage",
+            [
+                "ALTER TABLE analytics_daily DROP COLUMN IF EXISTS movie_searches;",
+                "ALTER TABLE analytics_daily DROP COLUMN IF EXISTS movie_downloads;",
+                "ALTER TABLE analytics_daily_users DROP COLUMN IF EXISTS movie_searches;",
+                "ALTER TABLE analytics_daily_users DROP COLUMN IF EXISTS movie_downloads;",
+                "DROP TABLE IF EXISTS user_quizzes;",
+            ],
+        ),
+        (
+            10,
+            "remove deprecated name meanings dataset table",
+            [
+                "DROP TABLE IF EXISTS name_meanings;",
+            ],
+        ),
+        (
+            11,
+            "books: persist local backup jobs for restart-safe downloads",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_local_download_jobs (
+                    id TEXT PRIMARY KEY,
+                    book_id TEXT NOT NULL UNIQUE,
+                    file_id TEXT NOT NULL,
+                    file_unique_id TEXT,
+                    file_name TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 12,
+                    next_attempt_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    locked_at TIMESTAMP,
+                    worker_id TEXT,
+                    last_error TEXT,
+                    completed_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_book_local_download_jobs_status_next ON book_local_download_jobs (status, next_attempt_at, created_at);",
+                "CREATE INDEX IF NOT EXISTS idx_book_local_download_jobs_book_id ON book_local_download_jobs (book_id);",
+            ],
+        ),
+        (
+            12,
+            "books: drop legacy storage channel metadata",
+            [
+                "ALTER TABLE books DROP COLUMN IF EXISTS storage_chat_id;",
+                "ALTER TABLE books DROP COLUMN IF EXISTS storage_message_id;",
+                "ALTER TABLE books DROP COLUMN IF EXISTS storage_updated_at;",
             ],
         ),
     ]
@@ -159,6 +187,25 @@ def _dsn():
         "host": os.getenv("DB_HOST", "localhost"),
         "port": int(os.getenv("DB_PORT", "5432")),
     }
+
+
+def _create_pool() -> None:
+    global _pool
+    if _pool is None:
+        _pool = pool.ThreadedConnectionPool(minconn=_DB_POOL_MIN, maxconn=_DB_POOL_MAX, **_dsn())
+        logger.info("DB pool initialized: minconn=%s maxconn=%s", _DB_POOL_MIN, _DB_POOL_MAX)
+
+
+def _reset_pool() -> None:
+    global _pool
+    if _pool is None:
+        return
+    try:
+        _pool.closeall()
+    except Exception:
+        pass
+    finally:
+        _pool = None
 
 
 def _table_exists(cur, table_name: str) -> bool:
@@ -205,10 +252,7 @@ def _runtime_schema_mode() -> str:
 
 def init_db():
     """Initialize connection pool and ensure schema exists."""
-    global _pool
-    if _pool is None:
-        _pool = pool.ThreadedConnectionPool(minconn=_DB_POOL_MIN, maxconn=_DB_POOL_MAX, **_dsn())
-        logger.info("DB pool initialized: minconn=%s maxconn=%s", _DB_POOL_MIN, _DB_POOL_MAX)
+    _create_pool()
     with db_conn() as conn:
         with conn.cursor() as cur:
             _ensure_schema_migrations(cur)
@@ -250,6 +294,7 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS group_language TEXT;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS delete_allowed BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stopped BOOLEAN NOT NULL DEFAULT FALSE;")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS audio_allowed BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS coin_adjustment INTEGER NOT NULL DEFAULT 0;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_at TIMESTAMP;")
@@ -276,9 +321,9 @@ def init_db():
             cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();")
             cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS uploaded_by_user_id BIGINT;")
             cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS upload_source TEXT;")
-            cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS storage_chat_id BIGINT;")
-            cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS storage_message_id BIGINT;")
-            cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS storage_updated_at TIMESTAMP;")
+            cur.execute("ALTER TABLE books DROP COLUMN IF EXISTS storage_chat_id;")
+            cur.execute("ALTER TABLE books DROP COLUMN IF EXISTS storage_message_id;")
+            cur.execute("ALTER TABLE books DROP COLUMN IF EXISTS storage_updated_at;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_books_created_at ON books (created_at DESC);")
             try:
                 cur.execute(
@@ -287,43 +332,32 @@ def init_db():
             except Exception as e:
                 # In case duplicates already exist, skip to avoid init failure
                 logger.warning("Could not create uniq_books_file_unique_id (skipping): %s", e)
-            cur.execute("DROP TABLE IF EXISTS movie_reactions;")
-            cur.execute("DROP TABLE IF EXISTS movies;")
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS name_meanings (
-                    id BIGSERIAL PRIMARY KEY,
-                    name_latin TEXT NOT NULL,
-                    name_uz_cyrillic TEXT,
-                    name_ru_cyrillic TEXT,
-                    gender TEXT NOT NULL DEFAULT 'unisex',
-                    origin_primary TEXT,
-                    origin_list TEXT,
-                    meaning_uz TEXT,
-                    meaning_ru TEXT,
-                    meaning_en TEXT,
-                    source_name TEXT,
-                    source_url TEXT,
-                    confidence TEXT,
-                    notes TEXT,
-                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                CREATE TABLE IF NOT EXISTS book_local_download_jobs (
+                    id TEXT PRIMARY KEY,
+                    book_id TEXT NOT NULL UNIQUE,
+                    file_id TEXT NOT NULL,
+                    file_unique_id TEXT,
+                    file_name TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 12,
+                    next_attempt_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    locked_at TIMESTAMP,
+                    worker_id TEXT,
+                    last_error TEXT,
+                    completed_at TIMESTAMP,
                     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
                 );
                 """
             )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_latin ON name_meanings (name_latin);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_uz_cyr ON name_meanings (name_uz_cyrillic);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_ru_cyr ON name_meanings (name_ru_cyrillic);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_gender ON name_meanings (gender);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_origin ON name_meanings (origin_primary);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_name_meanings_active ON name_meanings (active);")
-            cur.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS uniq_name_meanings_latin_gender
-                ON name_meanings ((LOWER(name_latin)), gender);
-                """
-            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_book_local_download_jobs_status_next ON book_local_download_jobs (status, next_attempt_at, created_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_book_local_download_jobs_book_id ON book_local_download_jobs (book_id);")
+            cur.execute("DROP TABLE IF EXISTS movie_reactions;")
+            cur.execute("DROP TABLE IF EXISTS movies;")
+            cur.execute("DROP TABLE IF EXISTS name_meanings;")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS upload_receipts (
@@ -426,9 +460,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS analytics_daily (
                     day DATE PRIMARY KEY,
                     searches INTEGER NOT NULL DEFAULT 0,
-                    buttons INTEGER NOT NULL DEFAULT 0,
-                    movie_searches INTEGER NOT NULL DEFAULT 0,
-                    movie_downloads INTEGER NOT NULL DEFAULT 0
+                    buttons INTEGER NOT NULL DEFAULT 0
                 );
                 """
             )
@@ -439,16 +471,10 @@ def init_db():
                     user_id BIGINT NOT NULL,
                     searches INTEGER NOT NULL DEFAULT 0,
                     buttons INTEGER NOT NULL DEFAULT 0,
-                    movie_searches INTEGER NOT NULL DEFAULT 0,
-                    movie_downloads INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (day, user_id)
                 );
                 """
             )
-            cur.execute("ALTER TABLE analytics_daily ADD COLUMN IF NOT EXISTS movie_searches INTEGER NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE analytics_daily ADD COLUMN IF NOT EXISTS movie_downloads INTEGER NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE analytics_daily_users ADD COLUMN IF NOT EXISTS movie_searches INTEGER NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE analytics_daily_users ADD COLUMN IF NOT EXISTS movie_downloads INTEGER NOT NULL DEFAULT 0;")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS analytics_counters (
@@ -558,26 +584,6 @@ def init_db():
             _apply_schema_migrations(cur)
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS user_quizzes (
-                    id TEXT PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    quiz_name TEXT NOT NULL,
-                    source_kind TEXT,
-                    source_preview TEXT,
-                    lang_ui TEXT,
-                    interval_s INTEGER NOT NULL DEFAULT 0,
-                    questions_json TEXT NOT NULL,
-                    question_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                    share_count INTEGER NOT NULL DEFAULT 0,
-                    last_started_at TIMESTAMP
-                );
-                """
-            )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_user_quizzes_user_created ON user_quizzes (user_id, created_at DESC);")
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS removed_users (
                     id BIGINT,
                     username TEXT,
@@ -629,17 +635,48 @@ def init_db():
 
 @contextmanager
 def db_conn():
+    global _pool
     if _pool is None:
-        init_db()
+        _create_pool()
     conn = _pool.getconn()
     try:
+        # PostgreSQL may restart while the app is still running. A pooled
+        # connection can look alive but fail on the first query, so ping it
+        # once here and recreate the pool if needed.
+        try:
+            if getattr(conn, "closed", 1):
+                raise psycopg2.OperationalError("connection already closed")
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()
+        except Exception:
+            try:
+                _pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            _reset_pool()
+            _create_pool()
+            conn = _pool.getconn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            if getattr(conn, "closed", 1) == 0:
+                conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        _pool.putconn(conn)
+        try:
+            _pool.putconn(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # --- Users ---
@@ -731,13 +768,14 @@ def search_users_by_name(query: str, limit: int = 30):
 def upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None,
                 blocked: bool, allowed: bool, joined_date: date | None, left_date: date | None,
                 language: str | None, delete_allowed: bool = False, stopped: bool = False,
+                audio_allowed: bool = False,
                 language_selected: bool | None = None, group_language: str | None = None):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO users (id, username, first_name, last_name, blocked, allowed, joined_date, left_date, language, delete_allowed, stopped, language_selected, group_language)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO users (id, username, first_name, last_name, blocked, allowed, joined_date, left_date, language, delete_allowed, stopped, audio_allowed, language_selected, group_language)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (id) DO UPDATE SET
                     username=EXCLUDED.username,
                     first_name=EXCLUDED.first_name,
@@ -749,6 +787,7 @@ def upsert_user(user_id: int, username: str | None, first_name: str | None, last
                     language=COALESCE(EXCLUDED.language, users.language),
                     delete_allowed=EXCLUDED.delete_allowed,
                     stopped=EXCLUDED.stopped,
+                    audio_allowed=EXCLUDED.audio_allowed,
                     language_selected=COALESCE(EXCLUDED.language_selected, users.language_selected),
                     group_language=COALESCE(EXCLUDED.group_language, users.group_language)
                 """,
@@ -764,6 +803,7 @@ def upsert_user(user_id: int, username: str | None, first_name: str | None, last
                     language,
                     delete_allowed,
                     stopped,
+                    audio_allowed,
                     language_selected,
                     group_language,
                 ),
@@ -806,8 +846,8 @@ def set_user_delete_allowed(user_id: int, allowed: bool):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO users (id, blocked, allowed, joined_date, delete_allowed, stopped)
-                VALUES (%s, FALSE, FALSE, %s, %s, FALSE)
+                INSERT INTO users (id, blocked, allowed, joined_date, delete_allowed, stopped, audio_allowed)
+                VALUES (%s, FALSE, FALSE, %s, %s, FALSE, FALSE)
                 ON CONFLICT (id) DO UPDATE SET
                     delete_allowed = EXCLUDED.delete_allowed
                 """,
@@ -823,14 +863,37 @@ def is_user_delete_allowed(user_id: int) -> bool:
             return bool(row[0]) if row else False
 
 
+def set_user_audio_allowed(user_id: int, allowed: bool):
+    today = date.today()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (id, blocked, allowed, joined_date, delete_allowed, stopped, audio_allowed)
+                VALUES (%s, FALSE, FALSE, %s, FALSE, FALSE, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    audio_allowed = EXCLUDED.audio_allowed
+                """,
+                (user_id, today, allowed),
+            )
+
+
+def is_user_audio_allowed(user_id: int) -> bool:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT audio_allowed FROM users WHERE id=%s", (user_id,))
+            row = cur.fetchone()
+            return bool(row[0]) if row else False
+
+
 def set_user_stopped(user_id: int, stopped: bool):
     today = date.today()
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO users (id, blocked, allowed, joined_date, stopped, delete_allowed)
-                VALUES (%s, FALSE, FALSE, %s, %s, FALSE)
+                INSERT INTO users (id, blocked, allowed, joined_date, stopped, delete_allowed, audio_allowed)
+                VALUES (%s, FALSE, FALSE, %s, %s, FALSE, FALSE)
                 ON CONFLICT (id) DO UPDATE SET
                     stopped = EXCLUDED.stopped
                 """,
@@ -1205,169 +1268,70 @@ def add_recent(user_id: int, book_id: str, title: str, max_recents: int):
 # --- Analytics ---
 
 def increment_analytics(key: str, amount: int = 1):
-    valid_keys = {"searches", "buttons", "movie_searches", "movie_downloads"}
+    valid_keys = {"searches", "buttons"}
     if key not in valid_keys:
         return 0
     today = date.today()
     with db_conn() as conn:
         with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO analytics_daily (day, searches, buttons, movie_searches, movie_downloads)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (day) DO UPDATE SET
-                        searches = analytics_daily.searches + EXCLUDED.searches,
-                        buttons = analytics_daily.buttons + EXCLUDED.buttons,
-                        movie_searches = analytics_daily.movie_searches + EXCLUDED.movie_searches,
-                        movie_downloads = analytics_daily.movie_downloads + EXCLUDED.movie_downloads
-                    """,
-                    (
-                        today,
-                        amount if key == "searches" else 0,
-                        amount if key == "buttons" else 0,
-                        amount if key == "movie_searches" else 0,
-                        amount if key == "movie_downloads" else 0,
-                    ),
-                )
-                cur.execute(
-                    "SELECT searches, buttons, movie_searches, movie_downloads FROM analytics_daily WHERE day=%s",
-                    (today,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return 0
-                key_idx = {"searches": 0, "buttons": 1, "movie_searches": 2, "movie_downloads": 3}
-                return int(row[key_idx[key]] or 0)
-            except Exception as e:
-                # Backward compatibility while DB schema is being migrated.
-                err = str(e).lower()
-                if "movie_searches" not in err and "movie_downloads" not in err:
-                    raise
-                conn.rollback()
-                if key not in {"searches", "buttons"}:
-                    return 0
-                cur.execute(
-                    """
-                    INSERT INTO analytics_daily (day, searches, buttons)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (day) DO UPDATE SET
-                        searches = analytics_daily.searches + EXCLUDED.searches,
-                        buttons = analytics_daily.buttons + EXCLUDED.buttons
-                    """,
-                    (today, amount if key == "searches" else 0, amount if key == "buttons" else 0),
-                )
-                cur.execute("SELECT searches, buttons FROM analytics_daily WHERE day=%s", (today,))
-                row = cur.fetchone()
-                if not row:
-                    return 0
-                return int(row[0] or 0) if key == "searches" else int(row[1] or 0)
+            cur.execute(
+                """
+                INSERT INTO analytics_daily (day, searches, buttons)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (day) DO UPDATE SET
+                    searches = analytics_daily.searches + EXCLUDED.searches,
+                    buttons = analytics_daily.buttons + EXCLUDED.buttons
+                """,
+                (today, amount if key == "searches" else 0, amount if key == "buttons" else 0),
+            )
+            cur.execute("SELECT searches, buttons FROM analytics_daily WHERE day=%s", (today,))
+            row = cur.fetchone()
+            if not row:
+                return 0
+            return int(row[0] or 0) if key == "searches" else int(row[1] or 0)
 
 
 def increment_user_analytics(user_id: int, key: str, amount: int = 1):
-    valid_keys = {"searches", "buttons", "movie_searches", "movie_downloads"}
+    valid_keys = {"searches", "buttons"}
     if key not in valid_keys:
         return 0
     today = date.today()
     with db_conn() as conn:
         with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO analytics_daily_users (day, user_id, searches, buttons, movie_searches, movie_downloads)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (day, user_id) DO UPDATE SET
-                        searches = analytics_daily_users.searches + EXCLUDED.searches,
-                        buttons = analytics_daily_users.buttons + EXCLUDED.buttons,
-                        movie_searches = analytics_daily_users.movie_searches + EXCLUDED.movie_searches,
-                        movie_downloads = analytics_daily_users.movie_downloads + EXCLUDED.movie_downloads
-                    """,
-                    (
-                        today,
-                        user_id,
-                        amount if key == "searches" else 0,
-                        amount if key == "buttons" else 0,
-                        amount if key == "movie_searches" else 0,
-                        amount if key == "movie_downloads" else 0,
-                    ),
-                )
-                cur.execute(
-                    """
-                    SELECT searches, buttons, movie_searches, movie_downloads
-                    FROM analytics_daily_users
-                    WHERE day=%s AND user_id=%s
-                    """,
-                    (today, user_id),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return 0
-                key_idx = {"searches": 0, "buttons": 1, "movie_searches": 2, "movie_downloads": 3}
-                return int(row[key_idx[key]] or 0)
-            except Exception as e:
-                err = str(e).lower()
-                if "movie_searches" not in err and "movie_downloads" not in err:
-                    raise
-                conn.rollback()
-                if key not in {"searches", "buttons"}:
-                    return 0
-                cur.execute(
-                    """
-                    INSERT INTO analytics_daily_users (day, user_id, searches, buttons)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (day, user_id) DO UPDATE SET
-                        searches = analytics_daily_users.searches + EXCLUDED.searches,
-                        buttons = analytics_daily_users.buttons + EXCLUDED.buttons
-                    """,
-                    (today, user_id, amount if key == "searches" else 0, amount if key == "buttons" else 0),
-                )
-                cur.execute(
-                    "SELECT searches, buttons FROM analytics_daily_users WHERE day=%s AND user_id=%s",
-                    (today, user_id),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return 0
-                return int(row[0] or 0) if key == "searches" else int(row[1] or 0)
+            cur.execute(
+                """
+                INSERT INTO analytics_daily_users (day, user_id, searches, buttons)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (day, user_id) DO UPDATE SET
+                    searches = analytics_daily_users.searches + EXCLUDED.searches,
+                    buttons = analytics_daily_users.buttons + EXCLUDED.buttons
+                """,
+                (today, user_id, amount if key == "searches" else 0, amount if key == "buttons" else 0),
+            )
+            cur.execute(
+                "SELECT searches, buttons FROM analytics_daily_users WHERE day=%s AND user_id=%s",
+                (today, user_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return 0
+            return int(row[0] or 0) if key == "searches" else int(row[1] or 0)
 
 
 def get_analytics_map():
     data: dict[str, dict] = {}
     with db_conn() as conn:
         with conn.cursor() as cur:
-            try:
-                cur.execute("SELECT day, searches, buttons, movie_searches, movie_downloads FROM analytics_daily")
-                rows = cur.fetchall()
-                for day, searches, buttons, movie_searches, movie_downloads in rows:
-                    total_searches = int(searches or 0)
-                    total_downloads = int(buttons or 0)
-                    movie_s = int(movie_searches or 0)
-                    movie_d = int(movie_downloads or 0)
-                    data[str(day)] = {
-                        "searches": total_searches,
-                        "buttons": total_downloads,
-                        "movie_searches": movie_s,
-                        "movie_downloads": movie_d,
-                        "book_searches": max(0, total_searches - movie_s),
-                        "book_downloads": max(0, total_downloads - movie_d),
-                    }
-            except Exception as e:
-                err = str(e).lower()
-                if "movie_searches" not in err and "movie_downloads" not in err:
-                    raise
-                conn.rollback()
-                cur.execute("SELECT day, searches, buttons FROM analytics_daily")
-                for day, searches, buttons in cur.fetchall():
-                    total_searches = int(searches or 0)
-                    total_downloads = int(buttons or 0)
-                    data[str(day)] = {
-                        "searches": total_searches,
-                        "buttons": total_downloads,
-                        "movie_searches": 0,
-                        "movie_downloads": 0,
-                        "book_searches": total_searches,
-                        "book_downloads": total_downloads,
-                    }
+            cur.execute("SELECT day, searches, buttons FROM analytics_daily")
+            for day, searches, buttons in cur.fetchall():
+                total_searches = int(searches or 0)
+                total_downloads = int(buttons or 0)
+                data[str(day)] = {
+                    "searches": total_searches,
+                    "buttons": total_downloads,
+                    "book_searches": total_searches,
+                    "book_downloads": total_downloads,
+                }
     return data
 
 
@@ -1407,52 +1371,18 @@ def get_counters(keys: list[str] | None = None) -> dict[str, int]:
 def get_daily_analytics(day: date):
     with db_conn() as conn:
         with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    "SELECT searches, buttons, movie_searches, movie_downloads FROM analytics_daily WHERE day=%s",
-                    (day,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return {
-                        "searches": 0,
-                        "downloads": 0,
-                        "movie_searches": 0,
-                        "movie_downloads": 0,
-                        "book_searches": 0,
-                        "book_downloads": 0,
-                    }
-                total_searches = int(row[0] or 0)
-                total_downloads = int(row[1] or 0)
-                movie_searches = int(row[2] or 0)
-                movie_downloads = int(row[3] or 0)
-                return {
-                    "searches": total_searches,
-                    "downloads": total_downloads,
-                    "movie_searches": movie_searches,
-                    "movie_downloads": movie_downloads,
-                    "book_searches": max(0, total_searches - movie_searches),
-                    "book_downloads": max(0, total_downloads - movie_downloads),
-                }
-            except Exception as e:
-                err = str(e).lower()
-                if "movie_searches" not in err and "movie_downloads" not in err:
-                    raise
-                conn.rollback()
-                cur.execute("SELECT searches, buttons FROM analytics_daily WHERE day=%s", (day,))
-                row = cur.fetchone()
-                if not row:
-                    return {"searches": 0, "downloads": 0, "movie_searches": 0, "movie_downloads": 0, "book_searches": 0, "book_downloads": 0}
-                total_searches = int(row[0] or 0)
-                total_downloads = int(row[1] or 0)
-                return {
-                    "searches": total_searches,
-                    "downloads": total_downloads,
-                    "movie_searches": 0,
-                    "movie_downloads": 0,
-                    "book_searches": total_searches,
-                    "book_downloads": total_downloads,
-                }
+            cur.execute("SELECT searches, buttons FROM analytics_daily WHERE day=%s", (day,))
+            row = cur.fetchone()
+            if not row:
+                return {"searches": 0, "downloads": 0, "book_searches": 0, "book_downloads": 0}
+            total_searches = int(row[0] or 0)
+            total_downloads = int(row[1] or 0)
+            return {
+                "searches": total_searches,
+                "downloads": total_downloads,
+                "book_searches": total_searches,
+                "book_downloads": total_downloads,
+            }
 
 
 def backfill_counters_if_empty() -> bool:
@@ -1480,7 +1410,6 @@ def backfill_counters_if_empty() -> bool:
 
             cur.execute("SELECT reaction, COUNT(*) FROM book_reactions GROUP BY reaction")
             react_counts = {str(r): int(c or 0) for r, c in cur.fetchall()}
-            movie_react_counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
 
             counters = {
                 "search_total": int(search_total or 0),
@@ -1498,10 +1427,6 @@ def backfill_counters_if_empty() -> bool:
                 "reaction_dislike": react_counts.get("dislike", 0),
                 "reaction_berry": react_counts.get("berry", 0),
                 "reaction_whale": react_counts.get("whale", 0),
-                "movie_reaction_like": movie_react_counts.get("like", 0),
-                "movie_reaction_dislike": movie_react_counts.get("dislike", 0),
-                "movie_reaction_berry": movie_react_counts.get("berry", 0),
-                "movie_reaction_whale": movie_react_counts.get("whale", 0),
             }
 
             for key, value in counters.items():
@@ -1614,166 +1539,73 @@ def get_random_books(limit: int = 10, require_accessible: bool = True):
                 )
             return cur.fetchall()
 
+def get_book_by_name(book_name: str):
+    def _name_variants(raw_name: str) -> list[str]:
+        name = str(raw_name or "").strip()
+        if not name:
+            return []
+        variants: list[str] = []
+        for candidate in (
+            name,
+            name.replace("ʻ", ""),
+            name.replace("’", ""),
+            name.replace("ʼ", ""),
+            name.replace("'", ""),
+        ):
+            candidate = str(candidate or "").strip()
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+        return variants
 
-# --- User Quizzes ---
-
-def save_user_quiz(
-    quiz_id: str,
-    user_id: int,
-    quiz_name: str,
-    source_kind: str,
-    source_preview: str,
-    lang_ui: str,
-    interval_s: int,
-    questions: list[dict],
-):
-    if not quiz_id or not user_id:
-        return False
-    payload = json.dumps(list(questions or []), ensure_ascii=False)
-    q_count = len(list(questions or []))
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO user_quizzes (
-                    id, user_id, quiz_name, source_kind, source_preview, lang_ui,
-                    interval_s, questions_json, question_count, updated_at
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                ON CONFLICT (id) DO UPDATE SET
-                    quiz_name=EXCLUDED.quiz_name,
-                    source_kind=EXCLUDED.source_kind,
-                    source_preview=EXCLUDED.source_preview,
-                    lang_ui=EXCLUDED.lang_ui,
-                    interval_s=EXCLUDED.interval_s,
-                    questions_json=EXCLUDED.questions_json,
-                    question_count=EXCLUDED.question_count,
-                    updated_at=NOW()
-                """,
-                (
-                    str(quiz_id),
-                    int(user_id),
-                    (quiz_name or "AI Quiz Test")[:200],
-                    (source_kind or "topic")[:32],
-                    (source_preview or "")[:500],
-                    (lang_ui or "en")[:8],
-                    int(interval_s or 0),
-                    payload,
-                    int(q_count),
-                ),
-            )
-            return cur.rowcount > 0
-
-
-def get_user_quiz(quiz_id: str, user_id: int | None = None):
-    if not quiz_id:
+    variants = _name_variants(book_name)
+    if not variants:
         return None
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if user_id is None:
-                cur.execute("SELECT * FROM user_quizzes WHERE id=%s", (quiz_id,))
-            else:
-                cur.execute("SELECT * FROM user_quizzes WHERE id=%s AND user_id=%s", (quiz_id, int(user_id)))
-            row = cur.fetchone()
-            if not row:
-                return None
-            try:
-                row["questions"] = json.loads(row.get("questions_json") or "[]")
-            except Exception:
-                row["questions"] = []
-            return row
-
-
-def list_user_quizzes(user_id: int, limit: int = 10, offset: int = 0):
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT id, user_id, quiz_name, source_kind, source_preview, lang_ui, interval_s,
-                       question_count, created_at, updated_at, share_count, last_started_at
-                FROM user_quizzes
-                WHERE user_id=%s
-                ORDER BY created_at DESC, id DESC
-                LIMIT %s OFFSET %s
-                """,
-                (int(user_id), int(limit), int(offset)),
-            )
-            return cur.fetchall()
-
-
-def count_user_quizzes(user_id: int) -> int:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM user_quizzes WHERE user_id=%s", (int(user_id),))
-            row = cur.fetchone()
-            return int(row[0] or 0) if row else 0
-
-
-def delete_user_quiz(quiz_id: str, user_id: int) -> bool:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM user_quizzes WHERE id=%s AND user_id=%s", (str(quiz_id), int(user_id)))
-            return cur.rowcount > 0
-
-
-def mark_user_quiz_started(quiz_id: str):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE user_quizzes SET last_started_at=NOW(), updated_at=NOW() WHERE id=%s", (str(quiz_id),))
-            return cur.rowcount > 0
-
-
-def increment_user_quiz_share_count(quiz_id: str):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE user_quizzes SET share_count=COALESCE(share_count,0)+1, updated_at=NOW() WHERE id=%s",
-                (str(quiz_id),),
-            )
-            return cur.rowcount > 0
-
-def get_book_by_name(book_name: str):
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM books WHERE book_name=%s", (book_name,))
-            return cur.fetchone()
+            for candidate in variants:
+                cur.execute(
+                    """
+                    SELECT
+                        b.*,
+                        j.status AS local_backup_status,
+                        j.attempts AS local_backup_attempts,
+                        j.max_attempts AS local_backup_max_attempts,
+                        j.last_error AS local_backup_error,
+                        j.next_attempt_at AS local_backup_next_attempt_at,
+                        j.updated_at AS local_backup_updated_at,
+                        j.completed_at AS local_backup_completed_at
+                    FROM books b
+                    LEFT JOIN book_local_download_jobs j ON j.book_id = b.id
+                    WHERE b.book_name=%s
+                    """,
+                    (candidate,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row
+            return None
 
 def get_book_by_file_unique_id(file_unique_id: str):
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM books WHERE file_unique_id=%s", (file_unique_id,))
+            cur.execute(
+                """
+                SELECT
+                    b.*,
+                    j.status AS local_backup_status,
+                    j.attempts AS local_backup_attempts,
+                    j.max_attempts AS local_backup_max_attempts,
+                    j.last_error AS local_backup_error,
+                    j.next_attempt_at AS local_backup_next_attempt_at,
+                    j.updated_at AS local_backup_updated_at,
+                    j.completed_at AS local_backup_completed_at
+                FROM books b
+                LEFT JOIN book_local_download_jobs j ON j.book_id = b.id
+                WHERE b.file_unique_id=%s
+                """,
+                (file_unique_id,),
+            )
             return cur.fetchone()
-
-
-def list_movies(limit: int = 1000):
-    del limit
-    return []
-
-
-def list_unindexed_movies(limit: int = 1000):
-    del limit
-    return []
-
-
-def get_movie_by_id(movie_id: str):
-    del movie_id
-    return None
-
-
-def get_movie_by_name(movie_name: str):
-    del movie_name
-    return None
-
-
-def get_movie_by_file_unique_id(file_unique_id: str):
-    del file_unique_id
-    return None
-
-
-def search_movies(query: str, limit: int = 20):
-    del query, limit
-    return []
-
 
 VARIANT_TOKENS = {
     "english", "eng", "en",
@@ -1875,11 +1707,6 @@ def find_duplicate_book(book_name: str | None, path: str | None = None, file_uni
         existing = get_book_by_name(book_name)
         if existing:
             return existing
-    return None
-
-
-def find_duplicate_movie(movie_name: str | None, file_unique_id: str | None = None):
-    del movie_name, file_unique_id
     return None
 
 def list_books_missing_file_unique_id(limit: int = 100):
@@ -2020,7 +1847,23 @@ def get_book_storage_counts() -> dict:
 def get_book_by_id(book_id: str):
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM books WHERE id=%s", (book_id,))
+            cur.execute(
+                """
+                SELECT
+                    b.*,
+                    j.status AS local_backup_status,
+                    j.attempts AS local_backup_attempts,
+                    j.max_attempts AS local_backup_max_attempts,
+                    j.last_error AS local_backup_error,
+                    j.next_attempt_at AS local_backup_next_attempt_at,
+                    j.updated_at AS local_backup_updated_at,
+                    j.completed_at AS local_backup_completed_at
+                FROM books b
+                LEFT JOIN book_local_download_jobs j ON j.book_id = b.id
+                WHERE b.id=%s
+                """,
+                (book_id,),
+            )
             return cur.fetchone()
 
 
@@ -2067,7 +1910,23 @@ def upsert_book_summary(
 def get_book_by_path(path: str):
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM books WHERE path=%s", (path,))
+            cur.execute(
+                """
+                SELECT
+                    b.*,
+                    j.status AS local_backup_status,
+                    j.attempts AS local_backup_attempts,
+                    j.max_attempts AS local_backup_max_attempts,
+                    j.last_error AS local_backup_error,
+                    j.next_attempt_at AS local_backup_next_attempt_at,
+                    j.updated_at AS local_backup_updated_at,
+                    j.completed_at AS local_backup_completed_at
+                FROM books b
+                LEFT JOIN book_local_download_jobs j ON j.book_id = b.id
+                WHERE b.path=%s
+                """,
+                (path,),
+            )
             return cur.fetchone()
 
 
@@ -2184,17 +2043,6 @@ def get_book_reaction_counts(book_id: str) -> dict[str, int]:
                 if reaction in counts:
                     counts[reaction] = int(count)
     return counts
-
-
-def set_movie_reaction(user_id: int, movie_id: str, reaction: str):
-    del user_id, movie_id, reaction
-    return None
-
-
-def get_movie_reaction_counts(movie_id: str) -> dict[str, int]:
-    del movie_id
-    return {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
-
 
 def get_book_favorite_count(book_id: str) -> int:
     with db_conn() as conn:
@@ -2383,11 +2231,6 @@ def get_reaction_totals() -> dict[str, int]:
                     counts[reaction] = int(count or 0)
     return counts
 
-
-def get_movie_reaction_totals() -> dict[str, int]:
-    return {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
-
-
 def get_user_reaction(book_id: str, user_id: int) -> str | None:
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -2397,12 +2240,6 @@ def get_user_reaction(book_id: str, user_id: int) -> str | None:
             )
             row = cur.fetchone()
             return row[0] if row else None
-
-
-def get_user_movie_reaction(movie_id: str, user_id: int) -> str | None:
-    del movie_id, user_id
-    return None
-
 
 def award_reaction_action(user_id: int, book_id: str) -> bool:
     with db_conn() as conn:
@@ -2584,11 +2421,6 @@ def insert_book(book: dict):
                 return False
 
 
-def insert_movie(movie: dict):
-    del movie
-    return False
-
-
 def bulk_upsert_books(books: list[dict]):
     if not books:
         return 0
@@ -2653,15 +2485,191 @@ def update_book_file_id(book_id: str, file_id: str, indexed: bool = True, file_u
             return cur.rowcount
 
 
+def update_book_path(book_id: str, path: str):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE books SET path=%s WHERE id=%s", (path, book_id))
+            return cur.rowcount
+
+
+def enqueue_book_local_download_job(
+    book_id: str,
+    file_id: str,
+    file_name: str,
+    file_unique_id: str | None = None,
+) -> str | None:
+    book_id = str(book_id or "").strip()
+    file_id = str(file_id or "").strip()
+    file_name = str(file_name or "").strip()
+    file_unique_id = str(file_unique_id or "").strip() or None
+    if not book_id or not file_id or not file_name:
+        return None
+    job_id = uuid.uuid4().hex
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO book_local_download_jobs (
+                    id, book_id, file_id, file_unique_id, file_name,
+                    status, attempts, max_attempts, next_attempt_at,
+                    locked_at, worker_id, last_error, completed_at,
+                    created_at, updated_at
+                )
+                VALUES (%s,%s,%s,%s,%s,'queued',0,12,NOW(),NULL,NULL,NULL,NULL,NOW(),NOW())
+                ON CONFLICT (book_id) DO UPDATE SET
+                    file_id=EXCLUDED.file_id,
+                    file_unique_id=COALESCE(EXCLUDED.file_unique_id, book_local_download_jobs.file_unique_id),
+                    file_name=EXCLUDED.file_name,
+                    status='queued',
+                    attempts=0,
+                    next_attempt_at=NOW(),
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=NULL,
+                    completed_at=NULL,
+                    updated_at=NOW()
+                RETURNING id
+                """,
+                (job_id, book_id, file_id, file_unique_id, file_name),
+            )
+            row = cur.fetchone()
+            if not row:
+                return job_id
+            try:
+                return str(row[0])
+            except Exception:
+                return job_id
+
+
+def get_book_local_download_job(book_id: str) -> dict | None:
+    book_id = str(book_id or "").strip()
+    if not book_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM book_local_download_jobs
+                WHERE book_id=%s
+                LIMIT 1
+                """,
+                (book_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def claim_book_local_download_job(worker_id: str, stale_after_seconds: int = 1800) -> dict | None:
+    worker_id = str(worker_id or "").strip() or "worker"
+    stale_after_seconds = max(60, int(stale_after_seconds or 1800))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                WITH candidate AS (
+                    SELECT id
+                    FROM book_local_download_jobs
+                    WHERE next_attempt_at <= NOW()
+                      AND (
+                          status = 'queued'
+                          OR (
+                              status = 'downloading'
+                              AND locked_at IS NOT NULL
+                              AND locked_at < NOW() - (%s * INTERVAL '1 second')
+                          )
+                      )
+                    ORDER BY next_attempt_at ASC, created_at ASC, id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE book_local_download_jobs j
+                SET
+                    status='downloading',
+                    attempts=attempts + 1,
+                    locked_at=NOW(),
+                    worker_id=%s,
+                    updated_at=NOW()
+                FROM candidate
+                WHERE j.id = candidate.id
+                RETURNING j.*
+                """,
+                (stale_after_seconds, worker_id),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def complete_book_local_download_job(job_id: str) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE book_local_download_jobs
+                SET status='done',
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=NULL,
+                    completed_at=NOW(),
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (job_id,),
+            )
+            return cur.rowcount
+
+
+def retry_book_local_download_job(job_id: str, error: str, retry_after_seconds: float = 60.0) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    retry_after_seconds = max(1.0, float(retry_after_seconds or 60.0))
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE book_local_download_jobs
+                SET status='queued',
+                    next_attempt_at=NOW() + (%s * INTERVAL '1 second'),
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=%s,
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (retry_after_seconds, str(error or "")[:2000], job_id),
+            )
+            return cur.rowcount
+
+
+def fail_book_local_download_job(job_id: str, error: str) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE book_local_download_jobs
+                SET status='failed',
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=%s,
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (str(error or "")[:2000], job_id),
+            )
+            return cur.rowcount
+
+
 def update_book_indexed(book_id: str, indexed: bool):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE books SET indexed=%s WHERE id=%s", (indexed, book_id))
-
-
-def update_movie_indexed(movie_id: str, indexed: bool):
-    del movie_id, indexed
-    return 0
 
 
 def update_book_upload_meta(book_id: str, uploaded_by_user_id: int | None = None, upload_source: str | None = None):
@@ -2676,32 +2684,6 @@ def update_book_upload_meta(book_id: str, uploaded_by_user_id: int | None = None
     if not fields:
         return 0
     values.append(book_id)
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"UPDATE books SET {', '.join(fields)} WHERE id=%s", values)
-            return cur.rowcount
-
-
-def update_book_storage_meta(
-    book_id: str,
-    storage_chat_id: int,
-    storage_message_id: int,
-    new_file_id: str | None = None,
-    new_file_unique_id: str | None = None,
-):
-    fields = [
-        "storage_chat_id=%s",
-        "storage_message_id=%s",
-        "storage_updated_at=NOW()",
-    ]
-    values: list = [int(storage_chat_id), int(storage_message_id)]
-    if new_file_id:
-        fields.append("file_id=%s")
-        values.append(new_file_id)
-    if new_file_unique_id:
-        fields.append("file_unique_id=%s")
-        values.append(new_file_unique_id)
-    values.append(str(book_id))
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(f"UPDATE books SET {', '.join(fields)} WHERE id=%s", values)
@@ -2996,6 +2978,28 @@ def get_audio_book_part(part_id: str) -> dict | None:
             )
             row = cur.fetchone()
             return dict(row) if row else None
+
+
+def update_audio_book_part_media(
+    part_id: str,
+    file_id: str,
+    file_unique_id: str | None = None,
+):
+    if not part_id or not file_id:
+        return 0
+    fields = ["file_id=%s"]
+    values: list = [str(file_id)]
+    if file_unique_id:
+        fields.append("file_unique_id=%s")
+        values.append(str(file_unique_id))
+    values.append(str(part_id))
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE audio_book_parts SET {', '.join(fields)} WHERE id=%s",
+                values,
+            )
+            return cur.rowcount
 
 
 def get_audio_book_part_by_file_unique_id(file_unique_id: str) -> dict | None:

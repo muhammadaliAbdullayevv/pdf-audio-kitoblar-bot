@@ -27,12 +27,8 @@ const FALLBACK_DATA = {
     users_left: { value: 1, change: "-50.0% vs previous 7d", scope: "range" },
     books_total: { value: 11975, change: "268 not indexed", scope: "lifetime" },
     books_new: { value: 140, change: "+9.4% vs previous 7d", scope: "range" },
-    movies_total: { value: 865, change: "810 indexed (93.6%)", scope: "lifetime" },
-    movies_new: { value: 21, change: "+16.7% vs previous 7d", scope: "range" },
     book_searches: { value: 206, change: "+6.2% vs previous 7d", scope: "range" },
-    movie_searches: { value: 38, change: "+1.8% vs previous 7d", scope: "range" },
     book_downloads: { value: 75, change: "-2.3% vs previous 7d", scope: "range" },
-    movie_downloads: { value: 16, change: "-6.5% vs previous 7d", scope: "range" },
     searches: { value: 244, change: "+5.2% vs previous 7d", scope: "range" },
     downloads_total: { value: 91, change: "-3.1% vs previous 7d", scope: "range" },
     audios_total: { value: 902, change: "12140 audio parts", scope: "lifetime" },
@@ -41,7 +37,6 @@ const FALLBACK_DATA = {
   catalog_growth: {
     labels: ["Mar 05", "Mar 06", "Mar 07", "Mar 08", "Mar 09", "Mar 10", "Mar 11"],
     books_new: [22, 18, 30, 14, 26, 19, 11],
-    movies_new: [3, 2, 6, 1, 3, 4, 2],
     audio_new: [9, 8, 11, 7, 8, 9, 5],
     unindexed_new: [2, 1, 3, 1, 2, 1, 0],
   },
@@ -77,9 +72,7 @@ const FALLBACK_DATA = {
     searches_total: 244,
     downloads_total: 91,
     book_searches_total: 206,
-    movie_searches_total: 38,
     book_downloads_total: 75,
-    movie_downloads_total: 16,
     conversion_pct: 37.3,
     request_queries_total: 43,
     zero_result_total: 9,
@@ -109,9 +102,6 @@ const FALLBACK_DATA = {
     books_index_ratio: 97.8,
     books_downloads_total: 48392,
     books_searches_total: 63190,
-    movies_total: 865,
-    movies_indexed: 810,
-    movies_index_ratio: 93.6,
     audio_books_total: 902,
     audio_books_with_source_books: 741,
     audio_parts_total: 12140,
@@ -154,22 +144,10 @@ const FALLBACK_DATA = {
     favorites_added_total: 5942,
     reaction_total_current: 3840,
     reaction_total_lifetime: 9142,
-    ai_total: 412,
     favorites_per_active_user: 45.4,
     reactions_per_active_user: 137.1,
-    ai_breakdown: {
-      chat: 200,
-      translator: 71,
-      grammar: 42,
-      email: 29,
-      quiz: 33,
-      music: 14,
-      pdf: 23,
-    },
     book_reactions_current: { like: 1689, dislike: 411, berry: 502, whale: 334 },
-    movie_reactions_current: { like: 611, dislike: 93, berry: 107, whale: 93 },
     book_reactions_lifetime: { like: 3924, dislike: 998, berry: 1069, whale: 833 },
-    movie_reactions_lifetime: { like: 1231, dislike: 341, berry: 412, whale: 334 },
   },
   downloader: {
     success_total: 356,
@@ -233,8 +211,7 @@ const FALLBACK_DATA = {
     { name: "/start", count: 981 },
     { name: "Search Books", count: 736 },
     { name: "Video Downloader", count: 515 },
-    { name: "AI Tools", count: 472 },
-    { name: "Search Movies", count: 301 },
+    { name: "Other Functions", count: 472 },
   ],
 };
 
@@ -347,12 +324,6 @@ function setKpis() {
   if (!kpis.book_downloads && kpis.downloads_total) {
     kpis.book_downloads = kpis.downloads_total;
   }
-  if (!kpis.movie_searches) {
-    kpis.movie_searches = { value: 0, change: "0.0% vs previous window", scope: "range" };
-  }
-  if (!kpis.movie_downloads) {
-    kpis.movie_downloads = { value: 0, change: "0.0% vs previous window", scope: "range" };
-  }
   const rangeLabel = String((dashboardData.range || {}).label || "selected range");
   const mappings = [
     ["users_current", "kpi-users-current", "kpi-users-current-meta"],
@@ -360,12 +331,8 @@ function setKpis() {
     ["users_left", "kpi-users-left", "kpi-users-left-meta"],
     ["books_total", "kpi-books-total", "kpi-books-total-meta"],
     ["books_new", "kpi-books-new", "kpi-books-new-meta"],
-    ["movies_total", "kpi-movies-total", "kpi-movies-total-meta"],
-    ["movies_new", "kpi-movies-new", "kpi-movies-new-meta"],
     ["book_searches", "kpi-book-searches", "kpi-book-searches-meta"],
-    ["movie_searches", "kpi-movie-searches", "kpi-movie-searches-meta"],
     ["book_downloads", "kpi-book-downloads", "kpi-book-downloads-meta"],
-    ["movie_downloads", "kpi-movie-downloads", "kpi-movie-downloads-meta"],
     ["audios_total", "kpi-audios-total", "kpi-audios-total-meta"],
     ["audios_new", "kpi-audios-new", "kpi-audios-new-meta"],
   ];
@@ -391,24 +358,19 @@ function setKpis() {
 function setCatalog() {
   const catalog = dashboardData.catalog || FALLBACK_DATA.catalog;
   const booksRatio = Number(catalog.books_index_ratio || 0);
-  const moviesRatio = Number(catalog.movies_index_ratio || 0);
   const audioRatio = Number(catalog.books_total || 0) > 0
     ? ((Number(catalog.audio_books_with_source_books || 0) / Number(catalog.books_total || 1)) * 100)
     : 0;
 
   setText("catalog-books-ratio", formatPercent(booksRatio));
-  setText("catalog-movies-ratio", formatPercent(moviesRatio));
   setText("catalog-audio-ratio", formatPercent(audioRatio));
 
   const booksMeter = document.getElementById("catalog-books-meter");
-  const moviesMeter = document.getElementById("catalog-movies-meter");
   const audioMeter = document.getElementById("catalog-audio-meter");
   if (booksMeter) booksMeter.style.width = `${Math.max(0, Math.min(100, booksRatio))}%`;
-  if (moviesMeter) moviesMeter.style.width = `${Math.max(0, Math.min(100, moviesRatio))}%`;
   if (audioMeter) audioMeter.style.width = `${Math.max(0, Math.min(100, audioRatio))}%`;
 
   setText("catalog-books-meta", `${formatNumber(catalog.books_indexed || 0)} indexed / ${formatNumber(catalog.books_total || 0)} total`);
-  setText("catalog-movies-meta", `${formatNumber(catalog.movies_indexed || 0)} indexed / ${formatNumber(catalog.movies_total || 0)} total`);
   setText("catalog-audio-meta", `${formatNumber(catalog.audio_books_with_source_books || 0)} linked audiobook books`);
 
   setText("catalog-books-unindexed", formatNumber(catalog.books_unindexed || 0));
@@ -518,23 +480,14 @@ function setEngagement() {
   setText("eng-favorites-added", formatNumber(engagement.favorites_added_total || 0));
   setText("eng-reactions-current", formatNumber(engagement.reaction_total_current || 0));
   setText("eng-reactions-lifetime", formatNumber(engagement.reaction_total_lifetime || 0));
-  setText("eng-ai-total", formatNumber(engagement.ai_total || 0));
   setText("downloader-health", `${formatPercent(downloader.success_rate || 0)} (${formatNumber(downloader.success_total || 0)}/${formatNumber(downloader.attempts_total || 0)})`);
 
   const reactionRows = [
     { label: "Book reactions now", value: Object.values(engagement.book_reactions_current || {}).reduce((acc, x) => acc + Number(x || 0), 0) },
-    { label: "Movie reactions now", value: Object.values(engagement.movie_reactions_current || {}).reduce((acc, x) => acc + Number(x || 0), 0) },
     { label: "Favorites per active user", value: Number(engagement.favorites_per_active_user || 0).toFixed(2) },
     { label: "Reactions per active user", value: Number(engagement.reactions_per_active_user || 0).toFixed(2) },
   ];
   renderListRows("reaction-mix-list", reactionRows, (row) => `<span>${escapeHtml(row.label)}</span><strong>${escapeHtml(row.value)}</strong>`);
-
-  const ai = engagement.ai_breakdown || {};
-  const aiRows = Object.keys(ai)
-    .map((key) => ({ label: key.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase()), value: Number(ai[key] || 0) }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 7);
-  renderListRows("ai-breakdown-list", aiRows, (row) => `<span>AI ${escapeHtml(row.label)}</span><strong>${formatNumber(row.value)}</strong>`);
 
   const issues = Array.isArray(downloader.recent_issues) ? downloader.recent_issues : [];
   renderListRows(
@@ -585,24 +538,14 @@ function setFunnel() {
 
 function setSearchQuality() {
   const q = dashboardData.search_quality || FALLBACK_DATA.search_quality;
-  const totalSearches = Number(q.searches_total || 0);
-  const totalDownloads = Number(q.downloads_total || 0);
-  const movieSearches = Number(q.movie_searches_total || 0);
-  const movieDownloads = Number(q.movie_downloads_total || 0);
-  const bookSearches = Number(
-    q.book_searches_total != null ? q.book_searches_total : Math.max(0, totalSearches - movieSearches)
-  );
-  const bookDownloads = Number(
-    q.book_downloads_total != null ? q.book_downloads_total : Math.max(0, totalDownloads - movieDownloads)
-  );
+  const bookSearches = Number(q.book_searches_total != null ? q.book_searches_total : q.searches_total || 0);
+  const bookDownloads = Number(q.book_downloads_total != null ? q.book_downloads_total : q.downloads_total || 0);
   const conversionPct = Number.isFinite(Number(q.conversion_pct))
     ? Number(q.conversion_pct)
-    : (bookSearches + movieSearches > 0 ? ((bookDownloads + movieDownloads) / (bookSearches + movieSearches)) * 100 : 0);
+    : (bookSearches > 0 ? (bookDownloads / bookSearches) * 100 : 0);
 
   setText("search-book-total", formatNumber(bookSearches));
-  setText("search-movie-total", formatNumber(movieSearches));
   setText("search-book-download-total", formatNumber(bookDownloads));
-  setText("search-movie-download-total", formatNumber(movieDownloads));
   setText("search-conversion", formatPercent(conversionPct));
   setText("search-request-queries", formatNumber(q.request_queries_total || 0));
   setText("search-zero-rate", `${formatPercent(q.zero_result_rate_pct || 0)} (${formatNumber(q.zero_result_total || 0)})`);
@@ -668,7 +611,6 @@ function setCatalogGrowth() {
   const g = dashboardData.catalog_growth || FALLBACK_DATA.catalog_growth;
   const labels = Array.isArray(g.labels) ? g.labels : [];
   const books = Array.isArray(g.books_new) ? g.books_new : [];
-  const movies = Array.isArray(g.movies_new) ? g.movies_new : [];
   const audio = Array.isArray(g.audio_new) ? g.audio_new : [];
   const unindexed = Array.isArray(g.unindexed_new) ? g.unindexed_new : [];
 
@@ -682,7 +624,6 @@ function setCatalogGrowth() {
     tr.innerHTML = `
       <td>${escapeHtml(labels[i] || "-")}</td>
       <td>${formatNumber(books[i] || 0)}</td>
-      <td>${formatNumber(movies[i] || 0)}</td>
       <td>${formatNumber(audio[i] || 0)}</td>
       <td>${formatNumber(unindexed[i] || 0)}</td>
     `;
@@ -690,7 +631,7 @@ function setCatalogGrowth() {
   }
   if (!labels.length) {
     const tr = document.createElement("tr");
-    tr.innerHTML = "<td colspan=\"5\">No growth data in this range</td>";
+    tr.innerHTML = "<td colspan=\"4\">No growth data in this range</td>";
     tbody.appendChild(tr);
   }
 }
@@ -976,14 +917,11 @@ async function fetchDashboardData() {
     if (currentRange === "all") {
       const kpis = dashboardData.kpis || {};
       if (kpis.books_total) kpis.books_new = { ...kpis.books_new, value: Number(kpis.books_total.value || 0), change: "lifetime total", scope: "range" };
-      if (kpis.movies_total) kpis.movies_new = { ...kpis.movies_new, value: Number(kpis.movies_total.value || 0), change: "lifetime total", scope: "range" };
       if (kpis.audios_total) kpis.audios_new = { ...kpis.audios_new, value: Number(kpis.audios_total.value || 0), change: "lifetime total", scope: "range" };
       if (kpis.users_current) kpis.users_new = { ...kpis.users_new, value: Number(kpis.users_current.value || 0), change: "lifetime total", scope: "range" };
       if (kpis.users_left) kpis.users_left = { ...kpis.users_left, change: "lifetime total", scope: "range" };
       if (kpis.book_searches) kpis.book_searches = { ...kpis.book_searches, change: "lifetime total", scope: "range" };
-      if (kpis.movie_searches) kpis.movie_searches = { ...kpis.movie_searches, change: "lifetime total", scope: "range" };
       if (kpis.book_downloads) kpis.book_downloads = { ...kpis.book_downloads, change: "lifetime total", scope: "range" };
-      if (kpis.movie_downloads) kpis.movie_downloads = { ...kpis.movie_downloads, change: "lifetime total", scope: "range" };
     }
     isLiveData = false;
   } finally {

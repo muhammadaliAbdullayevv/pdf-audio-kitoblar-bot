@@ -7,7 +7,6 @@ from telegram.ext import (
     CommandHandler,
     InlineQueryHandler,
     MessageHandler,
-    PollAnswerHandler,
     filters,
 )
 
@@ -22,7 +21,7 @@ REQUIRED_DEP_KEYS = (
     "handle_channel_post",
     "handle_photo_message",
     "handle_abook_audio",
-    "handle_movie_video",
+    "handle_video_media",
     "handle_file",
     "search_books",
     "language_command_handler",
@@ -36,12 +35,8 @@ REQUIRED_DEP_KEYS = (
     "handle_video_downloader_callback",
     "handle_audio_converter_callback",
     "handle_sticker_tools_callback",
-    "handle_ai_tools_callback",
-    "handle_my_quiz_callback",
-    "handle_ai_quiz_poll_answer",
     "handle_language_callback",
     "handle_page_callback",
-    "handle_movie_page_callback",
     "handle_user_page_callback",
     "handle_top_page_callback",
     "handle_top_users_toggle_callback",
@@ -50,8 +45,6 @@ REQUIRED_DEP_KEYS = (
     "handle_audiobook_page_callback",
     "handle_audiobook_part_play_callback",
     "handle_reaction_callback",
-    "handle_movie_reaction_callback",
-    "handle_movie_share_callback",
     "handle_summary_placeholder_callback",
     "handle_admin_panel_callback",
     "handle_background_task_callback",
@@ -67,9 +60,9 @@ REQUIRED_DEP_KEYS = (
     "top_command",
     "top_users_command",
     "help_command",
+    "chatid_command",
     "request_command",
     "requests_command_wrapper",
-    "my_quiz_command",
     "mystats_command",
     "myprofile_command",
     "inlinequery",
@@ -83,7 +76,6 @@ REQUIRED_DEP_KEYS = (
     "user_search_command",
     "pause_bot_command",
     "resume_bot_command",
-    "upload_local_books_command",
     "handle_request_status_callback",
     "handle_requests_page_callback",
     "handle_requests_view_callback",
@@ -95,7 +87,6 @@ REQUIRED_DEP_KEYS = (
     "handle_audiobook_delete_by_book_callback",
     "handle_audiobook_delete_callback",
     "handle_audiobook_add_callback",
-    "handle_movie_selection",
     "handle_book_selection",
     "handle_error",
 )
@@ -119,8 +110,8 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, d["handle_channel_post"]))
     app.add_handler(MessageHandler(filters.PHOTO, d["handle_photo_message"]))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | (filters.Document.ALL & filters.Document.MimeType("audio/")), d["handle_abook_audio"]))
-    app.add_handler(MessageHandler(filters.VIDEO | (filters.Document.ALL & filters.Document.MimeType("video/")), d["handle_movie_video"]))
-    app.add_handler(MessageHandler(filters.ANIMATION, d["handle_movie_video"]))
+    app.add_handler(MessageHandler(filters.VIDEO | (filters.Document.ALL & filters.Document.MimeType("video/")), d["handle_video_media"]))
+    app.add_handler(MessageHandler(filters.ANIMATION, d["handle_video_media"]))
     app.add_handler(MessageHandler(filters.Document.ALL, d["handle_file"]))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, d["search_books"]))
     app.add_handler(CommandHandler("language", d["language_command_handler"]))
@@ -134,12 +125,8 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["handle_video_downloader_callback"], pattern="^vdl:"))
     app.add_handler(CallbackQueryHandler(d["handle_audio_converter_callback"], pattern="^atool:"))
     app.add_handler(CallbackQueryHandler(d["handle_sticker_tools_callback"], pattern="^stkr:"))
-    app.add_handler(CallbackQueryHandler(d["handle_ai_tools_callback"], pattern="^aitool:"))
-    app.add_handler(CallbackQueryHandler(d["handle_my_quiz_callback"], pattern="^myquiz:"))
-    app.add_handler(PollAnswerHandler(d["handle_ai_quiz_poll_answer"]))
     app.add_handler(CallbackQueryHandler(d["handle_language_callback"], pattern="^lang_"))
     app.add_handler(CallbackQueryHandler(d["handle_page_callback"], pattern="^page:"))
-    app.add_handler(CallbackQueryHandler(d["handle_movie_page_callback"], pattern="^mpage:"))
     app.add_handler(CallbackQueryHandler(d["handle_user_page_callback"], pattern="^userpage:"))
     app.add_handler(CallbackQueryHandler(d["handle_top_page_callback"], pattern="^top:"))
     app.add_handler(CallbackQueryHandler(d["handle_top_users_toggle_callback"], pattern="^topusers:"))
@@ -148,8 +135,6 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_page_callback"], pattern="^abpage:"))
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_part_play_callback"], pattern="^abplay:"))
     app.add_handler(CallbackQueryHandler(d["handle_reaction_callback"], pattern="^react:"))
-    app.add_handler(CallbackQueryHandler(d["handle_movie_reaction_callback"], pattern="^mreact:"))
-    app.add_handler(CallbackQueryHandler(d["handle_movie_share_callback"], pattern="^mshare:"))
     app.add_handler(CallbackQueryHandler(d["handle_summary_placeholder_callback"], pattern="^summary:"))
     app.add_handler(CallbackQueryHandler(d["handle_admin_panel_callback"], pattern="^adminp:"))
     app.add_handler(CallbackQueryHandler(d["handle_background_task_callback"], pattern="^bgtask:"))
@@ -165,9 +150,9 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CommandHandler("top", d["top_command"]))
     app.add_handler(CommandHandler("top_users", d["top_users_command"]))
     app.add_handler(CommandHandler("help", d["help_command"]))
+    app.add_handler(CommandHandler("chatid", d["chatid_command"]))
     app.add_handler(CommandHandler("request", d["request_command"]))
     app.add_handler(CommandHandler("requests", d["requests_command_wrapper"]))
-    app.add_handler(CommandHandler("my_quiz", d["my_quiz_command"]))
     app.add_handler(CommandHandler("mystats", d["mystats_command"]))
     app.add_handler(CommandHandler("myprofile", d["myprofile_command"]))
     app.add_handler(InlineQueryHandler(d["inlinequery"]))
@@ -181,7 +166,6 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CommandHandler("user", d["user_search_command"]))
     app.add_handler(CommandHandler("pause_bot", d["pause_bot_command"]))
     app.add_handler(CommandHandler("resume_bot", d["resume_bot_command"]))
-    app.add_handler(CommandHandler("upload_local_books", d["upload_local_books_command"]))
     app.add_handler(CallbackQueryHandler(d["handle_request_status_callback"], pattern="^reqstatus:"))
     app.add_handler(CallbackQueryHandler(d["handle_requests_page_callback"], pattern="^reqpage:"))
     app.add_handler(CallbackQueryHandler(d["handle_requests_view_callback"], pattern="^reqview:"))
@@ -193,6 +177,5 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_delete_by_book_callback"], pattern=r"^abdelbook:"))
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_delete_callback"], pattern=r"^abdel:"))
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_add_callback"], pattern=r"^abadd:"))
-    app.add_handler(CallbackQueryHandler(d["handle_movie_selection"], pattern=r"^movie:[0-9a-fA-F-]{32,36}$"))
     app.add_handler(CallbackQueryHandler(d["handle_book_selection"], pattern=r"^(book:)?[0-9a-fA-F-]{32,36}$"))
     app.add_error_handler(d["handle_error"])

@@ -4,10 +4,17 @@ import asyncio
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any
 
-import ai_tools as _ai_tools
+from book_thumbnail import get_book_thumbnail_input
 from language import MESSAGES
+from telegram.error import NetworkError, RetryAfter, TimedOut
+
+try:
+    from pdf_editor import _pdf_editor_watermark_blocking as _shared_pdf_watermark_blocking
+except Exception:
+    _shared_pdf_watermark_blocking = None
 
 import uuid
 
@@ -23,10 +30,6 @@ _CONFIG_REQUIRED_KEYS = (
     "update_user_info",
     "is_allowed",
     "clean_query",
-    "db_find_duplicate_movie",
-    "db_insert_movie",
-    "es_available",
-    "update_movie_indexed",
     "_send_with_retry",
     "ApplicationHandlerStop",
     "safe_reply",
@@ -34,57 +37,23 @@ _CONFIG_REQUIRED_KEYS = (
     "db_update_upload_receipt",
     "db_insert_book",
     "db_update_book_upload_meta",
-    "UPLOAD_CHANNEL_IDS",
-    "enqueue_upload_fanout",
+    "db_enqueue_book_local_download_job",
+    "db_claim_book_local_download_job",
+    "db_complete_book_local_download_job",
+    "db_retry_book_local_download_job",
+    "db_fail_book_local_download_job",
     "index_book",
     "notify_request_matches",
     "db_insert_upload_receipt",
     "_reply_search_image_hint",
+    "es_available",
     "ensure_index",
     "load_books",
     "get_display_name",
     "update_book_indexed",
-    "ensure_movies_index",
-    "index_movie",
-    "db_list_unindexed_movies",
     "InlineKeyboardMarkup",
     "InlineKeyboardButton",
 )
-
-_UPLOAD_MODE_KEY = "upload_mode_state"
-_UPLOAD_MODE_BOOK = "book"
-_UPLOAD_MODE_MOVIE = "movie_removed"
-
-
-def configure(deps: dict[str, Any]) -> None:
-    for k, v in deps.items():
-        if k.startswith('__') and k.endswith('__'):
-            continue
-        globals()[k] = v
-    missing = [key for key in _CONFIG_REQUIRED_KEYS if key not in globals()]
-    if missing:
-        raise RuntimeError(f"upload_flow missing configured dependencies: {', '.join(missing)}")
-
-
-def _set_user_upload_mode(context: ContextTypes.DEFAULT_TYPE, mode: str | None) -> None:
-    try:
-        if mode in {_UPLOAD_MODE_BOOK, _UPLOAD_MODE_MOVIE}:
-            context.user_data[_UPLOAD_MODE_KEY] = mode
-        else:
-            context.user_data.pop(_UPLOAD_MODE_KEY, None)
-    except Exception:
-        pass
-
-
-def _get_user_upload_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
-    try:
-        mode = str(context.user_data.get(_UPLOAD_MODE_KEY) or "").strip().lower()
-    except Exception:
-        mode = ""
-    if mode in {_UPLOAD_MODE_BOOK}:
-        return mode
-    return ""
-
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
@@ -104,6 +73,59 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return float(default)
 
+
+_UPLOAD_MODE_KEY = "upload_mode_state"
+_UPLOAD_MODE_BOOK = "book"
+_UPLOAD_LOCAL_DIR = Path(os.getenv("UPLOAD_LOCAL_DIR", str(Path(__file__).resolve().parent / "downloads" / "localbooks")))
+_UPLOAD_AUTO_DOWNLOAD_LOCAL = _env_bool("UPLOAD_AUTO_DOWNLOAD_LOCAL", True)
+_UPLOAD_LOCAL_WORKER_COUNT = max(1, _env_int("UPLOAD_LOCAL_WORKER_COUNT", 3))
+_UPLOAD_LOCAL_DOWNLOAD_RETRIES = max(1, _env_int("UPLOAD_LOCAL_DOWNLOAD_RETRIES", 6))
+_UPLOAD_LOCAL_RETRY_BASE_DELAY_SEC = max(0.5, _env_float("UPLOAD_LOCAL_RETRY_BASE_DELAY_SEC", 2.0))
+_UPLOAD_LOCAL_RETRY_MIN_DELAY_SEC = max(1.0, _env_float("UPLOAD_LOCAL_RETRY_MIN_DELAY_SEC", 10.0))
+_UPLOAD_LOCAL_WORKER_POLL_SECONDS = max(0.5, _env_float("UPLOAD_LOCAL_WORKER_POLL_SECONDS", 1.0))
+_UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS = max(0.0, _env_float("UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS", 0.1))
+_UPLOAD_LOCAL_JOB_STALE_AFTER_SECONDS = max(60, _env_int("UPLOAD_LOCAL_JOB_STALE_AFTER_SECONDS", 3600))
+_UPLOAD_LOCAL_GET_FILE_READ_TIMEOUT_SEC = max(60.0, _env_float("UPLOAD_LOCAL_GET_FILE_READ_TIMEOUT_SEC", 300.0))
+_UPLOAD_LOCAL_DOWNLOAD_READ_TIMEOUT_SEC = max(120.0, _env_float("UPLOAD_LOCAL_DOWNLOAD_READ_TIMEOUT_SEC", 600.0))
+_UPLOAD_LOCAL_CONNECT_TIMEOUT_SEC = max(10.0, _env_float("UPLOAD_LOCAL_CONNECT_TIMEOUT_SEC", 45.0))
+_UPLOAD_LOCAL_POOL_TIMEOUT_SEC = max(10.0, _env_float("UPLOAD_LOCAL_POOL_TIMEOUT_SEC", 45.0))
+_UPLOAD_LOCAL_REFRESH_FILE_ID = _env_bool("UPLOAD_LOCAL_REFRESH_FILE_ID", True)
+_UPLOAD_LOCAL_WATERMARK_PDF = _env_bool("UPLOAD_LOCAL_WATERMARK_PDF", True)
+_UPLOAD_LOCAL_WATERMARK_TEXT = (
+    str(os.getenv("BOOK_WATERMARK_TEXT", "") or "").strip()
+    or "Pdf va audio kitoblar"
+)
+_UPLOAD_LOCAL_WORKER_KEY = "upload_local_backup_workers"
+
+
+def configure(deps: dict[str, Any]) -> None:
+    for k, v in deps.items():
+        if k.startswith('__') and k.endswith('__'):
+            continue
+        globals()[k] = v
+    missing = [key for key in _CONFIG_REQUIRED_KEYS if key not in globals()]
+    if missing:
+        raise RuntimeError(f"upload_flow missing configured dependencies: {', '.join(missing)}")
+
+
+def _set_user_upload_mode(context: ContextTypes.DEFAULT_TYPE, mode: str | None) -> None:
+    try:
+        if mode == _UPLOAD_MODE_BOOK:
+            context.user_data[_UPLOAD_MODE_KEY] = mode
+        else:
+            context.user_data.pop(_UPLOAD_MODE_KEY, None)
+    except Exception:
+        pass
+
+
+def _get_user_upload_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    try:
+        mode = str(context.user_data.get(_UPLOAD_MODE_KEY) or "").strip().lower()
+    except Exception:
+        mode = ""
+    if mode in {_UPLOAD_MODE_BOOK}:
+        return mode
+    return ""
 
 _BOOK_ADULT_FILTER_PATTERNS = (
     re.compile(r"(?<!\d)18\s*\+"),
@@ -159,6 +181,32 @@ def _book_has_adult_markers(*parts: Any) -> bool:
         if token in haystack:
             return True
     return False
+
+
+_BOOK_UPLOAD_ALLOWED_EXTENSIONS = {
+    ".pdf",
+    ".epub",
+    ".mobi",
+    ".djvu",
+    ".fb2",
+    ".txt",
+    ".doc",
+    ".docx",
+    ".rtf",
+    ".azw",
+    ".azw3",
+    ".odt",
+}
+_BOOK_UPLOAD_ALLOWED_FORMATS_TEXT = "PDF, EPUB, MOBI, DJVU, FB2, TXT, DOC, DOCX, RTF, AZW, AZW3, ODT"
+
+
+def _book_upload_file_extension(file_name: str) -> str:
+    _, ext = os.path.splitext(str(file_name or "").strip())
+    return ext.lower().strip()
+
+
+def _book_upload_is_allowed_file(file_name: str) -> bool:
+    return _book_upload_file_extension(file_name) in _BOOK_UPLOAD_ALLOWED_EXTENSIONS
 
 
 def _coerce_int_id_list(raw: Any) -> list[int]:
@@ -405,8 +453,461 @@ async def enqueue_bulk_index_job(app, job: dict):
         data["upload_bulk_index_worker"] = app.create_task(upload_bulk_index_worker(app))
 
 
+def _upload_local_normalized_label(value: str, default: str = "book") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    cleaner = globals().get("clean_query")
+    if callable(cleaner):
+        try:
+            text = str(cleaner(text) or "").strip()
+        except Exception:
+            pass
+    text = re.sub(r"[\x00-\x1f\x7f/\\]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return (text[:180] or default)
+
+
+def _upload_local_filename(book: dict[str, Any], file_name: str | None, file_path: str | None = None) -> str:
+    raw = str(file_name or file_path or "").strip()
+    ext = Path(raw).suffix.strip()
+    if not ext and file_path:
+        ext = Path(str(file_path)).suffix.strip()
+    if not ext:
+        ext = ".pdf"
+    base = _upload_local_normalized_label(
+        (book or {}).get("book_name")
+        or (book or {}).get("display_name")
+        or Path(raw).stem
+        or "book"
+    )
+    return f"{base}{ext}"
+
+
+def _upload_local_is_pdf_path(path: Path) -> bool:
+    return str(path.suffix or "").lower() == ".pdf"
+
+
+async def _upload_local_watermark_pdf_in_place(local_path: Path, watermark_text: str) -> None:
+    if _shared_pdf_watermark_blocking is None:
+        raise RuntimeError("watermark tools missing")
+    if not local_path.exists():
+        raise FileNotFoundError(str(local_path))
+
+    run_blocking_fn = globals().get("run_blocking")
+    if not callable(run_blocking_fn):
+        raise RuntimeError("run_blocking dependency missing")
+
+    pdf_bytes = await asyncio.to_thread(local_path.read_bytes)
+    watermarked_bytes = await run_blocking_fn(_shared_pdf_watermark_blocking, pdf_bytes, watermark_text)
+    tmp_wm_path = local_path.with_name(local_path.name + ".wm.part")
+    try:
+        if tmp_wm_path.exists():
+            tmp_wm_path.unlink()
+    except Exception:
+        pass
+    await asyncio.to_thread(tmp_wm_path.write_bytes, watermarked_bytes)
+    await asyncio.to_thread(tmp_wm_path.replace, local_path)
+
+
+def _upload_local_target_path(book: dict[str, Any], file_name: str | None, file_path: str | None = None) -> Path:
+    folder_name = _upload_local_normalized_label(
+        book.get("book_name")
+        or book.get("display_name")
+        or file_name
+        or "book"
+    )
+    book_id = str(book.get("id") or "").strip()
+    if book_id:
+        folder_name = f"{folder_name}__{book_id}"
+    return _UPLOAD_LOCAL_DIR / folder_name / _upload_local_filename(book, file_name, file_path)
+
+
+async def _upload_local_retry(call, *, desc: str):
+    delay = _UPLOAD_LOCAL_RETRY_BASE_DELAY_SEC
+    for attempt in range(1, _UPLOAD_LOCAL_DOWNLOAD_RETRIES + 1):
+        try:
+            return await call()
+        except RetryAfter as e:
+            if attempt >= _UPLOAD_LOCAL_DOWNLOAD_RETRIES:
+                raise
+            sleep_for = max(1.0, float(getattr(e, "retry_after", 1) or 1.0)) + 0.5
+            logger.warning("%s transient error (%s), retrying in %.1fs (attempt %s/%s)", desc, e, sleep_for, attempt, _UPLOAD_LOCAL_DOWNLOAD_RETRIES)
+            await asyncio.sleep(sleep_for)
+        except (TimedOut, NetworkError) as e:
+            if attempt >= _UPLOAD_LOCAL_DOWNLOAD_RETRIES:
+                raise
+            logger.warning("%s transient error (%s), retrying in %.1fs (attempt %s/%s)", desc, e, delay, attempt, _UPLOAD_LOCAL_DOWNLOAD_RETRIES)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60.0)
+
+
+async def _save_uploaded_book_local(bot, book: dict[str, Any], file_id: str, file_name: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "book_id": str(book.get("id") or ""),
+        "path": None,
+        "source_kind": "missing",
+        "error": None,
+        "db_updated": False,
+        "file_id_refreshed": False,
+    }
+    book_id = result["book_id"]
+    try:
+        if not file_id or not book_id:
+            result["error"] = "missing file_id or book_id"
+            return result
+
+        _UPLOAD_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+        target_path = _upload_local_target_path(book, file_name)
+        if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
+            result["path"] = str(target_path)
+            result["source_kind"] = "reused-existing"
+        else:
+            get_file_kwargs = {
+                "read_timeout": _UPLOAD_LOCAL_GET_FILE_READ_TIMEOUT_SEC,
+                "connect_timeout": _UPLOAD_LOCAL_CONNECT_TIMEOUT_SEC,
+                "pool_timeout": _UPLOAD_LOCAL_POOL_TIMEOUT_SEC,
+            }
+            tg_file = await _upload_local_retry(
+                lambda: bot.get_file(file_id, **get_file_kwargs),
+                desc=f"get_file {book_id or file_id}",
+            )
+            file_path = str(getattr(tg_file, "file_path", "") or "")
+            target_path = _upload_local_target_path(book, file_name, file_path=file_path or None)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = target_path.with_name(target_path.name + ".part")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            download_kwargs = {
+                "read_timeout": _UPLOAD_LOCAL_DOWNLOAD_READ_TIMEOUT_SEC,
+                "connect_timeout": _UPLOAD_LOCAL_CONNECT_TIMEOUT_SEC,
+                "pool_timeout": _UPLOAD_LOCAL_POOL_TIMEOUT_SEC,
+            }
+            await _upload_local_retry(
+                lambda: tg_file.download_to_drive(custom_path=str(tmp_path), **download_kwargs),
+                desc=f"download {book_id or file_id}",
+            )
+            if _UPLOAD_LOCAL_WATERMARK_PDF and _upload_local_is_pdf_path(target_path):
+                await _upload_local_watermark_pdf_in_place(tmp_path, _UPLOAD_LOCAL_WATERMARK_TEXT)
+                result["source_kind"] = "telegram-file-watermarked"
+            else:
+                result["source_kind"] = "telegram-file"
+            await asyncio.to_thread(tmp_path.replace, target_path)
+            result["path"] = str(target_path)
+
+        update_book_path_fn = globals().get("db_update_book_path")
+        if callable(update_book_path_fn) and result["path"]:
+            try:
+                await run_blocking(update_book_path_fn, book_id, result["path"])
+                result["db_updated"] = True
+            except Exception as e:
+                result["error"] = f"db_update_book_path failed: {e}"
+                logger.warning("db_update_book_path failed for %s: %s", book_id, e, exc_info=True)
+        elif result["path"]:
+            result["error"] = "db_update_book_path dependency missing"
+            logger.warning("db_update_book_path dependency missing; saved local file without DB path update for %s", book_id)
+        book["path"] = result["path"]
+
+        if result["path"] and _UPLOAD_LOCAL_REFRESH_FILE_ID:
+            refresh_info = await _refresh_uploaded_book_file_id(bot, book_id, result["path"])
+            if refresh_info.get("file_id"):
+                new_file_id = str(refresh_info.get("file_id") or "").strip()
+                new_file_unique_id = str(refresh_info.get("file_unique_id") or "").strip() or None
+                update_book_file_id_fn = globals().get("update_book_file_id")
+                if callable(update_book_file_id_fn):
+                    try:
+                        await run_blocking(update_book_file_id_fn, book_id, new_file_id, True, new_file_unique_id)
+                        result["file_id_refreshed"] = True
+                        book["file_id"] = new_file_id
+                        if new_file_unique_id:
+                            book["file_unique_id"] = new_file_unique_id
+                    except Exception as e:
+                        result["error"] = f"update_book_file_id failed: {e}"
+                        logger.warning("update_book_file_id failed for %s: %s", book_id, e, exc_info=True)
+                else:
+                    result["error"] = "update_book_file_id dependency missing"
+                    logger.warning("update_book_file_id dependency missing; kept old file_id for %s", book_id)
+
+                if result["file_id_refreshed"]:
+                    db_get_book_by_id_fn = globals().get("db_get_book_by_id")
+                    if callable(db_get_book_by_id_fn) and es_available():
+                        try:
+                            refreshed_book = await run_blocking(db_get_book_by_id_fn, book_id)
+                            if refreshed_book:
+                                await run_blocking(
+                                    index_book,
+                                    refreshed_book.get("book_name"),
+                                    new_file_id,
+                                    result["path"],
+                                    book_id,
+                                    refreshed_book.get("display_name") or refreshed_book.get("book_name"),
+                                    new_file_unique_id,
+                                )
+                        except Exception as e:
+                            logger.warning("Failed to reindex refreshed book file_id for %s: %s", book_id, e, exc_info=True)
+            elif not result["error"]:
+                result["error"] = f"file_id refresh failed: {refresh_info.get('error') or 'unknown error'}"
+        logger.info("Saved uploaded book locally: book_id=%s path=%s", book_id, result["path"])
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        logger.error("Failed to save uploaded book locally for %s: %s", book_id, e, exc_info=True)
+        return result
+
+
+async def _refresh_uploaded_book_file_id(bot, book_id: str, local_path: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "file_id": None,
+        "file_unique_id": None,
+        "error": None,
+    }
+    if not _UPLOAD_LOCAL_REFRESH_FILE_ID:
+        result["error"] = "refresh disabled"
+        return result
+
+    storage_channel_id = _resolve_book_storage_channel_id()
+    # Telegram channel IDs are negative. Only 0 means "missing".
+    if storage_channel_id == 0:
+        result["error"] = "missing BOOK_STORAGE_CHANNEL_ID"
+        return result
+
+    if not local_path or not Path(local_path).exists():
+        result["error"] = "missing local path"
+        return result
+
+    try:
+        sent = await _upload_local_retry(
+            lambda: bot.send_document(
+                chat_id=storage_channel_id,
+                document=str(local_path),
+                thumbnail=get_book_thumbnail_input(),
+                disable_notification=True,
+            ),
+            desc=f"refresh file_id {book_id}",
+        )
+        document = getattr(sent, "document", None)
+        file_id = str(getattr(document, "file_id", "") or "").strip()
+        if not file_id:
+            result["error"] = "Telegram did not return a document file_id"
+            return result
+        result["file_id"] = file_id
+        result["file_unique_id"] = str(getattr(document, "file_unique_id", "") or "").strip() or None
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        logger.warning(
+            "Failed to refresh file_id for %s from local file %s via storage channel %s: %s",
+            book_id,
+            local_path,
+            storage_channel_id,
+            e,
+            exc_info=True,
+        )
+        return result
+
+
+def _resolve_book_storage_channel_id() -> int:
+    candidates: list[Any] = []
+    try:
+        from config import BOOK_STORAGE_CHANNEL_ID as _config_book_storage_channel_id  # type: ignore
+
+        candidates.append(_config_book_storage_channel_id)
+    except Exception:
+        pass
+    candidates.extend(
+        [
+            globals().get("BOOK_STORAGE_CHANNEL_ID"),
+            os.getenv("BOOK_STORAGE_CHANNEL_ID", ""),
+        ]
+    )
+    for env_name in ("BOOK_MIGRATION_TARGET_CHANNEL_IDS", "UPLOAD_CHANNEL_IDS"):
+        candidates.append(os.getenv(env_name, ""))
+    candidates.extend(
+        [
+            globals().get("TELEGRAM_OWNER_ID"),
+            os.getenv("TELEGRAM_OWNER_ID", ""),
+        ]
+    )
+    # Final hard fallback so uploads keep working even if the runtime env is stale.
+    # This is the known private storage channel used for minted file_id refreshes.
+    candidates.append(-1003970604636)
+    for raw in candidates:
+        ids = _coerce_int_id_list(raw)
+        if ids:
+            return ids[0]
+        try:
+            value = int(str(raw or "").strip())
+        except Exception:
+            value = 0
+        if value:
+            return value
+    return 0
+
+
+def start_upload_local_backup_worker(app) -> None:
+    if not _UPLOAD_AUTO_DOWNLOAD_LOCAL:
+        return
+    logger.info(
+        "Local backup worker config: storage_channel_id=%s auto_download=%s refresh_file_id=%s workers=%s",
+        _resolve_book_storage_channel_id(),
+        _UPLOAD_AUTO_DOWNLOAD_LOCAL,
+        _UPLOAD_LOCAL_REFRESH_FILE_ID,
+        _UPLOAD_LOCAL_WORKER_COUNT,
+    )
+    data = app.bot_data
+    workers = data.get(_UPLOAD_LOCAL_WORKER_KEY)
+    if isinstance(workers, list):
+        live_workers = [task for task in workers if task is not None and not task.done()]
+        if live_workers:
+            data[_UPLOAD_LOCAL_WORKER_KEY] = live_workers
+            return
+    elif workers and not getattr(workers, "done", lambda: True)():
+        return
+    created_workers = [
+        app.create_task(_upload_local_backup_worker(app, worker_index=index + 1))
+        for index in range(_UPLOAD_LOCAL_WORKER_COUNT)
+    ]
+    data[_UPLOAD_LOCAL_WORKER_KEY] = created_workers
+    logger.info("Started %s local backup worker(s)", len(created_workers))
+
+
+async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
+    worker_id = f"upload-local-backup:{os.getpid()}:{worker_index}"
+    try:
+        while True:
+            try:
+                claim_fn = globals().get("db_claim_book_local_download_job")
+                retry_fn = globals().get("db_retry_book_local_download_job")
+                fail_fn = globals().get("db_fail_book_local_download_job")
+                complete_fn = globals().get("db_complete_book_local_download_job")
+                if not (callable(claim_fn) and callable(retry_fn) and callable(fail_fn) and callable(complete_fn)):
+                    logger.warning("Local backup worker dependencies missing; sleeping")
+                    await asyncio.sleep(_UPLOAD_LOCAL_WORKER_POLL_SECONDS)
+                    continue
+
+                job = await run_blocking(
+                    claim_fn,
+                    worker_id,
+                    _UPLOAD_LOCAL_JOB_STALE_AFTER_SECONDS,
+                )
+                if not job:
+                    await asyncio.sleep(_UPLOAD_LOCAL_WORKER_POLL_SECONDS)
+                    continue
+
+                job_id = str(job.get("id") or "").strip()
+                book_id = str(job.get("book_id") or "").strip()
+                file_id = str(job.get("file_id") or "").strip()
+                file_name = str(job.get("file_name") or "").strip()
+                attempts = int(job.get("attempts") or 0)
+                max_attempts = int(job.get("max_attempts") or 12)
+                logger.info(
+                    "Local backup job claimed: job_id=%s book_id=%s status=downloading attempts=%s/%s",
+                    job_id,
+                    book_id,
+                    attempts,
+                    max_attempts,
+                )
+
+                if not job_id or not book_id or not file_id or not file_name:
+                    error = "missing local backup job payload"
+                    if job_id:
+                        if attempts >= max_attempts:
+                            await run_blocking(fail_fn, job_id, error)
+                        else:
+                            await run_blocking(retry_fn, job_id, error, 60.0)
+                    if _UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS > 0:
+                        await asyncio.sleep(_UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS)
+                    continue
+
+                result = await _save_uploaded_book_local(app.bot, {"id": book_id}, file_id, file_name)
+                refresh_required = bool(_UPLOAD_LOCAL_REFRESH_FILE_ID)
+                refresh_ok = bool(result.get("file_id_refreshed")) or not refresh_required
+                if result.get("path") and result.get("db_updated") and refresh_ok:
+                    logger.info("Local backup job done: job_id=%s book_id=%s path=%s", job_id, book_id, result["path"])
+                    await run_blocking(complete_fn, job_id)
+                    if _UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS > 0:
+                        await asyncio.sleep(_UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS)
+                    continue
+
+                error = str(result.get("error") or "local backup failed")
+                if result.get("path") and not result.get("db_updated"):
+                    error = f"{error} (local file saved, DB path update pending)"
+                elif result.get("path") and result.get("db_updated") and refresh_required and not result.get("file_id_refreshed"):
+                    error = f"{error} (local file saved, file_id refresh pending)"
+                if attempts >= max_attempts:
+                    logger.error(
+                        "Local backup job failed permanently: job_id=%s book_id=%s attempts=%s/%s error=%s",
+                        job_id,
+                        book_id,
+                        attempts,
+                        max_attempts,
+                        error,
+                    )
+                    await run_blocking(fail_fn, job_id, error)
+                else:
+                    backoff = max(
+                        _UPLOAD_LOCAL_RETRY_MIN_DELAY_SEC,
+                        min(3600.0, _UPLOAD_LOCAL_RETRY_BASE_DELAY_SEC * (2 ** max(0, attempts - 1))),
+                    )
+                    logger.warning(
+                        "Local backup job retry scheduled: job_id=%s book_id=%s attempts=%s/%s backoff=%.1fs error=%s",
+                        job_id,
+                        book_id,
+                        attempts,
+                        max_attempts,
+                        backoff,
+                        error,
+                    )
+                    await run_blocking(retry_fn, job_id, error, backoff)
+                if _UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS > 0:
+                    await asyncio.sleep(_UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Local backup worker loop failed: %s", e, exc_info=True)
+                await asyncio.sleep(5.0)
+    finally:
+        current_task = _safe_asyncio_current_task()
+        workers = app.bot_data.get(_UPLOAD_LOCAL_WORKER_KEY)
+        if current_task is not None and isinstance(workers, list):
+            remaining = [task for task in workers if task is not current_task and not task.done()]
+            if remaining:
+                app.bot_data[_UPLOAD_LOCAL_WORKER_KEY] = remaining
+            else:
+                app.bot_data.pop(_UPLOAD_LOCAL_WORKER_KEY, None)
+        elif current_task is not None and app.bot_data.get(_UPLOAD_LOCAL_WORKER_KEY) is current_task:
+            app.bot_data.pop(_UPLOAD_LOCAL_WORKER_KEY, None)
+
+
+async def _enqueue_upload_local_backup(app, book: dict[str, Any], file_id: str, file_name: str) -> None:
+    if not _UPLOAD_AUTO_DOWNLOAD_LOCAL:
+        return
+    enqueue_fn = globals().get("db_enqueue_book_local_download_job")
+    if not callable(enqueue_fn):
+        logger.warning("db_enqueue_book_local_download_job dependency missing; skipping local backup enqueue")
+        return
+    book_id = str((book or {}).get("id") or "").strip()
+    if not book_id:
+        logger.warning("Skipping local backup enqueue for missing book_id")
+        return
+    try:
+        job_id = await run_blocking(
+            enqueue_fn,
+            book_id,
+            str(file_id or "").strip(),
+            str(file_name or "").strip(),
+            str((book or {}).get("file_unique_id") or "").strip() or None,
+        )
+        logger.info("Queued local backup job: book_id=%s job_id=%s", book_id, job_id)
+    except Exception as e:
+        logger.error("Failed to enqueue local backup job for %s: %s", book_id, e, exc_info=True)
+
+
 async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global upload_mode, movie_upload_mode
+    global upload_mode
     try:
         lang = ensure_user_language(update, context)
 
@@ -423,7 +924,6 @@ async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_allowed(update.effective_user.id):
             _set_user_upload_mode(context, _UPLOAD_MODE_BOOK)
             upload_mode = True
-            movie_upload_mode = False
             await update.message.reply_text(MESSAGES[lang]["upload_activated"])
         else:
             await update.message.reply_text(MESSAGES[lang]["not_authorized"])
@@ -510,587 +1010,6 @@ def _is_channel_or_link_line(raw: str, normalized: str = "") -> bool:
     return False
 
 
-def _normalize_title_candidate(raw: str) -> str:
-    value = _clean_meta_value(raw)
-    value = value.strip("#").strip()
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
-
-
-def _is_bad_movie_title_candidate(raw: str) -> bool:
-    value = _normalize_title_candidate(raw)
-    if not value:
-        return True
-    lower = value.lower()
-    if _PROMO_LINE_RE.match(value):
-        return True
-    if _is_channel_or_link_line(value, value):
-        return True
-    if lower.startswith("video_") and len(lower) >= 12:
-        return True
-    if re.fullmatch(r"video[_\-\s]*agad[a-z0-9_\-]{5,}", lower):
-        return True
-    if re.fullmatch(r"agad[a-z0-9_\-]{6,}", lower):
-        return True
-    return False
-
-
-def _humanize_movie_filename_stem(stem: str) -> str:
-    text = str(stem or "").strip()
-    if not text:
-        return ""
-    text = re.sub(r"[_\.]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _sanitize_caption_for_storage(caption: str) -> str:
-    raw = str(caption or "").strip()
-    if not raw:
-        return ""
-
-    lines_out: list[str] = []
-    blank_emitted = False
-    for raw_line in raw.splitlines():
-        line = _CAPTION_LINK_RE.sub("", str(raw_line))
-        line = re.sub(r"\s{2,}", " ", line).strip()
-        if line:
-            lines_out.append(line)
-            blank_emitted = False
-            continue
-        if lines_out and not blank_emitted:
-            lines_out.append("")
-            blank_emitted = True
-
-    cleaned = "\n".join(lines_out).strip()
-    if len(cleaned) > 1024:
-        cleaned = cleaned[:1021].rstrip() + "..."
-    return cleaned
-
-
-def _normalize_search_text(raw: str) -> str:
-    cleaner = globals().get("clean_query")
-    text = str(raw or "").strip()
-    if callable(cleaner):
-        try:
-            return str(cleaner(text) or "").strip()
-        except Exception:
-            pass
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-
-def _parse_movie_caption(caption: str) -> dict[str, Any]:
-    text = str(caption or "").strip()
-    if not text:
-        return {}
-
-    lines = [_clean_caption_line(x) for x in text.splitlines()]
-    lines = [x for x in lines if x]
-    if not lines:
-        return {}
-
-    title = ""
-    for m in _TITLE_QUOTED_RE.finditer(text):
-        candidate = _normalize_title_candidate(m.group(1))
-        if candidate and not _is_bad_movie_title_candidate(candidate):
-            title = candidate
-            break
-
-    year = None
-    genre = ""
-    country = ""
-    language = ""
-    rating = ""
-
-    for line in lines:
-        if _is_separator_line(line):
-            continue
-        line_for_match = _line_for_match(line)
-        if not line_for_match:
-            continue
-
-        parsed = False
-        for key, pattern in _FIELD_PATTERNS.items():
-            m = pattern.match(line_for_match)
-            if not m:
-                continue
-            value = _clean_meta_value(m.group(1))
-            if not value:
-                parsed = True
-                break
-            if key == "title":
-                candidate = _normalize_title_candidate(value)
-                if candidate and not _is_bad_movie_title_candidate(candidate):
-                    title = candidate
-            elif key == "year":
-                ym = _YEAR_RE.search(value)
-                if ym:
-                    try:
-                        year = int(ym.group(1))
-                    except Exception:
-                        year = None
-            elif key == "genre":
-                genre = value
-            elif key == "country":
-                country = value
-            elif key == "language":
-                language = value
-            elif key == "rating":
-                rating = value
-            parsed = True
-            break
-        if parsed:
-            continue
-
-        if not language:
-            for pat in _LANG_INLINE_PATTERNS:
-                m = pat.match(line_for_match)
-                if m:
-                    language = _clean_meta_value(m.group(1))
-                    parsed = True
-                    break
-        if parsed:
-            continue
-
-        if year is None:
-            ym = _YEAR_RE.search(line_for_match)
-            if ym and any(tok in line_for_match.lower() for tok in ("yil", "year", "год", "йил")):
-                try:
-                    year = int(ym.group(1))
-                except Exception:
-                    year = None
-
-    if not title:
-        for line in lines:
-            if _is_separator_line(line):
-                continue
-            line_for_match = _line_for_match(line)
-            if not line_for_match:
-                continue
-            if _is_channel_or_link_line(line, line_for_match):
-                continue
-            if _PROMO_LINE_RE.match(line_for_match):
-                continue
-            if any(p.match(line_for_match) for p in _FIELD_PATTERNS.values()):
-                continue
-            if any(p.match(line_for_match) for p in _LANG_INLINE_PATTERNS):
-                continue
-            if _YEAR_RE.search(line_for_match) and len(line_for_match) <= 12:
-                continue
-            candidate = _normalize_title_candidate(line_for_match)
-            if candidate and not _is_bad_movie_title_candidate(candidate):
-                title = candidate
-                break
-
-    search_parts = [title, genre, country, language, rating]
-    if year:
-        search_parts.append(str(year))
-    search_parts.append(text)
-    search_text = _normalize_search_text(" ".join([p for p in search_parts if p]))
-    latinize = globals().get("latinize_text")
-    if callable(latinize) and search_text:
-        try:
-            latinized = _normalize_search_text(latinize(search_text))
-            if latinized and latinized != search_text:
-                search_text = f"{search_text} {latinized}".strip()
-        except Exception:
-            pass
-
-    return {
-        "parsed_title": title or None,
-        "release_year": year,
-        "genre": genre or None,
-        "country": country or None,
-        "movie_lang": language or None,
-        "rating": rating or None,
-        "caption_text": text,
-        "search_text": search_text or None,
-    }
-
-
-def _movie_media_payload_from_message(msg) -> dict | None:
-    if not msg:
-        return None
-    caption = str(getattr(msg, "caption", "") or "").strip()
-    storage_caption = _sanitize_caption_for_storage(caption)
-    caption_for_parse = storage_caption or caption
-    caption_meta = _parse_movie_caption(caption_for_parse)
-    video = getattr(msg, "video", None)
-    if video:
-        movie_name = getattr(video, "file_name", None) or f"video_{getattr(video, 'file_unique_id', '') or uuid.uuid4().hex[:8]}.mp4"
-        return {
-            "kind": "video",
-            "file_id": getattr(video, "file_id", None),
-            "file_unique_id": getattr(video, "file_unique_id", None),
-            "file_name": movie_name,
-            "mime_type": getattr(video, "mime_type", None),
-            "duration_seconds": getattr(video, "duration", None),
-            "file_size": getattr(video, "file_size", None),
-            "caption": caption,
-            "storage_caption": storage_caption or None,
-            **caption_meta,
-        }
-    doc = getattr(msg, "document", None)
-    if doc:
-        mime = str(getattr(doc, "mime_type", "") or "").lower()
-        name = getattr(doc, "file_name", None) or ""
-        lowered = name.lower()
-        if mime.startswith("video/") or lowered.endswith((".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v")):
-            movie_name = name or f"video_{getattr(doc, 'file_unique_id', '') or uuid.uuid4().hex[:8]}.mp4"
-            return {
-                "kind": "document",
-                "file_id": getattr(doc, "file_id", None),
-                "file_unique_id": getattr(doc, "file_unique_id", None),
-                "file_name": movie_name,
-                "mime_type": getattr(doc, "mime_type", None),
-                "duration_seconds": None,
-                "file_size": getattr(doc, "file_size", None),
-                "caption": caption,
-                "storage_caption": storage_caption or None,
-                **caption_meta,
-            }
-    return None
-
-
-async def movie_upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = ensure_user_language(update, context)
-    await safe_reply(
-        update,
-        MESSAGES[lang].get("movie_feature_removed", "🎬 Movie feature has been removed. Please use book search instead."),
-    )
-
-
-async def _process_movie_upload(
-    context: ContextTypes.DEFAULT_TYPE,
-    status_msg,
-    media: dict,
-    lang: str,
-    uploader_user_id: int | None = None,
-):
-    try:
-        no_status_edits = _env_bool("UPLOAD_NO_STATUS_EDITS", False)
-        skip_name_duplicate_check = _env_bool("UPLOAD_SKIP_NAME_DUP_CHECK", False)
-
-        video_channel_ids = _resolve_video_upload_channel_ids()
-        if not video_channel_ids:
-            logger.warning(
-                "Movie upload rejected: no valid video channel configured (VIDEO_UPLOAD_CHANNEL_IDS=%r, VIDEO_UPLOAD_CHANNEL_ID=%r)",
-                globals().get("VIDEO_UPLOAD_CHANNEL_IDS"),
-                globals().get("VIDEO_UPLOAD_CHANNEL_ID"),
-            )
-            await _send_status_with_retry(
-                status_msg,
-                MESSAGES[lang].get(
-                    "movie_upload_no_channel",
-                    "⚠️ VIDEO_UPLOAD_CHANNEL_IDS/VIDEO_UPLOAD_CHANNEL_ID is not set. Please configure video channel IDs first.",
-                ),
-                reply_only=no_status_edits,
-            )
-            return
-        video_channel_id = await _pick_video_upload_channel_id(context, video_channel_ids)
-        if video_channel_id is None:
-            await _send_status_with_retry(
-                status_msg,
-                MESSAGES[lang].get(
-                    "movie_upload_no_channel",
-                    "⚠️ VIDEO_UPLOAD_CHANNEL_IDS/VIDEO_UPLOAD_CHANNEL_ID is not set. Please configure video channel IDs first.",
-                ),
-                reply_only=no_status_edits,
-            )
-            return
-
-        file_id = str(media.get("file_id") or "")
-        file_unique_id = str(media.get("file_unique_id") or "").strip() or None
-        file_name = str(media.get("file_name") or "video.mp4").strip() or "video.mp4"
-        fallback_name_raw, _ = os.path.splitext(file_name)
-        parsed_title = _normalize_title_candidate(str(media.get("parsed_title") or "").strip())
-        if _is_bad_movie_title_candidate(parsed_title):
-            parsed_title = ""
-        fallback_name = _normalize_title_candidate(_humanize_movie_filename_stem(fallback_name_raw))
-        if _is_bad_movie_title_candidate(fallback_name):
-            fallback_name = ""
-        movie_name_raw = parsed_title or fallback_name
-        if not movie_name_raw:
-            token = str(file_unique_id or uuid.uuid4().hex[:10])[:10]
-            movie_name_raw = f"movie {token}"
-        cleaned_name = clean_query(movie_name_raw)
-        if not cleaned_name:
-            cleaned_name = clean_query(_humanize_movie_filename_stem(fallback_name_raw))
-            movie_name_raw = _humanize_movie_filename_stem(fallback_name_raw) or movie_name_raw
-        display_label = movie_name_raw or file_name
-
-        release_year = media.get("release_year")
-        try:
-            release_year = int(release_year) if release_year is not None else None
-        except Exception:
-            release_year = None
-        genre = str(media.get("genre") or "").strip() or None
-        movie_lang = str(media.get("movie_lang") or "").strip() or None
-        country = str(media.get("country") or "").strip() or None
-        rating = str(media.get("rating") or "").strip() or None
-        caption_text = str(media.get("caption_text") or media.get("caption") or "").strip() or None
-        search_text = str(media.get("search_text") or "").strip() or None
-        if not search_text:
-            search_text = _normalize_search_text(
-                " ".join(
-                    [
-                        movie_name_raw,
-                        str(release_year or ""),
-                        genre or "",
-                        movie_lang or "",
-                        country or "",
-                        rating or "",
-                        caption_text or "",
-                    ]
-                )
-            ) or None
-
-        existing = await run_blocking(db_find_duplicate_movie, None, file_unique_id)
-        if not existing and (not skip_name_duplicate_check) and cleaned_name and len(cleaned_name) > 3:
-            existing = await run_blocking(db_find_duplicate_movie, cleaned_name, None)
-        if existing:
-            await _send_status_with_retry(
-                status_msg,
-                f"{MESSAGES[lang].get('movie_duplicate', MESSAGES[lang].get('duplicate', '⚠️ Duplicate ignored:'))} {display_label}",
-                reply_only=no_status_edits,
-            )
-            return
-
-        storage_caption = str(
-            media.get("storage_caption")
-            or media.get("caption_text")
-            or media.get("caption")
-            or ""
-        ).strip()
-        if storage_caption:
-            storage_caption = _sanitize_caption_for_storage(storage_caption)
-        kind = str(media.get("kind") or "").strip().lower()
-        sent = None
-        send_retry_max = 5
-        for attempt in range(1, send_retry_max + 1):
-            try:
-                if kind == "video":
-                    send_kwargs: dict[str, Any] = {
-                        "chat_id": video_channel_id,
-                        "video": file_id,
-                    }
-                    duration_seconds = media.get("duration_seconds")
-                    try:
-                        duration_int = int(duration_seconds) if duration_seconds is not None else None
-                    except Exception:
-                        duration_int = None
-                    if duration_int and duration_int > 0:
-                        send_kwargs["duration"] = duration_int
-                    if storage_caption:
-                        send_kwargs["caption"] = storage_caption
-                    sent = await context.bot.send_video(**send_kwargs)
-                else:
-                    send_kwargs = {
-                        "chat_id": video_channel_id,
-                        "document": file_id,
-                    }
-                    if storage_caption:
-                        send_kwargs["caption"] = storage_caption
-                    sent = await context.bot.send_document(**send_kwargs)
-                break
-            except Exception as e:
-                retry_after = getattr(e, "retry_after", None)
-                if retry_after is not None and attempt < send_retry_max:
-                    await asyncio.sleep(float(retry_after or 1) + 0.5)
-                    continue
-                transient_text = str(e).lower()
-                transient = any(x in transient_text for x in ("timed out", "timeout", "network", "connection"))
-                if transient and attempt < send_retry_max:
-                    await asyncio.sleep(min(10.0, 0.5 * (2 ** (attempt - 1))))
-                    continue
-                logger.error("Failed to send movie to video channel %s: %s", video_channel_id, e)
-                break
-
-        if not sent:
-            await _send_status_with_retry(
-                status_msg,
-                "❌ Failed to store the movie in video channel.",
-                reply_only=no_status_edits,
-            )
-            return
-
-        sent_media = getattr(sent, "document", None) or getattr(sent, "video", None)
-        stored_file_id = getattr(sent_media, "file_id", None) or file_id
-        stored_file_unique_id = getattr(sent_media, "file_unique_id", None) or file_unique_id
-        duration_seconds = media.get("duration_seconds")
-        if duration_seconds is None:
-            duration_seconds = getattr(sent_media, "duration", None)
-
-        movie = {
-            "id": str(uuid.uuid4()),
-            "movie_name": cleaned_name,
-            "display_name": movie_name_raw,
-            "file_id": stored_file_id,
-            "file_unique_id": stored_file_unique_id,
-            "path": None,
-            "mime_type": media.get("mime_type"),
-            "duration_seconds": duration_seconds,
-            "file_size": media.get("file_size"),
-            "channel_id": int(getattr(sent, "chat_id", video_channel_id) or video_channel_id),
-            "channel_message_id": int(getattr(sent, "message_id", 0) or 0) or None,
-            "release_year": release_year,
-            "genre": genre,
-            "movie_lang": movie_lang,
-            "country": country,
-            "rating": rating,
-            "caption_text": caption_text,
-            "search_text": search_text,
-            "indexed": False,
-            "uploaded_by_user_id": uploader_user_id,
-            "upload_source": "user_upload",
-        }
-        inserted = await run_blocking(db_insert_movie, movie)
-        if inserted is False:
-            await _send_status_with_retry(
-                status_msg,
-                f"{MESSAGES[lang].get('movie_duplicate', MESSAGES[lang].get('duplicate', '⚠️ Duplicate ignored:'))} {display_label}",
-                reply_only=no_status_edits,
-            )
-            return
-
-        async def _index_uploaded_movie():
-            try:
-                if not es_available():
-                    return
-                index_movie_fn = globals().get("index_movie")
-                if not callable(index_movie_fn):
-                    return
-                run_blocking_heavy_fn = globals().get("run_blocking_heavy")
-                if callable(run_blocking_heavy_fn):
-                    out_id = await run_blocking_heavy_fn(
-                        index_movie_fn,
-                        movie.get("movie_name"),
-                        movie.get("file_id"),
-                        movie.get("path"),
-                        movie.get("id"),
-                        movie.get("display_name"),
-                        movie.get("file_unique_id"),
-                        movie.get("mime_type"),
-                        movie.get("duration_seconds"),
-                        movie.get("file_size"),
-                        movie.get("channel_id"),
-                        movie.get("channel_message_id"),
-                        movie.get("release_year"),
-                        movie.get("genre"),
-                        movie.get("movie_lang"),
-                        movie.get("country"),
-                        movie.get("rating"),
-                        movie.get("caption_text"),
-                        movie.get("search_text"),
-                        True,
-                        "false",
-                    )
-                else:
-                    out_id = await run_blocking(
-                        index_movie_fn,
-                        movie.get("movie_name"),
-                        movie.get("file_id"),
-                        movie.get("path"),
-                        movie.get("id"),
-                        movie.get("display_name"),
-                        movie.get("file_unique_id"),
-                        movie.get("mime_type"),
-                        movie.get("duration_seconds"),
-                        movie.get("file_size"),
-                        movie.get("channel_id"),
-                        movie.get("channel_message_id"),
-                        movie.get("release_year"),
-                        movie.get("genre"),
-                        movie.get("movie_lang"),
-                        movie.get("country"),
-                        movie.get("rating"),
-                        movie.get("caption_text"),
-                        movie.get("search_text"),
-                        True,
-                        "false",
-                    )
-                if out_id:
-                    try:
-                        await run_blocking(update_movie_indexed, movie.get("id"), True)
-                    except Exception:
-                        logger.exception("Failed to set indexed=True for movie_id=%s", movie.get("id"))
-            except Exception as e:
-                logger.error("Background movie index failed: %s", e, exc_info=True)
-
-        try:
-            context.application.create_task(_index_uploaded_movie())
-        except Exception:
-            logger.exception("Failed to schedule background movie indexing task")
-
-        await _send_status_with_retry(
-            status_msg,
-            f"{MESSAGES[lang].get('movie_saved', MESSAGES[lang].get('saved', '✅ Saved:'))} {display_label}",
-            reply_only=no_status_edits,
-        )
-    except Exception as e:
-        logger.error("Movie upload failed: %s", e, exc_info=True)
-        no_status_edits = _env_bool("UPLOAD_NO_STATUS_EDITS", False)
-        await _send_status_with_retry(
-            status_msg,
-            f"❌ Movie upload failed: {str(e)[:100]}",
-            reply_only=no_status_edits,
-        )
-
-
-async def _start_movie_upload_from_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media: dict, lang: str):
-    no_status_edits = _env_bool("UPLOAD_NO_STATUS_EDITS", False)
-    if no_status_edits:
-        status_msg = update.message
-    else:
-        status_msg = await _send_with_retry(
-            lambda: update.message.reply_text(MESSAGES[lang].get("upload_processing", "⏳ Processing..."))
-        )
-    context.application.create_task(
-        _process_movie_upload(
-            context,
-            status_msg,
-            media,
-            lang,
-            uploader_user_id=update.effective_user.id if update.effective_user else None,
-        )
-    )
-
-
-async def handle_movie_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not update.message:
-            return
-        media = _movie_media_payload_from_message(update.message)
-        if not media:
-            return
-        if _get_user_upload_mode(context) != _UPLOAD_MODE_MOVIE:
-            return
-        lang = ensure_user_language(update, context)
-        user_id = update.effective_user.id if update.effective_user else None
-        if user_id and is_blocked(user_id):
-            await update.message.reply_text(MESSAGES[lang]["blocked"])
-            raise ApplicationHandlerStop()
-        if user_id and await is_stopped_user(user_id):
-            raise ApplicationHandlerStop()
-        limited, wait_s = spam_check_message(update, context)
-        if limited:
-            await update.message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
-            raise ApplicationHandlerStop()
-        await update_user_info(update, context)
-
-        if user_id and is_allowed(user_id):
-            await _start_movie_upload_from_media(update, context, media, lang)
-            raise ApplicationHandlerStop()
-        await update.message.reply_text(MESSAGES[lang]["upload_inactive"])
-        raise ApplicationHandlerStop()
-    except ApplicationHandlerStop:
-        raise
-    except Exception as e:
-        logger.error(f"handle_movie_video failed: {e}", exc_info=True)
-        lang = ensure_user_language(update, context)
-        await safe_reply(update, MESSAGES[lang]["error"])
-        raise
-
 async def _process_upload(
     context: ContextTypes.DEFAULT_TYPE,
     status_msg,
@@ -1134,6 +1053,38 @@ async def _process_upload(
                     reply_only=no_status_edits,
                 )
             return
+        if not _book_upload_is_allowed_file(file_name):
+            file_ext = _book_upload_file_extension(file_name) or "<none>"
+            logger.info(
+                "Book upload skipped by file type filter: file_name=%s ext=%s",
+                file_name,
+                file_ext,
+            )
+            if receipt_id:
+                try:
+                    await run_blocking(
+                        db_update_upload_receipt,
+                        receipt_id,
+                        status="filtered",
+                        saved_to_db=False,
+                        saved_to_es=False,
+                        error="unsupported_book_file_type",
+                    )
+                except Exception:
+                    logger.exception("Failed to update upload receipt as file type filtered")
+            blocked_msg = str(
+                MESSAGES.get(lang, {}).get(
+                    "upload_file_type_filtered",
+                    "⚠️ This file type is not allowed for book uploads: {file_name}\n📚 Allowed book formats: {formats}",
+                )
+            )
+            if status_msg:
+                await _send_status_with_retry(
+                    status_msg,
+                    blocked_msg.format(file_name=file_name, formats=_BOOK_UPLOAD_ALLOWED_FORMATS_TEXT),
+                    reply_only=no_status_edits,
+                )
+            return
         # prevent duplicates - prioritize file_unique_id over name for accuracy
         existing = await run_blocking(db_find_duplicate_book, None, None, file_unique_id)
         logger.info(f"Duplicate check for {file_name}: {'FOUND' if existing else 'NOT FOUND'} (by file_unique_id)")
@@ -1170,11 +1121,12 @@ async def _process_upload(
                 )
             return
 
-        # add new book with permanent UUID + indexed flag
+        # add new book with permanent UUID and indexed flag
+        normalized_title = cleaned_name or book_name
         new_book = {
             "id": str(uuid.uuid4()),   # permanent ID
-            "book_name": cleaned_name,  # normalized for search
-            "display_name": book_name,
+            "book_name": normalized_title,  # normalized for search
+            "display_name": normalized_title,  # normalized permanent display name
             "file_id": file_id,
             "file_unique_id": file_unique_id,
             "path": None,
@@ -1222,20 +1174,16 @@ async def _process_upload(
                 logger.exception("Failed to update upload receipt after DB save")
         receipt_saved_to_db = True
         receipt_book_id = new_book["id"]
+        try:
+            await _enqueue_upload_local_backup(context.application, new_book, file_id, file_name)
+        except Exception as e:
+            logger.error("Failed to enqueue local backup job for %s: %s", new_book["id"], e, exc_info=True)
         # User-facing confirmation: send only once when DB save succeeds.
         await _send_status_with_retry(
             status_msg,
             f"{MESSAGES[lang]['saved']} {file_name}",
             reply_only=no_status_edits,
         )
-
-        async def _fanout_to_channels():
-            if not UPLOAD_CHANNEL_IDS:
-                return
-            try:
-                await enqueue_upload_fanout(context.application, file_id, book_id=new_book["id"])
-            except Exception as e:
-                logger.error(f"Failed to enqueue upload fanout: {e}")
 
         async def _index_uploaded_book():
             nonlocal receipt_saved_to_es
@@ -1347,9 +1295,6 @@ async def _process_upload(
                 except Exception:
                     logger.exception("Failed to update upload receipt for ES unavailable")
 
-        # fan out to upload channels (background)
-        context.application.create_task(_fanout_to_channels())
-
         # Notify users who requested this book
         if not skip_request_notify:
             async def _notify_request_matches_safe():
@@ -1419,6 +1364,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update_user_info(update, context)
+        doc = update.message.document if update.message else None
+        doc_mime = str(getattr(doc, "mime_type", "") or "").lower()
 
         user_mode = _get_user_upload_mode(context)
         logger.info(
@@ -1427,22 +1374,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.effective_user.id if update.effective_user else "N/A",
             is_allowed(update.effective_user.id) if update.effective_user else "N/A",
         )
-        doc = update.message.document
-        doc_mime = str(getattr(doc, "mime_type", "") or "").lower() if doc else ""
-        doc_name = str(getattr(doc, "file_name", "") or "").lower() if doc else ""
-        looks_like_video_doc = bool(
-            doc and (
-                doc_mime.startswith("video/")
-                or doc_name.endswith((".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"))
-            )
-        )
-
-        if user_mode == _UPLOAD_MODE_MOVIE and is_allowed(update.effective_user.id) and looks_like_video_doc:
-            media = _movie_media_payload_from_message(update.message)
-            if media:
-                await _start_movie_upload_from_media(update, context, media, lang)
-                return
-
         if user_mode == _UPLOAD_MODE_BOOK and is_allowed(update.effective_user.id):
             if not update.message.document:
                 await update.message.reply_text(MESSAGES[lang]["send_doc"])
@@ -1456,7 +1387,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status_msg = await _send_with_retry(
                     lambda: update.message.reply_text(MESSAGES[lang]["upload_processing"])
                 )
-            file = update.message.document
+            file = doc
             file_id = file.file_id
             file_unique_id = getattr(file, "file_unique_id", None)
             file_name = file.file_name or "unknown"
@@ -1592,7 +1523,4 @@ def sync_unindexed_books():
         logger.error(f"Sync failed: {e}", exc_info=True)
 
 
-def sync_unindexed_movies():
-    logger.debug("Movie sync skipped: movie feature removed.")
-        
 # --- Audit command ---

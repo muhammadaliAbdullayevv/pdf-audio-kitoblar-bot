@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import textwrap
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -50,20 +52,6 @@ def _list_running_background_tasks(app) -> list[dict]:
         if not task or task.done():
             return
         items.append({"key": key, "label": label, "details": details, "task": task})
-
-    upload_local_status = bot_data.get("upload_local_status") or {}
-    if bot_data.get("upload_local_task") and not bot_data["upload_local_task"].done():
-        done = int(upload_local_status.get("done", 0) or 0)
-        total = int(upload_local_status.get("total", 0) or 0)
-        mode = str(upload_local_status.get("mode", "all"))
-        errs = int(upload_local_status.get("errors", 0) or 0)
-        add_item("upload_local_task", "Upload local books", f"mode={mode} progress={done}/{total} errors={errs}")
-
-    upload_fanout_task = bot_data.get("upload_fanout_task")
-    if upload_fanout_task and not upload_fanout_task.done():
-        q = bot_data.get("upload_fanout_queue")
-        qsize = q.qsize() if q else 0
-        add_item("upload_fanout_task", "Upload fanout queue", f"queued={qsize}")
 
     for kind, label in [("db", "DB dupes cleanup"), ("es", "ES dupes cleanup")]:
         task_key = _dupes_task_key(kind)
@@ -162,13 +150,6 @@ def _admin_panel_snapshot_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     tasks = _list_running_background_tasks(app)
     dupes_db = _get_dupes_status(app, "db") if "dupes_status" in (app.bot_data or {}) else {}
     dupes_es = _get_dupes_status(app, "es") if "dupes_status" in (app.bot_data or {}) else {}
-    upload_status = app.bot_data.get("upload_local_status") or {}
-    upload_line = "idle"
-    if upload_status:
-        done = int(upload_status.get("done", 0) or 0)
-        total = int(upload_status.get("total", 0) or 0)
-        mode = str(upload_status.get("mode", "all"))
-        upload_line = f"{mode} {done}/{total}"
     db_stage = dupes_db.get("stage") or "idle"
     es_stage = dupes_es.get("stage") or "idle"
     return (
@@ -178,7 +159,6 @@ def _admin_panel_snapshot_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"Background tasks: {len(tasks)}\n"
         f"DB dupes: {db_stage}\n"
         f"ES dupes: {es_stage}\n"
-        f"Upload local: {upload_line}\n"
         "──────────\n"
         "Choose a section."
     )
@@ -255,53 +235,6 @@ async def _admin_panel_send_or_edit(update: Update, context: ContextTypes.DEFAUL
     target_message = update.message or (query.message if query else None)
     if target_message:
         await target_message.reply_text(text, reply_markup=kb)
-
-
-async def _admin_panel_send_upload_local_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_message = update.message or (update.callback_query.message if update.callback_query else None)
-    if not target_message:
-        return
-    lang = ensure_user_language(update, context)
-    status = context.application.bot_data.get("upload_local_status")
-    if not status:
-        await target_message.reply_text(MESSAGES[lang]["upload_local_status_empty"])
-        return
-    done = int(status.get("done", 0) or 0)
-    total = int(status.get("total", 0) or 0)
-    uploaded = int(status.get("uploaded", 0) or 0)
-    updated = int(status.get("updated", 0) or 0)
-    skipped = int(status.get("skipped", 0) or 0)
-    skipped_large = int(status.get("skipped_large", 0) or 0)
-    missing = int(status.get("missing", 0) or 0)
-    errors = int(status.get("errors", 0) or 0)
-    start_ts = float(status.get("start_ts", time.time()))
-    elapsed = max(1, int(time.time() - start_ts))
-    rate = round(done / elapsed, 2)
-    per_channel = status.get("per_channel", {}) or {}
-    if per_channel:
-        for cid, info in per_channel.items():
-            if info.get("title") and info.get("title") != str(cid):
-                continue
-            try:
-                chat = await context.bot.get_chat(int(cid))
-                info["title"] = chat.title or chat.username or str(cid)
-            except Exception:
-                info["title"] = str(cid)
-        status["per_channel"] = per_channel
-        context.application.bot_data["upload_local_status"] = status
-    lines = []
-    for cid, info in per_channel.items():
-        sent = info.get("sent", 0)
-        err = info.get("errors", 0)
-        title = info.get("title") or str(cid)
-        lines.append(MESSAGES[lang]["upload_local_status_channel"].format(channel=title, sent=sent, errors=err))
-    per_channel_text = "\n".join(lines) if lines else MESSAGES[lang]["upload_local_status_channel_empty"]
-    text = MESSAGES[lang]["upload_local_status"].format(
-        done=done, total=total, uploaded=uploaded, updated=updated, skipped=skipped,
-        skipped_large=skipped_large, missing=missing, errors=errors, elapsed=elapsed,
-        rate=rate, per_channel=per_channel_text,
-    )
-    await target_message.reply_text(text)
 
 
 async def _admin_panel_send_missing_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -463,17 +396,6 @@ async def handle_admin_panel_callback(update: Update, context: ContextTypes.DEFA
         await es_dupes_command(update, context)
         await _admin_panel_send_or_edit(update, context, "dupes")
         return
-    if value == "upload_status":
-        await _admin_panel_send_upload_local_status(update, context)
-        await _admin_panel_send_or_edit(update, context, "uploads")
-        return
-    if value in {"upload_all", "upload_missing", "upload_unique", "upload_large"}:
-        context.user_data["_skip_spam_check_once"] = True
-        mode = value.replace("upload_", "", 1)
-        await _start_upload_local_books(update, context, mode)
-        await _admin_panel_send_or_edit(update, context, "uploads")
-        return
-
     try:
         await query.answer(MESSAGES[lang]["error"], show_alert=True)
     except Exception:
@@ -549,9 +471,7 @@ async def handle_background_task_callback(update: Update, context: ContextTypes.
 
     task.cancel()
     run_id = None
-    if key == "upload_local_task":
-        run_id = context.application.bot_data.get("upload_local_task_run_id")
-    elif key == _dupes_task_key("db"):
+    if key == _dupes_task_key("db"):
         st = _get_dupes_status(context.application, "db")
         run_id = st.get("task_run_id") if isinstance(st, dict) else None
     elif key == _dupes_task_key("es"):
@@ -567,11 +487,7 @@ async def handle_background_task_callback(update: Update, context: ContextTypes.
             )
         except Exception as e:
             logger.warning("Failed to mark task run as cancelling (%s): %s", run_id, e)
-    if key == "upload_local_task":
-        context.application.bot_data.pop("upload_local_status", None)
-    elif key == "upload_fanout_task":
-        context.application.bot_data["upload_fanout_queue"] = asyncio.Queue()
-    elif key == _dupes_task_key("db"):
+    if key == _dupes_task_key("db"):
         _update_dupes_status(context.application, "db", stage="cancelled", running=False, final_message_sent=False, finished_at=time.time())
     elif key == _dupes_task_key("es"):
         _update_dupes_status(context.application, "es", stage="cancelled", running=False, final_message_sent=False, finished_at=time.time())
@@ -1340,422 +1256,3 @@ async def user_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     result_text, page_entries, pages = build_user_results_text(query, entries, 0, lang)
     reply_markup = build_user_results_keyboard(page_entries, 0, pages, query_id)
     await update.message.reply_text(result_text, reply_markup=reply_markup)
-
-
-async def _start_upload_local_books(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    lang = ensure_user_language(update, context)
-    target_message = update.message or (update.callback_query.message if update.callback_query else None)
-    if not target_message:
-        return
-    if not _is_admin_user(update.effective_user.id):
-        await target_message.reply_text(MESSAGES[lang]["admin_only"])
-        return
-    limited, wait_s = spam_check_message(update, context)
-    if limited:
-        await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
-        return
-    if not UPLOAD_CHANNEL_IDS:
-        await target_message.reply_text(MESSAGES[lang]["upload_local_no_channel"])
-        return
-    running = context.application.bot_data.get("upload_local_task")
-    if running and not running.done():
-        await target_message.reply_text(MESSAGES[lang]["upload_local_running"])
-        return
-
-    admin_chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
-    await target_message.reply_text(MESSAGES[lang]["upload_local_started"])
-    task_run_id = None
-    try:
-        task_run_id = await run_blocking(
-            db_insert_admin_task_run,
-            "upload_local_task",
-            "upload_local",
-            update.effective_user.id if update.effective_user else None,
-            "running",
-            {"mode": mode, "admin_chat_id": int(admin_chat_id)},
-        )
-        context.application.bot_data["upload_local_task_run_id"] = task_run_id
-    except Exception as e:
-        logger.warning("Failed to persist upload_local task run start: %s", e)
-
-    async def _run():
-        uploaded = 0
-        updated = 0
-        skipped = 0
-        skipped_large = 0
-        missing = 0
-        errors = 0
-        lock = asyncio.Lock()
-        sem = asyncio.Semaphore(UPLOAD_LOCAL_WORKERS)
-        large_sem = asyncio.Semaphore(UPLOAD_LOCAL_LARGE_CONCURRENCY)
-        channel_ids = list(UPLOAD_CHANNEL_IDS)
-        chan_lock = asyncio.Lock()
-        chan_index = 0
-
-        async def next_channel_id() -> int:
-            nonlocal chan_index
-            async with chan_lock:
-                cid = channel_ids[chan_index % len(channel_ids)]
-                chan_index += 1
-                return cid
-
-        books = await run_blocking(db_list_books)
-        to_process: list[dict] = []
-        for b in books:
-            file_id = b.get("file_id")
-            file_unique_id = b.get("file_unique_id")
-            local_path = b.get("path")
-            if mode == "missing":
-                if file_id:
-                    skipped += 1
-                    continue
-                if not local_path or not os.path.exists(local_path):
-                    missing += 1
-                    continue
-                try:
-                    size_mb = os.path.getsize(local_path) / (1024 * 1024)
-                except Exception:
-                    size_mb = None
-                if size_mb is not None and size_mb > UPLOAD_LOCAL_MAX_MB:
-                    skipped_large += 1
-                    continue
-                to_process.append(b)
-                continue
-            if mode == "unique":
-                if not file_id or file_unique_id:
-                    skipped += 1
-                    continue
-                to_process.append(b)
-                continue
-            if mode == "large":
-                if file_id:
-                    skipped += 1
-                    continue
-                if not local_path or not os.path.exists(local_path):
-                    missing += 1
-                    continue
-                try:
-                    size_mb = os.path.getsize(local_path) / (1024 * 1024)
-                except Exception:
-                    size_mb = None
-                if size_mb is None or size_mb <= UPLOAD_LOCAL_MAX_MB:
-                    skipped += 1
-                    continue
-                to_process.append(b)
-                continue
-            # mode == "all"
-            if file_id and file_unique_id:
-                skipped += 1
-                continue
-            if not file_id and (not local_path or not os.path.exists(local_path)):
-                missing += 1
-                continue
-            if not file_id and local_path:
-                try:
-                    size_mb = os.path.getsize(local_path) / (1024 * 1024)
-                except Exception:
-                    size_mb = None
-                if size_mb is not None and size_mb > UPLOAD_LOCAL_MAX_MB:
-                    skipped_large += 1
-                    continue
-            to_process.append(b)
-
-        async def send_once(b: dict, target_channel: int):
-            file_id = b.get("file_id")
-            local_path = b.get("path")
-            if file_id:
-                sent = await context.bot.send_document(
-                    chat_id=target_channel,
-                    document=file_id,
-                    connect_timeout=UPLOAD_LOCAL_CONNECT_TIMEOUT,
-                    read_timeout=UPLOAD_LOCAL_READ_TIMEOUT,
-                    write_timeout=UPLOAD_LOCAL_WRITE_TIMEOUT,
-                    pool_timeout=UPLOAD_LOCAL_POOL_TIMEOUT,
-                )
-                return target_channel, sent
-            with open(local_path, "rb") as f:
-                sent = await context.bot.send_document(
-                    chat_id=target_channel,
-                    document=InputFile(f, filename=_book_filename(b)),
-                    connect_timeout=UPLOAD_LOCAL_CONNECT_TIMEOUT,
-                    read_timeout=UPLOAD_LOCAL_READ_TIMEOUT,
-                    write_timeout=UPLOAD_LOCAL_WRITE_TIMEOUT,
-                    pool_timeout=UPLOAD_LOCAL_POOL_TIMEOUT,
-                )
-                return target_channel, sent
-
-        total = len(to_process)
-        start_ts = time.time()
-        per_channel = {cid: {"sent": 0, "errors": 0, "title": str(cid)} for cid in channel_ids}
-        context.application.bot_data["upload_local_status"] = {
-            "mode": mode,
-            "total": total,
-            "done": 0,
-            "uploaded": 0,
-            "updated": 0,
-            "skipped": skipped,
-            "skipped_large": skipped_large,
-            "missing": missing,
-            "errors": 0,
-            "start_ts": start_ts,
-            "per_channel": per_channel,
-        }
-
-        async def process_book(b: dict):
-            nonlocal uploaded, updated, errors
-            async with sem:
-                book_id = str(b.get("id") or "")
-                file_id = b.get("file_id")
-                local_path = b.get("path")
-                size_mb = None
-                if local_path and os.path.exists(local_path):
-                    try:
-                        size_mb = round(os.path.getsize(local_path) / (1024 * 1024), 1)
-                    except Exception:
-                        size_mb = None
-                sent = None
-                target_channel = await next_channel_id()
-
-                async def _send_with_retries():
-                    nonlocal sent, target_channel
-                    attempts = 4
-                    delay = 2.0
-                    for attempt in range(attempts):
-                        try:
-                            target_channel, sent = await send_once(b, target_channel)
-                            return
-                        except RetryAfter as e:
-                            await asyncio.sleep(getattr(e, "retry_after", 1) + 0.5)
-                            continue
-                        except (TimedOut, NetworkError):
-                            if attempt == attempts - 1:
-                                raise
-                            await asyncio.sleep(delay)
-                            delay = min(delay * 2, 30.0)
-                            continue
-
-                try:
-                    if size_mb is not None and size_mb >= UPLOAD_LOCAL_LARGE_MB:
-                        async with large_sem:
-                            await _send_with_retries()
-                    else:
-                        await _send_with_retries()
-                    if sent is None:
-                        raise TimedOut("send_document timed out")
-                except Exception as e:
-                    logger.error(
-                        "upload_local failed book_id=%s channel=%s file_id=%s path=%s size_mb=%s err=%s",
-                        book_id,
-                        target_channel,
-                        file_id,
-                        local_path,
-                        size_mb,
-                        e,
-                        exc_info=True,
-                    )
-                    async with lock:
-                        errors += 1
-                        status = context.application.bot_data.get("upload_local_status", {})
-                        per_channel = status.get("per_channel", {})
-                        if target_channel in per_channel:
-                            per_channel[target_channel]["errors"] += 1
-                            status["per_channel"] = per_channel
-                        status["errors"] = errors
-                        status["done"] = uploaded + updated + errors
-                        context.application.bot_data["upload_local_status"] = status
-                    return
-
-                if sent and sent.document:
-                    new_file_id = sent.document.file_id
-                    new_unique_id = getattr(sent.document, "file_unique_id", None)
-                    await run_blocking(update_book_file_id, book_id, new_file_id, True, new_unique_id)
-                    async with lock:
-                        if file_id:
-                            updated += 1
-                        else:
-                            uploaded += 1
-                        status = context.application.bot_data.get("upload_local_status", {})
-                        per_channel = status.get("per_channel", {})
-                        if target_channel in per_channel:
-                            per_channel[target_channel]["sent"] += 1
-                            status["per_channel"] = per_channel
-                        status["uploaded"] = uploaded
-                        status["updated"] = updated
-                        status["done"] = uploaded + updated + errors
-                        context.application.bot_data["upload_local_status"] = status
-                else:
-                    logger.error(
-                        "upload_local empty send book_id=%s channel=%s file_id=%s path=%s size_mb=%s",
-                        book_id,
-                        target_channel,
-                        file_id,
-                        local_path,
-                        size_mb,
-                    )
-                    async with lock:
-                        errors += 1
-                        status = context.application.bot_data.get("upload_local_status", {})
-                        per_channel = status.get("per_channel", {})
-                        if target_channel in per_channel:
-                            per_channel[target_channel]["errors"] += 1
-                            status["per_channel"] = per_channel
-                        status["errors"] = errors
-                        status["done"] = uploaded + updated + errors
-                        context.application.bot_data["upload_local_status"] = status
-
-        try:
-            tasks = [asyncio.create_task(process_book(b)) for b in to_process]
-            if tasks:
-                await asyncio.gather(*tasks)
-
-            summary = MESSAGES[lang]["upload_local_done"].format(
-                uploaded=uploaded,
-                updated=updated,
-                skipped=skipped,
-                skipped_large=skipped_large,
-                missing=missing,
-                errors=errors,
-            )
-            try:
-                await context.bot.send_message(chat_id=admin_chat_id, text=summary)
-            except Exception:
-                pass
-            if task_run_id:
-                try:
-                    await run_blocking(
-                        db_update_admin_task_run,
-                        str(task_run_id),
-                        status="done",
-                        summary=summary,
-                        metadata={
-                            "mode": mode,
-                            "uploaded": uploaded,
-                            "updated": updated,
-                            "skipped": skipped,
-                            "skipped_large": skipped_large,
-                            "missing": missing,
-                            "errors": errors,
-                            "total": total,
-                        },
-                        finished_at=_now_dt(),
-                    )
-                except Exception as e:
-                    logger.warning("Failed to persist upload_local task completion: %s", e)
-        except asyncio.CancelledError:
-            if task_run_id:
-                try:
-                    await run_blocking(
-                        db_update_admin_task_run,
-                        str(task_run_id),
-                        status="cancelled",
-                        summary="Task cancelled",
-                        finished_at=_now_dt(),
-                    )
-                except Exception as e:
-                    logger.warning("Failed to persist upload_local task cancellation: %s", e)
-            raise
-        except Exception as e:
-            logger.error("upload_local task failed: %s", e, exc_info=True)
-            if task_run_id:
-                try:
-                    await run_blocking(
-                        db_update_admin_task_run,
-                        str(task_run_id),
-                        status="failed",
-                        error=str(e),
-                        summary="Upload local task failed",
-                        finished_at=_now_dt(),
-                    )
-                except Exception as db_e:
-                    logger.warning("Failed to persist upload_local task failure: %s", db_e)
-            try:
-                await context.bot.send_message(chat_id=admin_chat_id, text=MESSAGES[lang]["error"])
-            except Exception:
-                pass
-            raise
-        finally:
-            try:
-                context.application.bot_data.pop("upload_local_status", None)
-            except Exception:
-                pass
-
-    task = asyncio.create_task(_run())
-    context.application.bot_data["upload_local_task"] = task
-    def _cleanup(_t):
-        try:
-            context.application.bot_data.pop("upload_local_task", None)
-            context.application.bot_data.pop("upload_local_task_run_id", None)
-        except Exception:
-            pass
-    task.add_done_callback(_cleanup)
-
-
-async def upload_local_books_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_message = update.message or (update.callback_query.message if update.callback_query else None)
-    if not target_message:
-        return
-    mode = context.args[0].strip().lower() if context.args else "all"
-    if mode == "status":
-        lang = ensure_user_language(update, context)
-        if not _is_admin_user(update.effective_user.id):
-            await target_message.reply_text(MESSAGES[lang]["admin_only"])
-            return
-        status = context.application.bot_data.get("upload_local_status")
-        if not status:
-            await target_message.reply_text(MESSAGES[lang]["upload_local_status_empty"])
-            return
-        done = int(status.get("done", 0) or 0)
-        total = int(status.get("total", 0) or 0)
-        uploaded = int(status.get("uploaded", 0) or 0)
-        updated = int(status.get("updated", 0) or 0)
-        skipped = int(status.get("skipped", 0) or 0)
-        skipped_large = int(status.get("skipped_large", 0) or 0)
-        missing = int(status.get("missing", 0) or 0)
-        errors = int(status.get("errors", 0) or 0)
-        start_ts = float(status.get("start_ts", time.time()))
-        elapsed = max(1, int(time.time() - start_ts))
-        rate = round(done / elapsed, 2)
-        per_channel = status.get("per_channel", {}) or {}
-        if per_channel:
-            for cid, info in per_channel.items():
-                if info.get("title") and info.get("title") != str(cid):
-                    continue
-                try:
-                    chat = await context.bot.get_chat(int(cid))
-                    title = chat.title or chat.username or str(cid)
-                    info["title"] = title
-                except Exception:
-                    info["title"] = str(cid)
-            status["per_channel"] = per_channel
-            context.application.bot_data["upload_local_status"] = status
-        lines = []
-        for cid, info in per_channel.items():
-            sent = info.get("sent", 0)
-            err = info.get("errors", 0)
-            title = info.get("title") or str(cid)
-            lines.append(MESSAGES[lang]["upload_local_status_channel"].format(channel=title, sent=sent, errors=err))
-        per_channel_text = "\n".join(lines) if lines else MESSAGES[lang]["upload_local_status_channel_empty"]
-
-        text = MESSAGES[lang]["upload_local_status"].format(
-            done=done,
-            total=total,
-            uploaded=uploaded,
-            updated=updated,
-            skipped=skipped,
-            skipped_large=skipped_large,
-            missing=missing,
-            errors=errors,
-            elapsed=elapsed,
-            rate=rate,
-            per_channel=per_channel_text,
-        )
-        await target_message.reply_text(text)
-        return
-    if mode not in {"all", "missing", "unique", "large"}:
-        lang = ensure_user_language(update, context)
-        await target_message.reply_text(MESSAGES[lang]["upload_local_usage"])
-        return
-    await _start_upload_local_books(update, context, mode)
-
-
-# --- Main ---

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Smart AI Tools Bot Dashboard</title>
+  <title>Pdf va audio kitoblar Dashboard</title>
   <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
@@ -11,7 +11,7 @@
     <header class="hero reveal" style="--delay: 0.04s;">
       <div class="hero__left">
         <p class="eyebrow">Local Control Room</p>
-        <h1>Smart AI Tools Bot</h1>
+        <h1>Pdf va audio kitoblar</h1>
         <p class="hero__subtitle">
           Real-time operational dashboard for users, catalog growth, downloader quality, and infrastructure health.
         </p>
@@ -94,41 +94,21 @@
             <p id="kpi-books-new-meta" class="kpi-meta">0.0% vs previous window</p>
           </article>
           <article class="kpi-card reveal" style="--delay: 0.20s;">
-            <p class="kpi-title">Total Movies</p>
-            <p id="kpi-movies-total" class="kpi-value">0</p>
-            <p id="kpi-movies-total-meta" class="kpi-meta">0 indexed</p>
-          </article>
-          <article class="kpi-card reveal" style="--delay: 0.22s;">
-            <p class="kpi-title">New Movies</p>
-            <p id="kpi-movies-new" class="kpi-value">0</p>
-            <p id="kpi-movies-new-meta" class="kpi-meta">0.0% vs previous window</p>
-          </article>
-          <article class="kpi-card reveal" style="--delay: 0.24s;">
             <p class="kpi-title">Book Searches</p>
             <p id="kpi-book-searches" class="kpi-value">0</p>
             <p id="kpi-book-searches-meta" class="kpi-meta">0.0% vs previous window</p>
           </article>
-          <article class="kpi-card reveal" style="--delay: 0.26s;">
-            <p class="kpi-title">Movie Searches</p>
-            <p id="kpi-movie-searches" class="kpi-value">0</p>
-            <p id="kpi-movie-searches-meta" class="kpi-meta">0.0% vs previous window</p>
-          </article>
-          <article class="kpi-card reveal" style="--delay: 0.28s;">
+          <article class="kpi-card reveal" style="--delay: 0.22s;">
             <p class="kpi-title">Book Downloads</p>
             <p id="kpi-book-downloads" class="kpi-value">0</p>
             <p id="kpi-book-downloads-meta" class="kpi-meta">0.0% vs previous window</p>
           </article>
-          <article class="kpi-card reveal" style="--delay: 0.30s;">
-            <p class="kpi-title">Movie Downloads</p>
-            <p id="kpi-movie-downloads" class="kpi-value">0</p>
-            <p id="kpi-movie-downloads-meta" class="kpi-meta">0.0% vs previous window</p>
-          </article>
-          <article class="kpi-card reveal" style="--delay: 0.32s;">
+          <article class="kpi-card reveal" style="--delay: 0.24s;">
             <p class="kpi-title">Total Audios</p>
             <p id="kpi-audios-total" class="kpi-value">0</p>
             <p id="kpi-audios-total-meta" class="kpi-meta">0 parts</p>
           </article>
-          <article class="kpi-card reveal" style="--delay: 0.34s;">
+          <article class="kpi-card reveal" style="--delay: 0.26s;">
             <p class="kpi-title">Added Audios</p>
             <p id="kpi-audios-new" class="kpi-value">0</p>
             <p id="kpi-audios-new-meta" class="kpi-meta">0.0% vs previous window</p>
@@ -155,15 +135,6 @@
               </div>
               <div class="meter-track"><span id="catalog-books-meter" class="meter-fill"></span></div>
               <p id="catalog-books-meta" class="meter-meta">0 indexed / 0 total</p>
-            </div>
-
-            <div class="meter-group">
-              <div class="meter-head">
-                <span>Movie index coverage</span>
-                <strong id="catalog-movies-ratio">0.0%</strong>
-              </div>
-              <div class="meter-track"><span id="catalog-movies-meter" class="meter-fill meter-fill--alt"></span></div>
-              <p id="catalog-movies-meta" class="meter-meta">0 indexed / 0 total</p>
             </div>
 
             <div class="meter-group">
@@ -246,7 +217,6 @@
               <div class="eng-row"><span>Favorites added</span><strong id="eng-favorites-added">0</strong></div>
               <div class="eng-row"><span>Reactions (current)</span><strong id="eng-reactions-current">0</strong></div>
               <div class="eng-row"><span>Reactions (lifetime)</span><strong id="eng-reactions-lifetime">0</strong></div>
-              <div class="eng-row"><span>AI actions</span><strong id="eng-ai-total">0</strong></div>
               <div class="eng-row"><span>Downloader health</span><strong id="downloader-health">0.0%</strong></div>
             </div>
 
@@ -254,10 +224,6 @@
               <section class="eng-subpanel">
                 <h4>Reaction Mix</h4>
                 <ul id="reaction-mix-list" class="list-tight list-tight--cards"></ul>
-              </section>
-              <section class="eng-subpanel">
-                <h4>AI Breakdown</h4>
-                <ul id="ai-breakdown-list" class="list-tight list-tight--cards"></ul>
               </section>
               <section class="eng-subpanel eng-subpanel--wide">
                 <h4>Recent Issues</h4>
@@ -310,9 +276,7 @@
             </div>
             <div class="mini-grid mini-grid--three">
               <div class="mini-card"><span>Book searches</span><strong id="search-book-total">0</strong></div>
-              <div class="mini-card"><span>Movie searches</span><strong id="search-movie-total">0</strong></div>
               <div class="mini-card"><span>Book downloads</span><strong id="search-book-download-total">0</strong></div>
-              <div class="mini-card"><span>Movie downloads</span><strong id="search-movie-download-total">0</strong></div>
               <div class="mini-card"><span>Search->Download</span><strong id="search-conversion">0.0%</strong></div>
               <div class="mini-card"><span>Request queries</span><strong id="search-request-queries">0</strong></div>
               <div class="mini-card"><span>Zero-result</span><strong id="search-zero-rate">0.0%</strong></div>
@@ -369,12 +333,12 @@
           <article id="panel-catalog-growth" class="panel reveal" style="--delay: 0.58s;" data-views="catalog,traffic,overview">
             <div class="panel__head">
               <h3>New Catalog Items</h3>
-              <p data-range-aware>Books, movies, audiobooks growth and indexing lag</p>
+              <p data-range-aware>Books, audiobooks growth and indexing lag</p>
             </div>
             <div class="table-wrap">
               <table>
                 <thead>
-                  <tr><th>Day</th><th>Books+</th><th>Movies+</th><th>Audio+</th><th>Unindexed+</th></tr>
+                  <tr><th>Day</th><th>Books+</th><th>Audio+</th><th>Unindexed+</th></tr>
                 </thead>
                 <tbody id="growth-table-body"></tbody>
               </table>

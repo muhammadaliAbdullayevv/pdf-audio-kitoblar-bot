@@ -43,18 +43,9 @@ def build_main_menu_keyboard(
     if section == "other":
         keyboard = [
             [m.get("menu_top_users", "🏆 Top Users")],
-            [m.get("menu_audio_converter", "🎛️ Audio Editor"), m.get("menu_pdf_editor", "🧰 PDF Editor")],
-            [m.get("menu_sticker_tools", "🧩 Sticker Tools"), m.get("menu_name_meanings", "🪪 Name Meanings")],
+            [m.get("menu_pdf_maker", "🤖 AI PDF Maker"), m.get("menu_pdf_editor", "🧰 PDF Editor")],
+            [m.get("menu_audio_converter", "🎛️ Audio Editor"), m.get("menu_sticker_tools", "🧩 Sticker Tools")],
             [m.get("menu_contact_admin", "📞 Contact Admin"), m.get("menu_help", "❓ Help")],
-            [m.get("menu_back", "⬅️ Back")],
-        ]
-    elif section == "ai_tools":
-        keyboard = [
-            [m.get("menu_ai_chat", "💬 Chat with AI"), m.get("menu_ai_translator", "🌐 AI Translator")],
-            [m.get("menu_ai_grammar", "✍️ AI Grammar Fix"), m.get("menu_ai_email_writer", "📧 AI Email Writer")],
-            [m.get("menu_ai_quiz", "📝 AI Quiz Generator"), m.get("menu_ai_music", "🎵 AI Music Generator")],
-            [m.get("menu_ai_song", "🎤 AI Song Generator"), m.get("menu_pdf_maker", "🤖 AI PDF Maker")],
-            [m.get("menu_ai_pdf_translator", "🌐📄 AI PDF Translator")],
             [m.get("menu_back", "⬅️ Back")],
         ]
     elif section == "admin":
@@ -71,11 +62,6 @@ def build_main_menu_keyboard(
             labels["admin_dupes_status"],
             labels["admin_db_dupes"],
             labels["admin_es_dupes"],
-            labels["admin_upload_local_status"],
-            labels["admin_upload_local_all"],
-            labels["admin_upload_local_missing"],
-            labels["admin_upload_local_unique"],
-            labels["admin_upload_local_large"],
             labels["admin_missing_confirm"],
         ]
         keyboard = _pack_compact_rows(admin_items)
@@ -97,17 +83,10 @@ def build_main_menu_keyboard(
             [labels["admin_cancel_task"]],
             [m.get("menu_back", "⬅️ Back")],
         ]
-    elif section == "admin_uploads":
-        keyboard = [
-            [labels["admin_upload_local_status"]],
-            [labels["admin_upload_local_all"], labels["admin_upload_local_missing"]],
-            [labels["admin_upload_local_unique"], labels["admin_upload_local_large"]],
-            [m.get("menu_back", "⬅️ Back")],
-        ]
     else:
         keyboard = [
             [m.get("menu_search_books", "🔎 Search Books")],
-            [m.get("menu_top_books", "🔥 Top Books"), m.get("menu_ai_tools", "🤖 AI Tools")],
+            [m.get("menu_top_books", "🔥 Top Books")],
             [m.get("menu_video_downloader", "⬇️ Insta Youtub"), m.get("menu_text_to_voice", "🎙️ Text to Voice")],
             [m.get("menu_other_functions", "🛠️ Other Functions")],
         ]
@@ -138,10 +117,6 @@ def build_main_menu_message_text(
         title = m.get("menu_other_functions", "🛠️ Other Functions")
         subtitle = m.get("start_menu_subtitle", "Choose what you want to do 👇")
         return f"{title}\n{subtitle}"
-    if section == "ai_tools":
-        title = m.get("menu_ai_tools", "🤖 AI Tools")
-        subtitle = m.get("menu_ai_tools_placeholder", m.get("start_menu_subtitle", "Choose what you want to do 👇"))
-        return f"{title}\n{subtitle}"
     if section == "admin":
         return admin_guide_text_fn() if admin_guide_text_fn else labels["admin_panel"]
     if section.startswith("admin"):
@@ -150,7 +125,6 @@ def build_main_menu_message_text(
             "admin_maintenance": labels["admin_maintenance"],
             "admin_duplicates": labels["admin_duplicates"],
             "admin_tasks": labels["admin_tasks"],
-            "admin_uploads": labels["admin_uploads"],
         }
         return f"{title_map.get(section, labels['admin_panel'])}\n{m.get('start_menu_subtitle', 'Choose what you want to do 👇')}"
     title = m.get("start_menu_title", "Welcome, {name} 👋").format(name=first_name)
@@ -167,7 +141,5 @@ def build_main_menu_chat_text(
     return (
         f"{m.get('menu_other_functions', '🛠️ Other Functions')}\n{m.get('start_menu_subtitle', 'Choose what you want to do 👇')}"
         if section == "other"
-        else f"{m.get('menu_ai_tools', '🤖 AI Tools')}\n{m.get('menu_ai_tools_placeholder', m.get('start_menu_subtitle', 'Choose what you want to do 👇'))}"
-        if section == "ai_tools"
         else m.get("start_menu_subtitle", "Choose what you want to do 👇")
     )

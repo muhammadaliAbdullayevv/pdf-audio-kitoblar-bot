@@ -1,11 +1,12 @@
 import os
 import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
 from db import init_db, list_books, insert_book, find_duplicate_book
 from bot import normalize
 
-BOOKS_DIR = "/home/muhammadaliabdullayev/Documents/SmartAIToolsBot/downloads/localbooks"
+BOOKS_DIR = Path(__file__).resolve().parent / "downloads" / "localbooks"
 
 def update_local_books():
     load_dotenv()
@@ -13,6 +14,7 @@ def update_local_books():
     books = list_books()
     existing_count = len(books)
 
+    BOOKS_DIR.mkdir(parents=True, exist_ok=True)
     local_files = [
         f for f in os.listdir(BOOKS_DIR)
         if os.path.isfile(os.path.join(BOOKS_DIR, f))
@@ -24,7 +26,7 @@ def update_local_books():
     skipped_names = []
 
     for filename in local_files:
-        path = os.path.join(BOOKS_DIR, filename)
+        path = os.path.join(str(BOOKS_DIR), filename)
         display_name, _ = os.path.splitext(filename)
         display_name = display_name.strip()
         book_name = normalize(display_name)

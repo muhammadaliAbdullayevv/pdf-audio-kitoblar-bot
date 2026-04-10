@@ -324,11 +324,11 @@ async def handle_upload_help_callback(update: Update, context: ContextTypes.DEFA
     if limited:
         await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
         return
-    if query.data in {"upload_help_yes", "upload_help_movie_yes"}:
+    if query.data == "upload_help_yes":
         await safe_answer(query)
         await send_upload_request_to_admin(context, query.from_user, lang)
         await query.edit_message_text(MESSAGES[lang]["upload_help_sent"])
-    elif query.data in {"upload_help_no", "upload_help_movie_no"}:
+    elif query.data == "upload_help_no":
         await safe_answer(query)
         await query.edit_message_text(MESSAGES[lang]["upload_help_no_reply"])
     else:

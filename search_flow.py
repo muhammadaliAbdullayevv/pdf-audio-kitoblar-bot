@@ -10,10 +10,10 @@ import re
 import time
 import uuid
 from typing import Any
-from urllib.parse import quote_plus
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import ContextTypes
+from book_thumbnail import get_book_thumbnail_input
 
 try:
     from telegram import ReactionTypeEmoji
@@ -33,70 +33,6 @@ except ImportError:
     cache_set = lambda k, v, ttl=300: False
     cache_delete = lambda k: False
     cache_clear_pattern = lambda p: 0
-
-
-_MOVIE_CAPTION_LINK_RE = re.compile(r"(?:https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+)", re.IGNORECASE)
-MOVIE_REACTION_EMOJI = {
-    "like": "👍",
-    "dislike": "👎",
-    "berry": "🍓",
-    "whale": "🐳",
-}
-
-
-def _movie_caption_without_links(text: str) -> str:
-    raw = str(text or "").strip()
-    if not raw:
-        return ""
-
-    lines_out: list[str] = []
-    blank_emitted = False
-    for raw_line in raw.splitlines():
-        line = _MOVIE_CAPTION_LINK_RE.sub("", str(raw_line))
-        line = re.sub(r"\s{2,}", " ", line).strip()
-        if line:
-            lines_out.append(line)
-            blank_emitted = False
-            continue
-        if lines_out and not blank_emitted:
-            lines_out.append("")
-            blank_emitted = True
-
-    cleaned = "\n".join(lines_out).strip()
-    if len(cleaned) > 1024:
-        cleaned = cleaned[:1021].rstrip() + "..."
-    return cleaned
-
-
-def _compose_movie_delivery_caption(base_caption: str, lang: str) -> str:
-    footer = str(
-        MESSAGES.get(lang, MESSAGES.get("en", {})).get(
-            "movie_caption_bot_info",
-            "🤖 @SmartAIToolsBot | Books • Movies • AI tools",
-        )
-        or ""
-    ).strip()
-    base = str(base_caption or "").strip()
-    if not footer:
-        return base[:1024]
-    if not base:
-        return footer[:1024]
-
-    sep = "\n\n"
-    max_len = 1024
-    full = f"{base}{sep}{footer}"
-    if len(full) <= max_len:
-        return full
-
-    # Keep footer and trim base if needed.
-    room_for_base = max_len - len(sep) - len(footer)
-    if room_for_base <= 3:
-        return footer[:max_len]
-    trimmed_base = base[:room_for_base]
-    if len(base) > room_for_base:
-        trimmed_base = trimmed_base[:-3].rstrip() + "..."
-    return f"{trimmed_base}{sep}{footer}"
-
 
 def _ttl_value(name: str, default: int, minimum: int = 1) -> int:
     try:
@@ -133,11 +69,6 @@ def _book_search_entries_key(query: str) -> str:
     return f"search:books:entries:{ns}:{_query_fingerprint(query)}"
 
 
-def _movie_search_entries_key(query: str) -> str:
-    ns = _search_cache_namespace()
-    return f"search:movies:entries:{ns}:{_query_fingerprint(query)}"
-
-
 def get_cached_book_search_entries(query: str) -> list[dict[str, str]] | None:
     if not REDIS_CACHE_AVAILABLE:
         return None
@@ -162,32 +93,6 @@ def set_cached_book_search_entries(query: str, entries: list[dict[str, str]]) ->
         return
     ttl = _ttl_value("BOOK_SEARCH_RESULT_CACHE_TTL", 120, minimum=10)
     cache_set(_book_search_entries_key(query), {"entries": entries}, ttl=ttl)
-
-
-def get_cached_movie_search_entries(query: str) -> list[dict[str, str]] | None:
-    if not REDIS_CACHE_AVAILABLE:
-        return None
-    payload = cache_get(_movie_search_entries_key(query))
-    if isinstance(payload, dict):
-        payload = payload.get("entries")
-    if not isinstance(payload, list):
-        return None
-    entries: list[dict[str, str]] = []
-    for row in payload:
-        if not isinstance(row, dict):
-            continue
-        rid = str(row.get("id") or "").strip()
-        title = str(row.get("title") or "").strip()
-        if rid and title:
-            entries.append({"id": rid, "title": title})
-    return entries or None
-
-
-def set_cached_movie_search_entries(query: str, entries: list[dict[str, str]]) -> None:
-    if not REDIS_CACHE_AVAILABLE or not entries:
-        return
-    ttl = _ttl_value("MOVIE_SEARCH_RESULT_CACHE_TTL", 180, minimum=10)
-    cache_set(_movie_search_entries_key(query), {"entries": entries}, ttl=ttl)
 
 
 def configure(deps: dict[str, Any]) -> None:
@@ -522,20 +427,6 @@ def get_search_cache(context: ContextTypes.DEFAULT_TYPE, query_id: str):
     return cache.get(query_id)
 
 
-def cache_movie_search_results(context: ContextTypes.DEFAULT_TYPE, query: str, results: list):
-    cache = context.user_data.setdefault("movie_search_cache", {})
-    prune_search_cache(cache)
-    query_id = uuid.uuid4().hex[:8]
-    cache[query_id] = {"query": query, "results": results, "ts": time.time()}
-    context.user_data["last_movie_search_id"] = query_id
-    return query_id
-
-
-def get_movie_search_cache(context: ContextTypes.DEFAULT_TYPE, query_id: str):
-    cache = context.user_data.get("movie_search_cache", {})
-    return cache.get(query_id)
-
-
 def cache_user_results(context: ContextTypes.DEFAULT_TYPE, query: str, results: list):
     cache = context.user_data.setdefault("user_search_cache", {})
     prune_search_cache(cache)
@@ -714,26 +605,6 @@ def build_user_results_text(query: str, entries: list, page: int, lang: str):
     return header + body + footer, page_entries, pages
 
 
-def build_movie_results_text(query: str, entries: list, page: int, lang: str):
-    total = len(entries)
-    pages = max(1, int(math.ceil(total / PAGE_SIZE)))
-    page = max(0, min(page, pages - 1))
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    page_entries = entries[start:end]
-
-    header = MESSAGES[lang]["movie_results_header"].format(
-        query=query,
-        page=page + 1,
-        pages=pages,
-        total=total
-    ) + "\n\n"
-    lines = [f"{i}. {e['title']}" for i, e in enumerate(page_entries, start=start + 1)]
-    body = "\n".join(lines)
-    footer = "\n\n" + MESSAGES[lang]["use_buttons"]
-    return header + body + footer, page_entries, pages
-
-
 def build_user_results_keyboard(entries: list, page: int, pages: int, query_id: str):
     keyboard = []
     row = []
@@ -761,151 +632,19 @@ def build_user_results_keyboard(entries: list, page: int, pages: int, query_id: 
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_movie_results_keyboard(entries: list, page: int, pages: int, query_id: str):
-    keyboard = []
-    row = []
-    start_idx = page * PAGE_SIZE
-    for idx, entry in enumerate(entries, start=start_idx + 1):
-        row.append(
-            InlineKeyboardButton(
-                str(idx),
-                callback_data=f"movie:{entry['id']}"
-            )
-        )
-        if idx % 5 == 0:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"mpage:{query_id}:{page - 1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"mpage:{query_id}:{page + 1}"))
-    if nav:
-        keyboard.append(nav)
-    return InlineKeyboardMarkup(keyboard)
-
-
-def _resolve_bot_mention(context: ContextTypes.DEFAULT_TYPE | None = None) -> str:
-    username = ""
-    try:
-        bot_obj = getattr(context, "bot", None) if context else None
-        username = str(getattr(bot_obj, "username", "") or "").strip().lstrip("@")
-    except Exception:
-        username = ""
-    if username:
-        return f"@{username}"
-    return "@SmartAIToolsBot"
-
-
-def _build_movie_share_text(movie: dict, lang: str, context: ContextTypes.DEFAULT_TYPE | None = None) -> str:
-    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
-    title = str(movie.get("display_name") or movie.get("movie_name") or "Movie").strip() or "Movie"
-    template = msgs.get("movie_share_text", "🎬 {title}\n\n🤖 {bot}")
-    text = str(template or "").strip()
-    if not text:
-        text = "🎬 {title}\n\n🤖 {bot}"
-    bot_mention = _resolve_bot_mention(context)
-    text = text.format(title=title, bot=bot_mention)
-    if len(text) > 1000:
-        text = text[:997].rstrip() + "..."
-    return text
-
-
-def _movie_connected_post_url(movie: dict) -> str | None:
-    channel_id_raw = movie.get("channel_id")
-    message_id_raw = movie.get("channel_message_id")
-    try:
-        channel_id = int(channel_id_raw or 0)
-        message_id = int(message_id_raw or 0)
-    except Exception:
-        return None
-    if channel_id == 0 or message_id <= 0:
-        return None
-
-    channel_username = str(movie.get("channel_username") or "").strip().lstrip("@")
-    if channel_username:
-        return f"https://t.me/{channel_username}/{message_id}"
-
-    channel_str = str(channel_id)
-    if channel_str.startswith("-100") and len(channel_str) > 4:
-        return f"https://t.me/c/{channel_str[4:]}/{message_id}"
-    return None
-
-
-def _build_movie_share_url(movie: dict, lang: str, context: ContextTypes.DEFAULT_TYPE | None = None) -> str:
-    post_url = _movie_connected_post_url(movie)
-    if post_url:
-        return f"https://t.me/share/url?url={quote_plus(post_url)}"
-    share_text = _build_movie_share_text(movie, lang, context)
-    return f"https://t.me/share/url?text={quote_plus(share_text)}"
-
-
-def _build_movie_share_inline_query(movie_id: str) -> str:
-    return f"mshare_{str(movie_id or '').strip()}"
-
-
-def build_movie_keyboard(
-    movie_id: str,
-    counts: dict[str, int] | None = None,
-    user_reaction: str | None = None,
-    lang: str = "en",
-    share_query: str | None = None,
-    share_url: str | None = None,
-) -> InlineKeyboardMarkup:
-    counts_map = counts or {}
-    like = int(counts_map.get("like", 0) or 0)
-    dislike = int(counts_map.get("dislike", 0) or 0)
-    berry = int(counts_map.get("berry", 0) or 0)
-    whale = int(counts_map.get("whale", 0) or 0)
-    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
-
-    def label(key: str, emoji: str, count: int) -> str:
-        prefix = "★ " if user_reaction == key else ""
-        return f"{prefix}{emoji} {count}"
-
-    share_label = msgs.get("movie_share_button", "🔗 Share")
-    if share_query:
-        share_button = InlineKeyboardButton(share_label, switch_inline_query=share_query)
-    elif share_url:
-        share_button = InlineKeyboardButton(share_label, url=share_url)
-    else:
-        # Fallback for old call-sites/messages; new flow passes URL for one-tap share.
-        share_button = InlineKeyboardButton(share_label, callback_data=f"mshare:{movie_id}")
-
-    rows = [
-        [
-            InlineKeyboardButton(label("whale", MOVIE_REACTION_EMOJI["whale"], whale), callback_data=f"mreact:{movie_id}:whale"),
-            InlineKeyboardButton(label("berry", MOVIE_REACTION_EMOJI["berry"], berry), callback_data=f"mreact:{movie_id}:berry"),
-            InlineKeyboardButton(label("like", MOVIE_REACTION_EMOJI["like"], like), callback_data=f"mreact:{movie_id}:like"),
-            InlineKeyboardButton(label("dislike", MOVIE_REACTION_EMOJI["dislike"], dislike), callback_data=f"mreact:{movie_id}:dislike"),
-        ],
-        [share_button],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-def _movie_feature_removed_text(lang: str) -> str:
-    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
-    return msgs.get(
-        "movie_feature_removed",
-        "🎬 Movie feature has been removed. Please use book search instead.",
-    )
-
-
 def build_user_info_text(user: dict) -> str:
     name = " ".join([p for p in [user.get("first_name"), user.get("last_name")] if p]).strip() or "—"
     username = f"@{user.get('username')}" if user.get("username") else "—"
     language = user.get("language") or "—"
     joined = user.get("joined_date") or "—"
+    audio_allowed = "✅" if bool(user.get("audio_allowed")) else "❌"
     return "\n".join([
         f"👤 Name: {name}",
         f"🔤 Username: {username}",
         f"🆔 User ID: {user.get('id')}",
         f"🌐 Language: {language}",
         f"📅 Joined: {joined}",
+        f"🎧 Audio allowed: {audio_allowed}",
     ])
 
 
@@ -914,6 +653,7 @@ def build_user_admin_keyboard(user: dict) -> InlineKeyboardMarkup:
     blocked = bool(user.get("blocked"))
     upload_allowed = bool(user.get("allowed"))
     delete_allowed = bool(user.get("delete_allowed"))
+    audio_allowed = bool(user.get("audio_allowed"))
     stopped = bool(user.get("stopped"))
 
     def mark(flag: bool) -> str:
@@ -927,6 +667,9 @@ def build_user_admin_keyboard(user: dict) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(f"🗑️ Delete {mark(delete_allowed)}", callback_data=f"uact:del:{user_id}"),
             InlineKeyboardButton(f"🔇 Stop {mark(stopped)}", callback_data=f"uact:stop:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton(f"🎧 Audio {mark(audio_allowed)}", callback_data=f"uact:audio:{user_id}"),
         ],
         [
             InlineKeyboardButton("➕ Bonus", callback_data=f"uact:bonus_add:{user_id}"),
@@ -951,6 +694,52 @@ def transliterate_to_latin(text: str) -> str:
         lower = ch.lower()
         result.append(mapping.get(lower, ch))
     return "".join(result)
+
+
+def transliterate_to_cyrillic(text: str) -> str:
+    if not text:
+        return ""
+    s = str(text).lower()
+    s = s.replace("ʻ", "'").replace("’", "'").replace("ʼ", "'")
+
+    digraphs = (
+        ("shch", "щ"),
+        ("yo", "ё"),
+        ("yu", "ю"),
+        ("ya", "я"),
+        ("ye", "е"),
+        ("zh", "ж"),
+        ("kh", "х"),
+        ("ts", "ц"),
+        ("ch", "ч"),
+        ("sh", "ш"),
+        ("o'", "ў"),
+        ("g'", "ғ"),
+    )
+    single = {
+        "a": "а", "b": "б", "v": "в", "g": "г", "d": "д", "e": "е",
+        "z": "з", "i": "и", "y": "й", "k": "к", "l": "л", "m": "м",
+        "n": "н", "o": "о", "p": "п", "r": "р", "s": "с", "t": "т",
+        "u": "у", "f": "ф", "h": "х", "q": "қ", "x": "кс", "j": "ж",
+        "c": "с", "w": "в",
+    }
+
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        matched = False
+        for latin, cyr in digraphs:
+            if s.startswith(latin, i):
+                out.append(cyr)
+                i += len(latin)
+                matched = True
+                break
+        if matched:
+            continue
+        ch = s[i]
+        out.append(single.get(ch, ch))
+        i += 1
+    return "".join(out)
 
 
 def _mark_and_check_duplicate_text_update(context: ContextTypes.DEFAULT_TYPE, update: Update) -> bool:
@@ -1114,6 +903,114 @@ async def handle_audiobook_page_callback(update: Update, context: ContextTypes.D
     await safe_answer(query)
 
 
+def _extract_audiobook_message_media(message):
+    return (
+        getattr(message, "audio", None)
+        or getattr(message, "voice", None)
+        or getattr(message, "document", None)
+    )
+
+
+async def _cache_audiobook_part_file_id(part: dict, message) -> None:
+    media = _extract_audiobook_message_media(message)
+    if not media:
+        return
+    new_file_id = getattr(media, "file_id", None)
+    new_file_unique_id = getattr(media, "file_unique_id", None)
+    if not new_file_id:
+        return
+    part["file_id"] = new_file_id
+    if new_file_unique_id:
+        part["file_unique_id"] = new_file_unique_id
+    try:
+        await run_blocking(
+            update_audio_book_part_media,
+            str(part.get("id") or ""),
+            new_file_id,
+            new_file_unique_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to cache audiobook part file_id for %s: %s",
+            part.get("id"),
+            e,
+        )
+
+
+async def _send_audiobook_part_to_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    part: dict,
+    *,
+    caption: str | None = None,
+    reply_markup=None,
+):
+    file_id = str(part.get("file_id") or "").strip()
+    title = str(part.get("title") or f"Part {part.get('part_index', 0)}").strip() or None
+    duration = part.get("duration_seconds")
+
+    if file_id:
+        send_attempts = (
+            ("audio", lambda: context.bot.send_audio(chat_id=chat_id, audio=file_id, caption=caption, title=title, duration=duration, reply_markup=reply_markup)),
+            ("voice", lambda: context.bot.send_voice(chat_id=chat_id, voice=file_id, caption=caption, duration=duration, reply_markup=reply_markup)),
+            ("document", lambda: context.bot.send_document(chat_id=chat_id, document=file_id, caption=caption, reply_markup=reply_markup)),
+        )
+        for kind, sender in send_attempts:
+            try:
+                sent = await sender()
+                await _cache_audiobook_part_file_id(part, sent)
+                return sent
+            except Exception as e:
+                logger.debug(
+                    "Audiobook part send by %s failed for %s: %s",
+                    kind,
+                    part.get("id"),
+                    e,
+                )
+
+    try:
+        channel_id = int(part.get("channel_id") or 0)
+        channel_message_id = int(part.get("channel_message_id") or 0)
+    except Exception:
+        channel_id = 0
+        channel_message_id = 0
+    if channel_id and channel_message_id:
+        try:
+            forwarded = await context.bot.forward_message(
+                chat_id=chat_id,
+                from_chat_id=channel_id,
+                message_id=channel_message_id,
+            )
+            await _cache_audiobook_part_file_id(part, forwarded)
+            try:
+                trimmed_caption = str(caption or "").strip()
+                if trimmed_caption:
+                    await forwarded.edit_caption(caption=trimmed_caption, reply_markup=reply_markup)
+                elif reply_markup is not None:
+                    await forwarded.edit_reply_markup(reply_markup=reply_markup)
+            except Exception as e:
+                logger.debug(
+                    "Audiobook forwarded message edit skipped for %s: %s",
+                    part.get("id"),
+                    e,
+                )
+                if reply_markup is not None:
+                    try:
+                        await forwarded.edit_reply_markup(reply_markup=reply_markup)
+                    except Exception:
+                        pass
+            return forwarded
+        except Exception as e:
+            logger.error(
+                "Audiobook storage forward failed for %s (channel=%s message=%s): %s",
+                part.get("id"),
+                channel_id,
+                channel_message_id,
+                e,
+            )
+    return None
+
+
 async def handle_audiobook_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback invoked when user presses "Listen Audiobook" button."""
     query = update.callback_query
@@ -1142,15 +1039,16 @@ async def handle_audiobook_callback(update: Update, context: ContextTypes.DEFAUL
     # if only one part, send immediately
     if len(parts) == 1:
         part = parts[0]
-        file_id = part.get("file_id")
         caption = audio_book.get("display_title") or audio_book.get("title") or ""
-        try:
-            await query.message.reply_audio(audio=file_id, caption=caption)
-        except Exception:
-            try:
-                await query.message.reply_document(document=file_id, caption=caption)
-            except Exception:
-                pass
+        sent = await _send_audiobook_part_to_chat(
+            context,
+            query.message.chat_id,
+            part,
+            caption=caption,
+        )
+        if not sent:
+            await safe_answer(query, MESSAGES[lang].get("audio_send_failed", "Failed to send audio"), show_alert=True)
+            return
         await safe_answer(query)
         return
     # otherwise show selection keyboard
@@ -1189,20 +1087,22 @@ async def handle_audiobook_part_callback(update: Update, context: ContextTypes.D
     if not part:
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
-    file_id = part.get("file_id")
     part_id = part.get("id")
     caption = f"{part_index}/{len(all_parts)}"
     # Build keyboard with delete button (admin only)
     kb = None
     if _is_admin_user(query.from_user.id) and not _is_group_chat(update):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Delete Part", callback_data=f"apdel:{part_id}")]])
-    try:
-        await query.message.reply_audio(audio=file_id, caption=caption, reply_markup=kb)
-    except Exception:
-        try:
-            await query.message.reply_document(document=file_id, caption=caption, reply_markup=kb)
-        except Exception:
-            pass
+    sent = await _send_audiobook_part_to_chat(
+        context,
+        query.message.chat_id,
+        part,
+        caption=caption,
+        reply_markup=kb,
+    )
+    if not sent:
+        await safe_answer(query, MESSAGES[lang].get("audio_send_failed", "Failed to send audio"), show_alert=True)
+        return
     # increment audiobook download counter in background
     _schedule_bg_task(context, _run_db_retry(increment_audio_book_download, audio_book_id))
     await safe_answer(query)
@@ -1888,27 +1788,29 @@ async def handle_audiobook_part_play_callback(update: Update, context: ContextTy
         await safe_answer(query, MESSAGES[lang].get("audio_part_not_found", "Audio part not found"), show_alert=True)
         return
     
-    # Send the audio file with delete button for admins
-    try:
-        # Create keyboard with delete button for admins
-        keyboard = []
-        if _is_admin_user(query.from_user.id) and not _is_group_chat(update):
-            delete_button = InlineKeyboardButton("🗑️ Delete Audio", callback_data=f"apdel:{part_id}")
-            keyboard.append([delete_button])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-        
-        await context.bot.send_audio(
-            chat_id=query.message.chat_id,
-            audio=part.get("file_id"),
-            title=part.get("title", f"Part {part.get('part_index', 0)}"),
-            duration=part.get("duration_seconds"),
-            reply_markup=reply_markup,
-        )
+    # Send the audio file with delete button for audio managers
+    keyboard = []
+    can_manage_audio = False
+    if not _is_group_chat(update) and callable(globals().get("is_audio_allowed")):
+        try:
+            can_manage_audio = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+        except Exception:
+            can_manage_audio = False
+    if can_manage_audio:
+        delete_button = InlineKeyboardButton("🗑️ Delete Audio", callback_data=f"apdel:{part_id}")
+        keyboard.append([delete_button])
+
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    sent = await _send_audiobook_part_to_chat(
+        context,
+        query.message.chat_id,
+        part,
+        reply_markup=reply_markup,
+    )
+    if sent:
         await safe_answer(query)
-    except Exception as e:
-        logger.error(f"Failed to send audiobook part {part_id}: {e}")
-        await safe_answer(query, MESSAGES[lang].get("audio_send_failed", "Failed to send audio"), show_alert=True)
+        return
+    await safe_answer(query, MESSAGES[lang].get("audio_send_failed", "Failed to send audio"), show_alert=True)
 
 
 async def handle_audiobook_part_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1920,8 +1822,14 @@ async def handle_audiobook_part_delete_callback(update: Update, context: Context
     if _is_group_chat(update):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
-    if not _is_admin_user(query.from_user.id):
-        await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
+    can_manage_audio = False
+    if callable(globals().get("is_audio_allowed")):
+        try:
+            can_manage_audio = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+        except Exception:
+            can_manage_audio = False
+    if not can_manage_audio:
+        await safe_answer(query, MESSAGES[lang]["audiobook_add_not_allowed"], show_alert=True)
         return
     data = query.data or ""
     if not data.startswith("apdel:"):
@@ -1950,8 +1858,14 @@ async def handle_audiobook_delete_callback(update: Update, context: ContextTypes
     if _is_group_chat(update):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
-    if not _is_admin_user(query.from_user.id):
-        await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
+    can_manage_audio = False
+    if callable(globals().get("is_audio_allowed")):
+        try:
+            can_manage_audio = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+        except Exception:
+            can_manage_audio = False
+    if not can_manage_audio:
+        await safe_answer(query, MESSAGES[lang]["audiobook_add_not_allowed"], show_alert=True)
         return
     data = query.data or ""
     if not data.startswith("abdel:"):
@@ -1976,8 +1890,14 @@ async def handle_audiobook_delete_by_book_callback(update: Update, context: Cont
     if _is_group_chat(update):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
-    if not _is_admin_user(query.from_user.id):
-        await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
+    can_manage_audio = False
+    if callable(globals().get("is_audio_allowed")):
+        try:
+            can_manage_audio = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+        except Exception:
+            can_manage_audio = False
+    if not can_manage_audio:
+        await safe_answer(query, MESSAGES[lang]["audiobook_add_not_allowed"], show_alert=True)
         return
     data = query.data or ""
     if not data.startswith("abdelbook:"):
@@ -2016,8 +1936,14 @@ async def handle_audiobook_add_callback(update: Update, context: ContextTypes.DE
     if _is_group_chat(update):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
-    if not _is_admin_user(query.from_user.id):
-        await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
+    can_manage_audio = False
+    if callable(globals().get("is_audio_allowed")):
+        try:
+            can_manage_audio = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+        except Exception:
+            can_manage_audio = False
+    if not can_manage_audio:
+        await safe_answer(query, MESSAGES[lang]["audiobook_add_not_allowed"], show_alert=True)
         return
     data = query.data or ""
     if not data.startswith("abadd:"):
@@ -2113,12 +2039,8 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Keep search mode stable between messages.
         search_mode = str(context.user_data.get("search_mode") or "").strip().lower()
-        if search_mode == "movie":
-            context.user_data["awaiting_movie_search"] = True
-            context.user_data["awaiting_book_search"] = False
-        elif search_mode == "book":
-            if not bool(context.user_data.get("awaiting_movie_search")):
-                context.user_data["awaiting_book_search"] = True
+        if search_mode == "book":
+            context.user_data["awaiting_book_search"] = True
 
         limited, wait_s = spam_check_message(update, context)
         if limited:
@@ -2343,9 +2265,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ):
             return
 
-        if await _ai_tool_mode_handle_text_input(update, context, lang):
-            return
-
         if await _video_dl_handle_text_input(update, context, lang):
             return
 
@@ -2356,9 +2275,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if callable(globals().get("_sticker_handle_text_input")):
             if await _sticker_handle_text_input(update, context, lang):
                 return
-
-        if await _ai_chat_handle_text_input(update, context, lang):
-            return
 
         # Simple thanks replies
         thanks_lang = _detect_thanks_reply_lang(update.message.text)
@@ -2391,15 +2307,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(MESSAGES[lang]["request_sent"])
                 return
 
-        if context.user_data.get("awaiting_movie_search"):
-            context.user_data["awaiting_movie_search"] = False
-            context.user_data["awaiting_book_search"] = True
-            context.user_data["search_mode"] = "book"
-            await update.message.reply_text(
-                f"{_movie_feature_removed_text(lang)}\n\n{MESSAGES[lang].get('menu_search_prompt', 'Send a book name to search.')}"
-            )
-            return
-
         chat_type = str(getattr(update.effective_chat, "type", "") or "").lower()
         is_group_chat = chat_type in {"group", "supergroup"}
         reply_msg = getattr(update.message, "reply_to_message", None)
@@ -2418,11 +2325,11 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         is_reply_search_in_group = is_reply_to_bot
         active_menu_section = str(context.user_data.get("main_menu_section") or "").strip().lower()
-        has_active_menu_context = active_menu_section in {"main", "other", "ai_tools", "admin"}
+        has_active_menu_context = active_menu_section in {"main", "other", "admin"}
         # Allow direct search on main menu (for old users used to typing book names)
         # and when no menu context is active (e.g. before/without opening menus).
         # Keep explicit Search Books requirement in submenus/admin sections to avoid confusion.
-        require_search_button = active_menu_section in {"other", "ai_tools", "admin"}
+        require_search_button = active_menu_section in {"other", "admin"}
 
         if require_search_button and not bool(context.user_data.get("awaiting_book_search")) and not is_reply_search_in_group:
             if is_group_chat:
@@ -2461,7 +2368,20 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not cleaned_query:
             await update.message.reply_text(MESSAGES[lang]["enter_specific"])
             return
-        translit_query = transliterate_to_latin(cleaned_query)
+        query_variants: list[str] = []
+        for candidate in (cleaned_query, cleaned_query.replace("ʻ", "")):
+            candidate = str(candidate or "").strip()
+            if candidate and candidate not in query_variants:
+                query_variants.append(candidate)
+        translit_variants: list[str] = []
+        for candidate in query_variants:
+            for translit_candidate in (
+                transliterate_to_latin(candidate),
+                transliterate_to_cyrillic(candidate),
+            ):
+                translit_candidate = str(translit_candidate or "").strip()
+                if translit_candidate and translit_candidate not in translit_variants:
+                    translit_variants.append(translit_candidate)
 
         entries = get_cached_book_search_entries(query) or []
         entries = entries[:MAX_SEARCH_RESULTS]
@@ -2469,15 +2389,19 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # --- Search in ES if available ---
         if not entries and es_available():
-            results += await run_blocking(search_es, cleaned_query)  # raw Cyrillic or Latin
-            if translit_query != cleaned_query:
-                results += await run_blocking(search_es, translit_query)  # transliterated Latin
+            for candidate in query_variants:
+                results += await run_blocking(search_es, candidate)  # raw Cyrillic or Latin
+            for candidate in translit_variants:
+                if candidate not in query_variants:
+                    results += await run_blocking(search_es, candidate)  # transliterated Latin
         elif not entries:
             books = await run_blocking(load_books)
             # --- Fallback: local substring search ---
-            results += [(b, 1.0, b.get("id")) for b in books if cleaned_query in b["book_name"].lower()]
-            if translit_query != cleaned_query:
-                results += [(b, 1.0, b.get("id")) for b in books if translit_query in b["book_name"].lower()]
+            for candidate in query_variants:
+                results += [(b, 1.0, b.get("id")) for b in books if candidate in str(b.get("book_name") or "").lower()]
+            for candidate in translit_variants:
+                if candidate not in query_variants:
+                    results += [(b, 1.0, b.get("id")) for b in books if candidate in str(b.get("book_name") or "").lower()]
 
         # ✅ Deduplicate by UUID and build entries
         if not entries:
@@ -2498,7 +2422,9 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not entries:
             if es_available():
                 books = await run_blocking(load_books)
-            suggestions = suggest_books(books, cleaned_query, limit=5)
+            suggestions = suggest_books(books, query_variants[0] if query_variants else cleaned_query, limit=5)
+            if not suggestions and len(query_variants) > 1:
+                suggestions = suggest_books(books, query_variants[1], limit=5)
             if suggestions:
                 suggestion_lines = [f"{i + 1}. {s['title']}" for i, s in enumerate(suggestions)]
                 text = MESSAGES[lang]["suggestions"] + "\n\n" + "\n".join(suggestion_lines)
@@ -2582,6 +2508,7 @@ from db import (
     insert_audio_book_part,
     list_audio_book_parts,
     get_audio_book_part,
+    update_audio_book_part_media,
     get_audio_book_part_by_file_unique_id_and_audio_book,
     delete_audio_book_part,
     delete_audio_book,
@@ -2681,11 +2608,12 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         # Audiobook flags: show listen if audiobook exists; allow add for admins
         audio_book = await run_blocking(get_audio_book_for_book, book_id)
         has_ab = bool(audio_book)
-        can_add_ab = (
-            bool(_is_admin_user(query.from_user.id))
-            if allow_management_buttons and callable(globals().get("_is_admin_user"))
-            else False
-        )
+        can_add_ab = False
+        if allow_management_buttons and callable(globals().get("is_audio_allowed")):
+            try:
+                can_add_ab = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+            except Exception:
+                can_add_ab = False
         is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
         show_listen_btn = has_ab if (is_group_chat or is_owner_user) else True
         ab_request_count = 0
@@ -2725,12 +2653,14 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                 # Fallback: try local path if available
                 if local_path and os.path.exists(local_path):
                     try:
+                        thumbnail = get_book_thumbnail_input()
                         with open(local_path, "rb") as f:
                             sent = await context.bot.send_document(
                                 chat_id=query.message.chat_id,
                                 document=InputFile(f, filename=_book_filename(book)),
                                 caption=caption,
-                                reply_markup=reactions_kb
+                                reply_markup=reactions_kb,
+                                thumbnail=thumbnail,
                             )
                         if sent and sent.document:
                             await update_file_id(sent.document.file_id, getattr(sent.document, "file_unique_id", None))
@@ -2745,12 +2675,14 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         elif local_path and os.path.exists(local_path):
             for attempt in range(1, LOCAL_SEND_RETRIES + 1):
                 try:
+                    thumbnail = get_book_thumbnail_input()
                     with open(local_path, "rb") as f:
                         sent = await context.bot.send_document(
                             chat_id=query.message.chat_id,
                             document=InputFile(f, filename=_book_filename(book)),
                             caption=caption,
-                            reply_markup=reactions_kb
+                            reply_markup=reactions_kb,
+                            thumbnail=thumbnail,
                         )
                     if sent and sent.document:
                         await update_file_id(sent.document.file_id, getattr(sent.document, "file_unique_id", None))
@@ -2814,11 +2746,12 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                     # Recompute audiobook flags for refreshed keyboard
                     audio_book2 = await run_blocking(get_audio_book_for_book, book_id)
                     has_ab2 = bool(audio_book2)
-                    can_add_ab2 = (
-                        bool(_is_admin_user(query.from_user.id))
-                        if allow_management_buttons and callable(globals().get("_is_admin_user"))
-                        else False
-                    )
+                    can_add_ab2 = False
+                    if allow_management_buttons and callable(globals().get("is_audio_allowed")):
+                        try:
+                            can_add_ab2 = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+                        except Exception:
+                            can_add_ab2 = False
                     is_owner_user2 = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
                     show_listen_btn2 = has_ab2 if (is_group_chat or is_owner_user2) else True
                     ab_request_count2 = 0
@@ -2861,30 +2794,6 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         raise
 
 
-async def handle_movie_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    lang = ensure_user_language(update, context)
-    await safe_answer(query, _movie_feature_removed_text(lang), show_alert=True)
-
-
-async def handle_movie_reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    lang = ensure_user_language(update, context)
-    await safe_answer(query, _movie_feature_removed_text(lang), show_alert=True)
-
-
-async def handle_movie_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    lang = ensure_user_language(update, context)
-    await safe_answer(query, _movie_feature_removed_text(lang), show_alert=True)
-
-
 async def handle_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if update.effective_user and await is_stopped_user(update.effective_user.id):
@@ -2917,14 +2826,6 @@ async def handle_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
     await safe_answer(query)
-
-
-async def handle_movie_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    lang = ensure_user_language(update, context)
-    await safe_answer(query, _movie_feature_removed_text(lang), show_alert=True)
 
 
 async def handle_user_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

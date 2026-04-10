@@ -29,6 +29,7 @@ try:
 except Exception:
     InlineQueryResultCachedVideo = None  # type: ignore
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, InputFile
+from book_thumbnail import get_book_thumbnail_input
 
 from urllib3.exceptions import InsecureRequestWarning
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
@@ -67,13 +68,13 @@ from config import (
     TOKEN,
     OWNER_ID,
     REQUEST_CHAT_ID,
+    BOOK_STORAGE_CHANNEL_ID,
     COIN_SEARCH,
     COIN_DOWNLOAD,
     COIN_REACTION,
     COIN_FAVORITE,
     COIN_REFERRAL,
     TOP_USERS_LIMIT,
-    UPLOAD_CHANNEL_IDS,
     AUDIO_UPLOAD_CHANNEL_IDS,
     AUDIO_UPLOAD_CHANNEL_ID,
     VIDEO_UPLOAD_CHANNEL_IDS,
@@ -90,6 +91,7 @@ from db import (
     update_user_group_language,
     update_user_left_date,
     set_user_allowed,
+    set_user_audio_allowed,
     set_user_delete_allowed,
     set_user_stopped,
     set_user_blocked,
@@ -125,9 +127,7 @@ from db import (
     get_upload_request_status_counts as db_get_upload_request_status_counts,
     get_user_status_counts as db_get_user_status_counts,
     get_reaction_totals as db_get_reaction_totals,
-    get_movie_reaction_totals as db_get_movie_reaction_totals,
     get_user_reaction as db_get_user_reaction,
-    get_user_movie_reaction as db_get_user_movie_reaction,
     award_reaction_action as db_award_reaction_action,
     get_user_reaction_awards_count as db_get_user_reaction_awards_count,
     get_daily_analytics as db_get_daily_analytics,
@@ -140,13 +140,7 @@ from db import (
     get_book_by_path as db_get_book_by_path,
     get_book_by_name as db_get_book_by_name,
     get_book_by_file_unique_id as db_get_book_by_file_unique_id,
-    list_movies as db_list_movies,
-    list_unindexed_movies as db_list_unindexed_movies,
-    get_movie_by_id as db_get_movie_by_id,
-    get_movie_by_file_unique_id as db_get_movie_by_file_unique_id,
-    search_movies as db_search_movies,
     find_duplicate_book as db_find_duplicate_book,
-    find_duplicate_movie as db_find_duplicate_movie,
     get_duplicate_counts_file_unique_id as db_get_duplicate_counts_file_unique_id,
     get_duplicate_counts_path as db_get_duplicate_counts_path,
     get_duplicate_counts_name as db_get_duplicate_counts_name,
@@ -156,19 +150,20 @@ from db import (
     increment_book_download as db_increment_book_download,
     increment_book_searches as db_increment_book_searches,
     set_book_reaction as db_set_book_reaction,
-    set_movie_reaction as db_set_movie_reaction,
-    get_movie_reaction_counts as db_get_movie_reaction_counts,
     get_book_stats as db_get_book_stats,
     get_top_books as db_get_top_books,
     get_top_users as db_get_top_users,
     insert_book as db_insert_book,
-    insert_movie as db_insert_movie,
     bulk_upsert_books,
     update_book_file_id,
     update_book_indexed,
-    update_movie_indexed,
+    update_book_path as db_update_book_path,
     update_book_by_path,
-    update_book_storage_meta as db_update_book_storage_meta,
+    enqueue_book_local_download_job as db_enqueue_book_local_download_job,
+    claim_book_local_download_job as db_claim_book_local_download_job,
+    complete_book_local_download_job as db_complete_book_local_download_job,
+    retry_book_local_download_job as db_retry_book_local_download_job,
+    fail_book_local_download_job as db_fail_book_local_download_job,
     get_audio_book_for_book,
     get_audio_book_by_id,
     list_audio_book_parts,
@@ -200,15 +195,9 @@ from db import (
     update_upload_receipt as db_update_upload_receipt,
     update_book_upload_meta as db_update_book_upload_meta,
     upsert_book_summary as db_upsert_book_summary,
-    save_user_quiz as db_save_user_quiz,
-    get_user_quiz as db_get_user_quiz,
-    list_user_quizzes as db_list_user_quizzes,
-    count_user_quizzes as db_count_user_quizzes,
-    delete_user_quiz as db_delete_user_quiz,
-    mark_user_quiz_started as db_mark_user_quiz_started,
-    increment_user_quiz_share_count as db_increment_user_quiz_share_count,
     search_users_by_name as db_search_users_by_name,
     is_user_delete_allowed as db_is_user_delete_allowed,
+    is_user_audio_allowed as db_is_user_audio_allowed,
     is_user_stopped as db_is_user_stopped,
     set_user_referrer as db_set_user_referrer,
 )
@@ -231,7 +220,6 @@ from admin_tools import (
     handle_admin_menu_prompt_input as _admin_tools_handle_admin_menu_prompt_input,
 )
 
-import ai_tools as _ai_tools
 import audio_converter as _audio_converter
 import sticker_tools as _sticker_tools
 import video_downloader as _video_downloader
@@ -286,9 +274,7 @@ _BRIDGE_DB_SYMBOLS = (
     db_get_upload_request_status_counts,
     db_get_user_status_counts,
     db_get_reaction_totals,
-    db_get_movie_reaction_totals,
     db_get_user_reaction,
-    db_get_user_movie_reaction,
     db_award_reaction_action,
     db_get_user_reaction_awards_count,
     db_get_daily_analytics,
@@ -299,13 +285,7 @@ _BRIDGE_DB_SYMBOLS = (
     db_get_book_by_path,
     db_get_book_by_name,
     db_get_book_by_file_unique_id,
-    db_list_movies,
-    db_list_unindexed_movies,
-    db_get_movie_by_id,
-    db_get_movie_by_file_unique_id,
-    db_search_movies,
     db_find_duplicate_book,
-    db_find_duplicate_movie,
     db_get_duplicate_counts_file_unique_id,
     db_get_duplicate_counts_path,
     db_get_duplicate_counts_name,
@@ -315,19 +295,20 @@ _BRIDGE_DB_SYMBOLS = (
     db_increment_book_download,
     db_increment_book_searches,
     db_set_book_reaction,
-    db_set_movie_reaction,
-    db_get_movie_reaction_counts,
     db_get_book_stats,
     db_get_top_books,
     db_get_top_users,
     db_insert_book,
-    db_insert_movie,
     bulk_upsert_books,
     update_book_file_id,
     update_book_indexed,
-    update_movie_indexed,
+    db_update_book_path,
     update_book_by_path,
-    db_update_book_storage_meta,
+    db_enqueue_book_local_download_job,
+    db_claim_book_local_download_job,
+    db_complete_book_local_download_job,
+    db_retry_book_local_download_job,
+    db_fail_book_local_download_job,
     get_audio_book_for_book,
     get_audio_book_by_id,
     list_audio_book_parts,
@@ -359,15 +340,9 @@ _BRIDGE_DB_SYMBOLS = (
     db_update_upload_receipt,
     db_update_book_upload_meta,
     db_upsert_book_summary,
-    db_save_user_quiz,
-    db_get_user_quiz,
-    db_list_user_quizzes,
-    db_count_user_quizzes,
-    db_delete_user_quiz,
-    db_mark_user_quiz_started,
-    db_increment_user_quiz_share_count,
     db_search_users_by_name,
     db_is_user_delete_allowed,
+    db_is_user_audio_allowed,
     db_is_user_stopped,
     db_set_user_referrer,
 )
@@ -388,8 +363,6 @@ _SEARCH_FLOW_DEP_KEYS = (
     "SEARCH_COOLDOWN_SEC",
     "TOP_CACHE_TTL",
     "_admin_tools_handle_admin_menu_prompt_input",
-    "_ai_chat_handle_text_input",
-    "_ai_tool_mode_handle_text_input",
     "_audio_conv_handle_media_input",
     "_audio_conv_handle_text_input",
     "_book_filename",
@@ -418,17 +391,12 @@ _SEARCH_FLOW_DEP_KEYS = (
     "db_add_user_coin_adjustment",
     "db_get_book_by_id",
     "db_get_book_stats",
-    "db_get_movie_by_id",
-    "db_get_movie_reaction_counts",
-    "db_get_user_movie_reaction",
     "db_get_user_reaction",
     "db_list_requests",
     "db_increment_book_download",
     "db_increment_book_searches",
     "db_increment_counter",
     "db_insert_book",
-    "db_search_movies",
-    "db_set_movie_reaction",
     "ensure_user_language",
     "es_available",
     "format_request_admin_text",
@@ -446,6 +414,7 @@ _SEARCH_FLOW_DEP_KEYS = (
     "index_book",
     "is_blocked",
     "is_favorited",
+    "is_audio_allowed",
     "is_stopped_user",
     "load_requests",
     "mark_request_fulfilled",
@@ -458,9 +427,9 @@ _SEARCH_FLOW_DEP_KEYS = (
     "safe_reply",
     "_schedule_application_task",
     "search_es",
-    "search_movies_es",
     "send_request_to_admin",
     "set_user_allowed",
+    "set_user_audio_allowed",
     "spam_check_callback",
     "spam_check_message",
     "suggest_books",
@@ -636,10 +605,12 @@ _ENGAGEMENT_OPTIONAL_DEP_KEYS = (
     "hashlib",
     "is_blocked",
     "is_favorited",
+    "is_audio_allowed",
     "is_stopped_user",
     "remove_favorite",
     "set_cached_top_entries",
     "set_user_allowed",
+    "set_user_audio_allowed",
     "set_user_blocked",
     "set_user_delete_allowed",
     "set_user_stopped",
@@ -685,9 +656,7 @@ _PDF_EDITOR_REQUIRED_DEP_KEYS = (
     "update_user_info",
 )
 
-_PDF_EDITOR_OPTIONAL_DEP_KEYS = (
-    "_ai_tool_translate_with_source_retry_blocking",
-)
+_PDF_EDITOR_OPTIONAL_DEP_KEYS = ()
 
 _TTS_REQUIRED_DEP_KEYS = (
     "MESSAGES",
@@ -753,7 +722,6 @@ _ADMIN_RUNTIME_OPTIONAL_DEP_KEYS = (
     "RetryAfter",
     "TTFont",
     "TimedOut",
-    "UPLOAD_CHANNEL_IDS",
     "UPLOAD_LOCAL_CONNECT_TIMEOUT",
     "UPLOAD_LOCAL_LARGE_CONCURRENCY",
     "UPLOAD_LOCAL_LARGE_MB",
@@ -789,6 +757,7 @@ _ADMIN_RUNTIME_OPTIONAL_DEP_KEYS = (
     "db_list_admin_task_runs",
     "db_list_books",
     "db_search_users_by_name",
+    "db_update_book_path",
     "db_update_admin_task_run",
     "delete_book_and_related",
     "ensure_user_language",
@@ -922,6 +891,34 @@ async def requests_command_wrapper(update: Update, context: ContextTypes.DEFAULT
 
 async def smoke_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await admin_only_command(update, context, smoke_check_command)
+
+
+async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    if not update.effective_chat or not update.effective_user:
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await safe_reply(update, MESSAGES[lang]["admin_only"])
+        return
+    chat_id = update.effective_chat.id
+    chat_type = getattr(update.effective_chat, "type", "-")
+    chat_title = getattr(update.effective_chat, "title", None) or "-"
+    user_id = update.effective_user.id
+    text = MESSAGES[lang]["chat_id_info"].format(
+        chat_id=chat_id,
+        chat_type=chat_type,
+        user_id=user_id,
+    )
+    text = f"{text}\n📌 Title: {chat_title}"
+    admin_id = get_admin_id()
+    if admin_id and admin_id != chat_id:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+            if update.effective_chat.type in {"group", "supergroup", "channel"}:
+                return
+        except Exception:
+            pass
+    await safe_reply(update, text)
 
 
 
@@ -1285,9 +1282,9 @@ def build_book_caption(book, downloads: int, fav_count: int, counts: dict) -> st
 async def send_book(bot, chat_id, book):
     """
     Send a book to the user:
-    - Prefer local file if it exists
-    - Capture and save file_id after upload
-    - Fall back to Telegram cache if local file is missing
+    - Prefer Telegram cache if available
+    - Fall back to local file if it exists
+    - Capture and save file_id after local upload
     - Always index/update in ES using stable UUID
     """
 
@@ -1328,7 +1325,7 @@ async def send_book(bot, chat_id, book):
         except Exception as e:
             logger.warning("Failed to load audiobook metadata for %s: %s", book_id, e)
     has_ab = bool(audio_book)
-    can_add_ab = bool(_is_admin_user(user_id)) if user_id else False
+    can_add_ab = bool(is_audio_allowed(user_id)) if user_id else False
     is_owner_user = bool(_is_owner_user(user_id)) if user_id and callable(globals().get("_is_owner_user")) else False
     show_listen_btn = has_ab if is_owner_user else True
     ab_request_count = 0
@@ -1356,32 +1353,47 @@ async def send_book(bot, chat_id, book):
 
     if book.get("file_id"):
         # Prefer Telegram cache
-        await bot.send_document(
-            chat_id=chat_id,
-            document=book["file_id"],
-            caption=caption,
-            reply_markup=reactions_kb,
-        )
+        try:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=book["file_id"],
+                caption=caption,
+                reply_markup=reactions_kb,
+            )
+            return
+        except Exception as e:
+            logger.error("send_book failed by file_id for %s: %s", book_id, e)
 
-    elif book_path and os.path.exists(book_path):
+    if book_path and os.path.exists(book_path):
         # Fallback to local file
+        thumbnail = get_book_thumbnail_input()
         with open(book_path, "rb") as f:
             sent_message = await bot.send_document(
                 chat_id=chat_id,
                 document=InputFile(f, filename=_book_filename(book)),
                 caption=caption,
                 reply_markup=reactions_kb,
+                thumbnail=thumbnail,
             )
 
         # Capture file_id for future use
         if sent_message and sent_message.document:
             new_file_id = sent_message.document.file_id
+            new_file_unique_id = getattr(sent_message.document, "file_unique_id", None)
             book["file_id"] = new_file_id
+            if new_file_unique_id:
+                book["file_unique_id"] = new_file_unique_id
 
             # Save updated file_id in DB
             try:
                 if book.get("id"):
-                    await run_blocking(update_book_file_id, str(book.get("id")), new_file_id, True, None)
+                    await run_blocking(
+                        update_book_file_id,
+                        str(book.get("id")),
+                        new_file_id,
+                        True,
+                        new_file_unique_id,
+                    )
                 elif book_path:
                     await run_blocking(update_book_by_path, book_path, file_id=new_file_id, indexed=True)
                 logger.debug(f"Updated file_id + indexed flag for {book.get('book_name')} in DB")
@@ -1398,7 +1410,7 @@ async def send_book(bot, chat_id, book):
                         book_path,
                         book.get("id"),
                         get_display_name(book),
-                        None,
+                        new_file_unique_id,
                     )
                 except Exception as e:
                     logger.warning("Failed to index book in ES for %s: %s", book.get("id"), e)
@@ -1480,7 +1492,6 @@ warnings.simplefilter("ignore", InsecureRequestWarning)
 BOOKS_FILE = "books.json"
 USER_FILE = "users.json"
 upload_mode = False
-movie_upload_mode = False
 
 # File locks (process-level) for simple concurrency safety
 BOOKS_LOCK = Lock()
@@ -1493,7 +1504,6 @@ UPLOAD_REQUESTS_LOCK = Lock()
 
 # ✅ Define the index name once
 ES_INDEX = "books"
-MOVIES_ES_INDEX = os.getenv("MOVIES_ES_INDEX", "movies").strip() or "movies"
 
 # Elasticsearch config via environment variables
 ES_URL = os.getenv("ES_URL", "")
@@ -1504,13 +1514,15 @@ _ES_CLIENT = None
 BOOK_LOVERS_GROUP_URL = (os.getenv("BOOK_LOVERS_GROUP_URL", "https://t.me/book_lovers_clubb") or "").strip()
 _BOOK_LOVERS_GROUP_HANDLE_RAW = (os.getenv("BOOK_LOVERS_GROUP_HANDLE", "") or "").strip()
 BOT_OWNER_USERNAME = (os.getenv("BOT_OWNER_USERNAME", "@MuhammadaliAbdullayev") or "@MuhammadaliAbdullayev").strip()
+BOT_DISPLAY_NAME = (os.getenv("BOT_DISPLAY_NAME", "Pdf va audio kitoblar") or "Pdf va audio kitoblar").strip()
+BOT_PUBLIC_USERNAME = (os.getenv("BOT_PUBLIC_USERNAME", "@pdf_audio_kitoblar_bot") or "@pdf_audio_kitoblar_bot").strip()
 
 ANALYTICS_FILE = "analytics.json"
 REQUESTS_FILE = "requests.json"
 UPLOAD_REQUESTS_FILE = "upload_requests.json"
 PAGE_SIZE = 10
-SEARCH_COOLDOWN_SEC = 2
-DOWNLOAD_COOLDOWN_SEC = 5
+SEARCH_COOLDOWN_SEC = 0
+DOWNLOAD_COOLDOWN_SEC = 0
 MAX_RECENTS = 5
 MAX_FAVORITES = 50
 MAX_SEARCH_RESULTS = 20
@@ -1535,7 +1547,6 @@ SPAM_CB_BLOCK = 10
 TOP_CACHE_TTL = 60
 AUDIT_CACHE_TTL = 30
 BOOK_SEARCH_RESULT_CACHE_TTL = max(10, int(os.getenv("BOOK_SEARCH_RESULT_CACHE_TTL", "120") or "120"))
-MOVIE_SEARCH_RESULT_CACHE_TTL = max(10, int(os.getenv("MOVIE_SEARCH_RESULT_CACHE_TTL", "180") or "180"))
 TOP_USERS_CACHE_TTL = max(5, int(os.getenv("TOP_USERS_CACHE_TTL", "45") or "45"))
 SEARCH_CACHE_NS = (os.getenv("SEARCH_CACHE_NS", "v1") or "v1").strip()
 try:
@@ -1969,6 +1980,8 @@ async def safe_reply(update: Update, text: str, **kwargs) -> bool:
 
 
 def _spam_guard(context: ContextTypes.DEFAULT_TYPE, key: str, limit: int, window: int, block: int):
+    # Disabled intentionally: book uploads and rapid actions should not be throttled by the bot itself.
+    return False, 0
     now = time.time()
     block_until = context.user_data.get(f"{key}_block_until", 0)
     if now < block_until:
@@ -2417,127 +2430,6 @@ async def set_bot_commands(application):
     )
 
 
-BOT_DESCRIPTION_LONG = (
-    "📚 Smart AI Tools Bot\n"
-    "📖 Kitoblarni qidiring va yuklab oling.\n"
-    "🎧 Audio kitoblarni toping va tinglang.\n"
-    "\n"
-    "📚 Smart AI Tools Bot\n"
-    "📖 Search and download books.\n"
-    "🎧 Find and listen to audiobooks.\n"
-    "\n"
-    "👤 Owned and managed by @MuhammadaliAbdullayev"
-)
-
-BOT_SHORT_DESCRIPTION = "UZ/EN: Kitob va audio kitoblar | Books and audiobooks"
-
-# Clears stale per-language profile texts that may have been set manually in BotFather.
-# You can override this list at runtime with BOT_PROFILE_CLEAR_LANGUAGE_CODES (comma-separated).
-BOT_PROFILE_TEXT_CLEANUP_LOCALES = (
-    "ar",
-    "de",
-    "en-gb",
-    "en-us",
-    "es",
-    "es-419",
-    "fa",
-    "fr",
-    "id",
-    "it",
-    "ja",
-    "ko",
-    "kk",
-    "ms",
-    "pt",
-    "pt-br",
-    "th",
-    "tr",
-    "uk",
-    "uz-cyrl",
-    "vi",
-    "zh-cn",
-    "zh-hans",
-    "zh-hant",
-    "zh-tw",
-)
-
-
-BOT_PROFILE_TEXTS = {
-    # Default fallback when Telegram language is not matched
-    "default": {
-        "description": BOT_DESCRIPTION_LONG,
-        "about": BOT_SHORT_DESCRIPTION,
-    },
-    "en": {
-        "description": BOT_DESCRIPTION_LONG,
-        "about": BOT_SHORT_DESCRIPTION,
-    },
-    "uz": {
-        "description": BOT_DESCRIPTION_LONG,
-        "about": BOT_SHORT_DESCRIPTION,
-    },
-    "ru": {
-        "description": BOT_DESCRIPTION_LONG,
-        "about": BOT_SHORT_DESCRIPTION,
-    },
-}
-
-
-def _clip_text(value: str, limit: int) -> str:
-    text = str(value or "").strip()
-    return text[:limit] if len(text) > limit else text
-
-
-def _parse_lang_codes_csv(value: str) -> set[str]:
-    out: set[str] = set()
-    for raw in str(value or "").split(","):
-        code = raw.strip().lower()
-        if code:
-            out.add(code)
-    return out
-
-
-async def set_bot_profile_texts(application):
-    bot = application.bot
-    supported_langs = {str(k).lower() for k in BOT_PROFILE_TEXTS.keys() if k != "default"}
-    cleanup_langs = _parse_lang_codes_csv(os.getenv("BOT_PROFILE_CLEAR_LANGUAGE_CODES", ""))
-    cleanup_langs -= supported_langs
-
-    for lang_code in sorted(cleanup_langs):
-        try:
-            await bot.set_my_description(description="", language_code=lang_code)
-            await bot.set_my_short_description(short_description="", language_code=lang_code)
-        except Exception as e:
-            logger.debug("Profile text cleanup skipped for lang=%s: %s", lang_code, e)
-
-    default_payload = BOT_PROFILE_TEXTS.get("default", BOT_PROFILE_TEXTS.get("en", {}))
-    default_desc = _clip_text(default_payload.get("description", ""), 512)
-    default_about = _clip_text(default_payload.get("about", ""), 120)
-
-    try:
-        if default_desc:
-            await bot.set_my_description(description=default_desc)
-        if default_about:
-            await bot.set_my_short_description(short_description=default_about)
-    except Exception as e:
-        logger.warning("Failed to set default bot profile texts: %s", e)
-
-    for lang_code, payload in BOT_PROFILE_TEXTS.items():
-        if lang_code == "default":
-            continue
-        desc = _clip_text(payload.get("description", ""), 512)
-        about = _clip_text(payload.get("about", ""), 120)
-        if desc == default_desc and about == default_about:
-            continue
-        try:
-            if desc:
-                await bot.set_my_description(description=desc, language_code=lang_code)
-            if about:
-                await bot.set_my_short_description(short_description=about, language_code=lang_code)
-        except Exception as e:
-            logger.warning("Failed to set bot profile texts for lang=%s: %s", lang_code, e)
-
-
 async def _sync_user_commands_if_needed(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int | None,
@@ -2572,12 +2464,6 @@ async def post_init(application):
         except Exception as e:
             logger.error(f"Background command sync failed: {e}")
 
-    async def _bg_set_profile_texts():
-        try:
-            await set_bot_profile_texts(application)
-        except Exception as e:
-            logger.error(f"Background profile text sync failed: {e}")
-
     async def _bg_backfill_awards():
         try:
             await run_blocking_db_retry(
@@ -2588,14 +2474,35 @@ async def post_init(application):
         except Exception as e:
             logger.error(f"Failed to backfill user awards: {e}")
 
+    async def _bg_sync_unindexed_books():
+        try:
+            await run_blocking(sync_unindexed_books)
+        except Exception as e:
+            logger.error(f"Failed to sync unindexed books to Elasticsearch: {e}", exc_info=True)
+
+    async def _bg_ensure_upload_local_backup_worker(context):
+        try:
+            starter = getattr(_upload_flow, "start_upload_local_backup_worker", None)
+            if callable(starter):
+                starter(application)
+        except Exception as e:
+            logger.error(f"Failed to ensure local backup worker: {e}")
+
     asyncio.create_task(_bg_set_commands())
-    asyncio.create_task(_bg_set_profile_texts())
     try:
         application.job_queue.run_repeating(prune_blocked_users, interval=3 * 60 * 60, first=60)
         logger.debug("Scheduled prune_blocked_users every 3 hours.")
     except Exception as e:
         logger.error(f"Failed to schedule prune_blocked_users: {e}")
     asyncio.create_task(_bg_backfill_awards())
+    asyncio.create_task(_bg_sync_unindexed_books())
+    try:
+        starter = getattr(_upload_flow, "start_upload_local_backup_worker", None)
+        if callable(starter):
+            starter(application)
+        application.job_queue.run_repeating(_bg_ensure_upload_local_backup_worker, interval=60, first=60)
+    except Exception as e:
+        logger.error(f"Failed to start local backup worker: {e}")
 
 
 def get_es():
@@ -2667,20 +2574,6 @@ def ensure_index():
         logger.error(f"Failed to ensure index: {e}")
 
 
-def ensure_movies_index():
-    try:
-        es = get_es()
-        if not es:
-            return
-        if not es.indices.exists(index=MOVIES_ES_INDEX):
-            es.indices.create(index=MOVIES_ES_INDEX)
-            logger.debug(f"Created ES index: {MOVIES_ES_INDEX}")
-        else:
-            logger.debug(f"ES index exists: {MOVIES_ES_INDEX}")
-    except Exception as e:
-        logger.error(f"Failed to ensure movies index: {e}")
-
-
 def index_book(book_name, file_id=None, path=None, book_id=None, display_name=None, file_unique_id=None, refresh: str | bool | None = "wait_for"):
     try:
         es = get_es()
@@ -2711,71 +2604,6 @@ def index_book(book_name, file_id=None, path=None, book_id=None, display_name=No
         return book_id
     except Exception as e:
         logger.error(f"Failed to index in ES: {e}")
-        return None
-
-
-def index_movie(
-    movie_name,
-    file_id=None,
-    path=None,
-    movie_id=None,
-    display_name=None,
-    file_unique_id=None,
-    mime_type=None,
-    duration_seconds=None,
-    file_size=None,
-    channel_id=None,
-    channel_message_id=None,
-    release_year=None,
-    genre=None,
-    movie_lang=None,
-    country=None,
-    rating=None,
-    caption_text=None,
-    search_text=None,
-    indexed: bool = True,
-    refresh: str | bool | None = "wait_for",
-):
-    try:
-        es = get_es()
-        if not es:
-            return None
-        ensure_movies_index()
-        if not movie_id:
-            movie_id = str(uuid.uuid4())
-
-        doc = {
-            "id": movie_id,
-            "movie_name": movie_name,
-            "display_name": display_name or movie_name,
-            "file_id": file_id,
-            "file_unique_id": file_unique_id,
-            "path": path,
-            "mime_type": mime_type,
-            "duration_seconds": duration_seconds,
-            "file_size": file_size,
-            "channel_id": channel_id,
-            "channel_message_id": channel_message_id,
-            "release_year": release_year,
-            "release_year_text": str(release_year) if release_year else None,
-            "genre": genre,
-            "movie_lang": movie_lang,
-            "country": country,
-            "rating": rating,
-            "caption_text": caption_text,
-            "search_text": search_text,
-            "indexed": bool(indexed),
-        }
-        es.index(
-            index=MOVIES_ES_INDEX,
-            id=movie_id,
-            document=doc,
-            refresh=refresh,
-        )
-        logger.debug("Indexed/updated movie in ES: %s (id=%s)", movie_name, movie_id)
-        return movie_id
-    except Exception as e:
-        logger.error("Failed to index movie in ES: %s", e)
         return None
 
 
@@ -2868,42 +2696,6 @@ def search_es(query, size: int = MAX_SEARCH_RESULTS):
         return []
 
 
-def search_movies_es(query, size: int = MAX_SEARCH_RESULTS):
-    try:
-        es = get_es()
-        if not es:
-            return []
-        res = es.search(
-            index=MOVIES_ES_INDEX,
-            query={
-                "multi_match": {
-                    "query": query,
-                    "fields": [
-                        "movie_name^3",
-                        "display_name^3",
-                        "search_text^4",
-                        "genre^2",
-                        "movie_lang^2",
-                        "country^2",
-                        "rating",
-                        "release_year_text^2",
-                        "caption_text",
-                    ],
-                    "fuzziness": "AUTO",
-                }
-            },
-            size=size,
-            track_total_hits=False,
-            source_includes=["id", "movie_name", "display_name", "release_year", "genre", "movie_lang"],
-        )
-        hits = [(hit["_source"], hit["_score"], hit["_id"]) for hit in res["hits"]["hits"]]
-        logger.debug("ES movie search '%s' -> %s hits", query, len(hits))
-        return hits
-    except Exception as e:
-        logger.error("ES movie search failed: %s", e)
-        return []
-
-
 def get_es_health_summary(es):
     status = "unknown"
     count = 0
@@ -2926,14 +2718,26 @@ STOPWORDS = {
     "pdf", "zip", "rar", "doc", "docx", "z", "lib", "org"
 }
 
+def _normalize_uzbek_apostrophes(text: str) -> str:
+    if not text:
+        return ""
+    s = str(text)
+    # Keep the Uzbek apostrophe as a real character and repair common
+    # "o zbek" / "g ulom" spacing mistakes.
+    s = s.replace("'", "ʻ").replace("’", "ʻ").replace("ʼ", "ʻ")
+    s = re.sub(r"\b([og])ʻ\s+([^\W\d_])", r"\1ʻ\2", s, flags=re.UNICODE)
+    s = re.sub(r"\b([og])\s+([^\W\d_])", r"\1ʻ\2", s, flags=re.UNICODE)
+    return s
+
+
 def normalize(text: str) -> str:
     text = text.lower()
-    # Normalize Uzbek apostrophes to nothing (so o‘tkan == otkan)
-    text = text.replace("'", "").replace("’", "").replace("ʻ", "").replace("ʼ", "")
+    # Preserve Uzbek apostrophes and standardize common variants to "ʻ".
+    text = _normalize_uzbek_apostrophes(text)
     text = re.sub(r'@[\w]+', ' ', text)                 # remove @usernames
     text = re.sub(r'https?://\S+|www\.\S+', ' ', text)  # remove links
     text = text.replace("_", " ")
-    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)  # remove punctuation/symbols
+    text = re.sub(r"[^\w\sʻ]+", " ", text, flags=re.UNICODE)  # remove punctuation/symbols but keep Uzbek apostrophe
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -2992,15 +2796,6 @@ def save_books(books):
     except Exception as e:
         logger.error(f"Failed to save books to DB: {e}")
 
-
-def load_movies(limit: int = 50000):
-    try:
-        movies = db_list_movies(limit=limit)
-        logger.debug(f"Loaded {len(movies)} movies from DB")
-        return movies
-    except Exception as e:
-        logger.error(f"Failed to load movies from DB: {e}")
-        return []
 
 def clean_query(text: str) -> str:
     return normalize(text)
@@ -3089,6 +2884,7 @@ def save_users(users):
                 language=u.get("language"),
                 delete_allowed=bool(u.get("delete_allowed", False)),
                 stopped=bool(u.get("stopped", False)),
+                audio_allowed=bool(u.get("audio_allowed", False)),
                 language_selected=u.get("language_selected"),
                 group_language=u.get("group_language"),
             )
@@ -3211,6 +3007,12 @@ def set_user_group_language(user_id: int, lang: str):
         update_user_group_language(user_id, lang)
 
 
+def _language_picker_prompt_lang(user: dict | None, tg_user) -> str:
+    if isinstance(user, dict) and user.get("language") and bool(user.get("language_selected")) is True:
+        return detect_language_code(str(user.get("language")))
+    return detect_language_code(getattr(tg_user, "language_code", None))
+
+
 def ensure_user_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
     if not update.effective_user:
         return "en"
@@ -3277,6 +3079,7 @@ async def update_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE | 
             language=effective_lang,
             delete_allowed=bool(existing.get("delete_allowed", False)),
             stopped=bool(existing.get("stopped", False)),
+            audio_allowed=bool(existing.get("audio_allowed", False)),
             language_selected=lang_selected,
             retries=DB_RETRY_ATTEMPTS,
             base_delay=DB_RETRY_BASE_DELAY_SEC,
@@ -3317,6 +3120,16 @@ def is_allowed(user_id: int) -> bool:
     return bool(user.get("allowed")) if user else False
 
 
+def is_audio_allowed(user_id: int) -> bool:
+    if _is_owner_user(user_id):
+        return True
+    try:
+        return bool(db_is_user_audio_allowed(user_id))
+    except Exception:
+        user = get_user(user_id)
+        return bool(user.get("audio_allowed")) if user else False
+
+
 def is_bot_paused(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return bool(context.application.bot_data.get("bot_paused"))
 
@@ -3347,160 +3160,6 @@ def format_bot_paused_on(lang: str, context: ContextTypes.DEFAULT_TYPE) -> str:
         except Exception:
             return msg
     return msg
-
-
-async def pick_upload_channel(app) -> int | None:
-    if not UPLOAD_CHANNEL_IDS:
-        return None
-    data = app.bot_data
-    lock = data.get("upload_channel_lock")
-    if lock is None:
-        lock = asyncio.Lock()
-        data["upload_channel_lock"] = lock
-    async with lock:
-        idx = int(data.get("upload_channel_index", 0) or 0)
-        cid = UPLOAD_CHANNEL_IDS[idx % len(UPLOAD_CHANNEL_IDS)]
-        data["upload_channel_index"] = idx + 1
-        return cid
-
-
-async def enqueue_upload_fanout(app, file_id: str, book_id: str | None = None):
-    if not UPLOAD_CHANNEL_IDS:
-        return
-    data = app.bot_data
-    q = data.get("upload_fanout_queue")
-    if q is None:
-        q = asyncio.Queue()
-        data["upload_fanout_queue"] = q
-    await q.put({"file_id": file_id, "book_id": (str(book_id) if book_id else None)})
-    task = data.get("upload_fanout_task")
-    if not task or task.done():
-        data["upload_fanout_task"] = _schedule_application_task(app, upload_fanout_worker(app))
-
-
-async def upload_fanout_worker(app):
-    data = app.bot_data
-    q: asyncio.Queue | None = data.get("upload_fanout_queue")
-    if q is None:
-        return
-    try:
-        while True:
-            try:
-                first = await asyncio.wait_for(q.get(), timeout=5)
-            except asyncio.TimeoutError:
-                if q.empty():
-                    break
-                continue
-
-            batch = [first]
-            limit = max(1, len(UPLOAD_CHANNEL_IDS))
-            while len(batch) < limit:
-                try:
-                    batch.append(q.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-
-            task_meta: list[dict] = []
-            for item in batch:
-                if isinstance(item, dict):
-                    fid = str(item.get("file_id") or "").strip()
-                    bid = str(item.get("book_id") or "").strip() or None
-                else:
-                    fid = str(item or "").strip()
-                    bid = None
-                if not fid:
-                    continue
-                cid = await pick_upload_channel(app)
-                if not cid:
-                    continue
-                task_meta.append({"channel_id": cid, "book_id": bid, "file_id": fid})
-            fanout_retry_max = max(1, int(os.getenv("UPLOAD_FANOUT_RETRY_MAX", "8") or "8"))
-            fanout_send_delay = max(0.0, float(os.getenv("UPLOAD_FANOUT_SEND_DELAY_SEC", "0.15") or "0.15"))
-            fanout_retry_jitter = max(0.0, float(os.getenv("UPLOAD_FANOUT_RETRY_JITTER_SEC", "0.5") or "0.5"))
-
-            for meta in task_meta:
-                cid = int(meta.get("channel_id") or 0)
-                book_id = meta.get("book_id")
-                fid = str(meta.get("file_id") or "").strip()
-                if not cid or not fid:
-                    continue
-
-                sent = None
-                last_err = None
-                for attempt in range(1, fanout_retry_max + 1):
-                    try:
-                        sent = await app.bot.send_document(chat_id=cid, document=fid)
-                        last_err = None
-                        break
-                    except RetryAfter as e:
-                        last_err = e
-                        wait_s = float(getattr(e, "retry_after", 1) or 1) + fanout_retry_jitter
-                        logger.warning(
-                            "Fanout flood control for channel %s, waiting %.2fs (attempt %s/%s)",
-                            cid,
-                            wait_s,
-                            attempt,
-                            fanout_retry_max,
-                        )
-                        await asyncio.sleep(wait_s)
-                    except (TimedOut, NetworkError) as e:
-                        last_err = e
-                        backoff = min(10.0, 0.5 * (2 ** (attempt - 1)))
-                        logger.warning(
-                            "Fanout transient error for channel %s: %s (attempt %s/%s, wait %.2fs)",
-                            cid,
-                            e,
-                            attempt,
-                            fanout_retry_max,
-                            backoff,
-                        )
-                        await asyncio.sleep(backoff)
-                    except Exception as e:
-                        last_err = e
-                        logger.error("Failed to send uploaded file to channel %s: %s", cid, e)
-                        break
-
-                if not sent:
-                    if last_err is not None:
-                        logger.error(
-                            "Fanout failed after retries for channel %s (book_id=%s): %s",
-                            cid,
-                            book_id,
-                            last_err,
-                        )
-                    continue
-
-                if book_id and getattr(sent, "message_id", None):
-                    try:
-                        doc = getattr(sent, "document", None)
-                        await run_blocking(
-                            db_update_book_storage_meta,
-                            book_id,
-                            cid,
-                            int(sent.message_id),
-                            getattr(doc, "file_id", None),
-                            getattr(doc, "file_unique_id", None),
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Failed to persist storage metadata for book_id=%s channel=%s: %s",
-                            book_id,
-                            cid,
-                            e,
-                        )
-
-                if fanout_send_delay > 0:
-                    await asyncio.sleep(fanout_send_delay)
-
-            for _ in batch:
-                q.task_done()
-
-            if q.empty():
-                break
-    finally:
-        current_task = _safe_asyncio_current_task()
-        if current_task is not None and data.get("upload_fanout_task") is current_task:
-            data.pop("upload_fanout_task", None)
 
 
 async def can_delete_books(user_id: int) -> bool:
@@ -3696,14 +3355,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Reset menu/search state until the user explicitly chooses a language.
         context.user_data.pop("main_menu_section", None)
         context.user_data["awaiting_book_search"] = False
-        context.user_data["awaiting_movie_search"] = False
         context.user_data.pop("search_mode", None)
         referrer_id = parse_referral_payload(context.args[0] if context.args else None)
-        lang = ensure_user_language(update, context)
+        prompt_lang = _language_picker_prompt_lang(user_record, update.effective_user)
         # Always ask user to choose language on /start (do not auto-use Telegram locale).
         await safe_reply(
             update,
-            MESSAGES[lang]["choose_language"],
+            MESSAGES[prompt_lang]["choose_language"],
             reply_markup=get_language_keyboard()
         )
         _schedule_application_task(
@@ -3741,14 +3399,13 @@ async def language_command_handler(update: Update, context: ContextTypes.DEFAULT
         else:
             await _reply_group_language_prompt(update, context, prompt_lang)
         return
-    lang = ensure_user_language(update, context)
+    prompt_lang = _language_picker_prompt_lang(user_record, update.effective_user)
     # Keep menu hidden/reset until language is explicitly chosen.
     context.user_data.pop("main_menu_section", None)
     context.user_data["awaiting_book_search"] = False
-    context.user_data["awaiting_movie_search"] = False
     context.user_data.pop("search_mode", None)
     await update.message.reply_text(
-        MESSAGES[lang]["choose_language"],
+        MESSAGES[prompt_lang]["choose_language"],
         reply_markup=get_language_keyboard()
     )
 
@@ -3806,11 +3463,9 @@ async def _send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, la
     context.user_data["main_menu_section"] = section
     if section == "main":
         context.user_data["awaiting_book_search"] = True
-        context.user_data["awaiting_movie_search"] = False
         context.user_data["search_mode"] = "book"
     else:
         context.user_data["awaiting_book_search"] = False
-        context.user_data["awaiting_movie_search"] = False
         context.user_data.pop("search_mode", None)
     return True
 
@@ -3822,11 +3477,9 @@ async def _send_main_menu_to_chat_id(context: ContextTypes.DEFAULT_TYPE, chat_id
         context.user_data["main_menu_section"] = section
         if section == "main":
             context.user_data["awaiting_book_search"] = True
-            context.user_data["awaiting_movie_search"] = False
             context.user_data["search_mode"] = "book"
         else:
             context.user_data["awaiting_book_search"] = False
-            context.user_data["awaiting_movie_search"] = False
             context.user_data.pop("search_mode", None)
         return True
     except Exception:
@@ -3918,12 +3571,6 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
         _pdfed_clear_session(context)
         cancelled = True
 
-    ai_tool_mode_session = _ai_tool_mode_get_session(context)
-    if ai_tool_mode_session and (not user_id or ai_tool_mode_session.get("user_id") in {None, user_id}):
-        await _edit_prompt_if_any(ai_tool_mode_session)
-        _ai_tool_mode_clear_session(context)
-        cancelled = True
-
     # Cancel audiobook adding flow if active
     pending_abook = context.user_data.get("pending_abook")
     if pending_abook and (not user_id or True):  # Audiobook flow is user-specific
@@ -3955,10 +3602,6 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
     if context.user_data.get("admin_menu_prompt"):
         context.user_data.pop("admin_menu_prompt", None)
         cancelled = True
-    if _ai_chat_get_session(context):
-        _ai_chat_clear_session(context)
-        cancelled = True
-
     return cancelled
 
 
@@ -3971,7 +3614,6 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
 
     if action == "search":
         context.user_data["awaiting_book_search"] = True
-        context.user_data["awaiting_movie_search"] = False
         context.user_data["search_mode"] = "book"
         await update.message.reply_text(
             m.get("menu_search_prompt", "Send a book name to search."),
@@ -3980,24 +3622,13 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         context.user_data["main_menu_section"] = "main"
         return True
     context.user_data["awaiting_book_search"] = False
-    if action == "search_movies":
-        context.user_data["awaiting_movie_search"] = False
-        context.user_data["awaiting_book_search"] = True
-        context.user_data["search_mode"] = "book"
-        await update.message.reply_text(
-            f"{m.get('movie_feature_removed', '🎬 Movie feature has been removed. Please use book search instead.')}\n\n{m.get('menu_search_prompt', 'Send a book name to search.')}",
-            reply_markup=_main_menu_keyboard(lang, "main", user_id),
-        )
-        context.user_data["main_menu_section"] = "main"
-        return True
-    context.user_data["awaiting_movie_search"] = False
     context.user_data.pop("search_mode", None)
     if action == "tts":
         context.user_data["main_menu_section"] = "main"
         await _tts_start_session_from_message(update.message, update, context, lang)
         return True
     if action == "pdf":
-        context.user_data["main_menu_section"] = "main"
+        context.user_data["main_menu_section"] = "other"
         await _pdf_maker_start_session_from_message(update.message, update, context, lang)
         return True
     if action == "pdf_editor":
@@ -4022,32 +3653,9 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     if action == "other":
         await _send_main_menu(update, context, lang, "other")
         return True
-    if action == "ai_tools":
-        await _send_main_menu(update, context, lang, "ai_tools")
-        return True
-    if action == "ai_chat":
-        context.user_data["main_menu_section"] = "ai_tools"
-        await _ai_chat_start_session_from_message(update.message, update, context, lang)
-        return True
-    if action == "ai_pdf_translator":
-        context.user_data["main_menu_section"] = "ai_tools"
-        await _pdfed_start_translation_session_from_message(update.message, update, context, lang)
-        return True
-    if action in {"ai_translator", "ai_grammar", "ai_email_writer", "ai_quiz", "ai_music", "ai_song"}:
-        context.user_data["main_menu_section"] = "ai_tools"
-        mode_map = {
-            "ai_translator": "translator",
-            "ai_grammar": "grammar",
-            "ai_email_writer": "email",
-            "ai_quiz": "quiz",
-            "ai_music": "music",
-            "ai_song": "song",
-        }
-        await _ai_tool_mode_start_session_from_message(update.message, update, context, lang, mode_map[action])
-        return True
     if action == "back":
         prev = str(context.user_data.get("main_menu_section") or "main")
-        if prev in {"admin_maintenance", "admin_duplicates", "admin_tasks", "admin_uploads"}:
+        if prev in {"admin_maintenance", "admin_duplicates", "admin_tasks"}:
             await _send_main_menu(update, context, lang, "admin")
         elif prev == "admin":
             await _send_main_menu(update, context, lang, "main")
@@ -4079,14 +3687,6 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         context.user_data["_skip_spam_check_once"] = True
         await upload_command(update, context)
         return True
-    if action == "movie_upload":
-        context.user_data["main_menu_section"] = "other"
-        context.user_data["_skip_spam_check_once"] = True
-        await update.message.reply_text(
-            m.get("movie_feature_removed", "🎬 Movie feature has been removed. Please use book search instead."),
-            reply_markup=_main_menu_keyboard(lang, "other", user_id),
-        )
-        return True
     if action == "video_downloader":
         context.user_data["main_menu_section"] = "video_downloader"
         await _video_dl_start_session_from_message(update.message, update, context, lang)
@@ -4098,16 +3698,6 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     if action == "sticker_tools":
         context.user_data["main_menu_section"] = "other"
         await _sticker_start_session_from_message(update.message, update, context, lang)
-        return True
-    if action == "name_meanings":
-        context.user_data["main_menu_section"] = "other"
-        await update.message.reply_text(
-            m.get(
-                "menu_name_meanings_coming_soon",
-                "🪪 Name Meanings will be available soon. 🙏✨\n📌 We are preparing this section. Thank you for your patience.",
-            ),
-            reply_markup=_main_menu_keyboard(lang, "other", user_id),
-        )
         return True
     if action == "contact_admin":
         context.user_data["main_menu_section"] = "other"
@@ -4144,8 +3734,6 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         es_dupes_command_fn=es_dupes_command,
         dupes_status_command_fn=dupes_status_command,
         cancel_task_command_fn=cancel_task_command,
-        admin_panel_send_upload_local_status_fn=_admin_panel_send_upload_local_status,
-        start_upload_local_books_fn=_start_upload_local_books,
     )
     if handled_admin:
         return True
@@ -4168,7 +3756,6 @@ async def _send_animated_start_greeting(update: Update, context: ContextTypes.DE
         return False
     context.user_data["main_menu_section"] = "main"
     context.user_data["awaiting_book_search"] = True
-    context.user_data["awaiting_movie_search"] = False
     context.user_data["search_mode"] = "book"
     return True
 
@@ -4176,7 +3763,6 @@ async def _send_animated_start_greeting(update: Update, context: ContextTypes.DE
 def _set_main_menu_ready_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["main_menu_section"] = "main"
     context.user_data["awaiting_book_search"] = True
-    context.user_data["awaiting_movie_search"] = False
     context.user_data["search_mode"] = "book"
 
 
@@ -4285,6 +3871,10 @@ async def handle_language_callback(update: Update, context: ContextTypes.DEFAULT
 _UPLOAD_FLOW_OPTIONAL_DEP_KEYS = (
     "run_blocking_heavy",
     "bulk_index_books",
+    "db_update_book_path",
+    "db_get_book_by_id",
+    "update_book_file_id",
+    "BOOK_STORAGE_CHANNEL_ID",
     "VIDEO_UPLOAD_CHANNEL_IDS",
     "VIDEO_UPLOAD_CHANNEL_ID",
 )
@@ -4310,13 +3900,10 @@ def _build_upload_flow_deps() -> dict[str, object]:
 _upload_flow.configure(_build_upload_flow_deps())
 
 upload_command = _upload_flow.upload_command
-movie_upload_command = _upload_flow.movie_upload_command
 _process_upload = _upload_flow._process_upload
 _raw_handle_file = _upload_flow.handle_file
-_raw_handle_movie_video = _upload_flow.handle_movie_video
 _raw_handle_photo_message = _upload_flow.handle_photo_message
 sync_unindexed_books = _upload_flow.sync_unindexed_books
-sync_unindexed_movies = _upload_flow.sync_unindexed_movies
 
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4384,7 +3971,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _raw_handle_file(update, context)
 
 
-async def handle_movie_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_video_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route video/GIF to sticker tools only."""
     sticker_handler = globals().get("_sticker_handle_media_input")
     if callable(sticker_handler):
@@ -4503,14 +4090,6 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "reaction_berry",
             "reaction_whale",
             "video_downloads",
-            # AI Tools counters
-            "ai_chat_sessions",
-            "ai_translator_uses",
-            "ai_grammar_fixes",
-            "ai_email_writes",
-            "ai_quiz_generated",
-            "ai_music_generated",
-            "ai_song_generated",
             "ai_pdf_created",
         ]
         counters = await run_blocking(db_get_counters, counter_keys)
@@ -4612,14 +4191,7 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines += [
             "──────────",
-            "🤖 AI Tools",
-            f"- AI Chat sessions: {counters.get('ai_chat_sessions', 0)}",
-            f"- Translator uses: {counters.get('ai_translator_uses', 0)}",
-            f"- Grammar fixes: {counters.get('ai_grammar_fixes', 0)}",
-            f"- Email writes: {counters.get('ai_email_writes', 0)}",
-            f"- Quiz generated: {counters.get('ai_quiz_generated', 0)}",
-            f"- Music generated: {counters.get('ai_music_generated', 0)}",
-            f"- Song lyrics generated: {counters.get('ai_song_generated', 0)}",
+            "📄 AI PDF Tools",
             f"- PDF created: {counters.get('ai_pdf_created', 0)}",
         ]
 
@@ -4661,9 +4233,6 @@ _search_flow.configure(_build_search_flow_deps())
 transliterate_to_latin = _search_flow.transliterate_to_latin
 search_books = _search_flow.search_books
 handle_book_selection = _search_flow.handle_book_selection
-handle_movie_selection = _search_flow.handle_movie_selection
-handle_movie_reaction_callback = _search_flow.handle_movie_reaction_callback
-handle_movie_share_callback = _search_flow.handle_movie_share_callback
 handle_audiobook_callback = _search_flow.handle_audiobook_callback
 handle_audiobook_part_callback = _search_flow.handle_audiobook_part_callback
 handle_audiobook_part_delete_callback = _search_flow.handle_audiobook_part_delete_callback
@@ -4675,7 +4244,6 @@ handle_audiobook_part_play_callback = _search_flow.handle_audiobook_part_play_ca
 handle_audiobook_add_callback = _search_flow.handle_audiobook_add_callback
 handle_abook_audio = _search_flow.handle_abook_audio
 handle_page_callback = _search_flow.handle_page_callback
-handle_movie_page_callback = _search_flow.handle_movie_page_callback
 handle_user_page_callback = _search_flow.handle_user_page_callback
 handle_user_select_callback = _search_flow.handle_user_select_callback
 
@@ -5409,11 +4977,9 @@ _pdf_editor.configure(_build_pdf_editor_deps())
 _pdfed_clear_session = _pdf_editor._pdf_editor_clear_session
 _pdfed_get_session = _pdf_editor._pdf_editor_get_session
 _pdfed_start_session_from_message = _pdf_editor._pdf_editor_start_session_from_message
-_pdfed_start_translation_session_from_message = _pdf_editor._pdf_editor_start_translation_session_from_message
 _pdfed_handle_text_input = _pdf_editor._pdf_editor_handle_text_input
 _pdfed_handle_media_input = _pdf_editor._pdf_editor_handle_media_input
 pdf_editor_command = _pdf_editor.pdf_editor_command
-pdf_translator_command = _pdf_editor.pdf_translator_command
 handle_pdf_editor_callback = _pdf_editor.handle_pdf_editor_callback
 
 
@@ -5459,80 +5025,6 @@ text_to_voice_command = _tts_tools.text_to_voice_command
 _tts_start_session_from_message = _tts_tools._tts_start_session_from_message
 handle_tts_callback = _tts_tools.handle_tts_callback
 
-
-# AI tools extracted module bridge
-_ai_tools.configure(
-    messages=MESSAGES,
-    logger_obj=logger,
-    run_blocking_fn=run_blocking,
-    run_blocking_heavy_fn=run_blocking_heavy,
-    send_with_retry_fn=_send_with_retry,
-    main_menu_keyboard_fn=_main_menu_keyboard,
-    safe_answer_fn=safe_answer,
-    db_save_user_quiz_fn=db_save_user_quiz,
-    db_get_user_quiz_fn=db_get_user_quiz,
-    db_list_user_quizzes_fn=db_list_user_quizzes,
-    db_count_user_quizzes_fn=db_count_user_quizzes,
-    db_delete_user_quiz_fn=db_delete_user_quiz,
-    db_mark_user_quiz_started_fn=db_mark_user_quiz_started,
-    db_increment_user_quiz_share_count_fn=db_increment_user_quiz_share_count,
-    db_increment_counter_fn=db_increment_counter,
-)
-
-_AI_CHAT_SESSION_KEY = _ai_tools._AI_CHAT_SESSION_KEY
-_ai_chat_texts = _ai_tools._ai_chat_texts
-_ai_chat_clear_session = _ai_tools._ai_chat_clear_session
-_ai_chat_get_session = _ai_tools._ai_chat_get_session
-_ai_chat_save_session = _ai_tools._ai_chat_save_session
-_ai_chat_trim_history = _ai_tools._ai_chat_trim_history
-_ai_chat_build_prompt = _ai_tools._ai_chat_build_prompt
-_ai_chat_user_asked_for_links = _ai_tools._ai_chat_user_asked_for_links
-_ai_chat_postprocess_reply = _ai_tools._ai_chat_postprocess_reply
-_ai_chat_guess_reply_lang = _ai_tools._ai_chat_guess_reply_lang
-_ai_chat_needs_caution_notice = _ai_tools._ai_chat_needs_caution_notice
-_ai_chat_add_caution_notice = _ai_tools._ai_chat_add_caution_notice
-_AI_TOOL_MODE_SESSION_KEY = _ai_tools._AI_TOOL_MODE_SESSION_KEY
-_AI_TOOL_MODE_KEYS = _ai_tools._AI_TOOL_MODE_KEYS
-_ai_tool_mode_clear_session = _ai_tools._ai_tool_mode_clear_session
-_ai_tool_mode_get_session = _ai_tools._ai_tool_mode_get_session
-_ai_tool_mode_save_session = _ai_tools._ai_tool_mode_save_session
-_ai_tool_mode_texts = _ai_tools._ai_tool_mode_texts
-_ai_tool_mode_title = _ai_tools._ai_tool_mode_title
-_ai_tool_mode_prompt = _ai_tools._ai_tool_mode_prompt
-_ai_tool_lang_label = _ai_tools._ai_tool_lang_label
-_ai_tool_parse_target_lang = _ai_tools._ai_tool_parse_target_lang
-_ai_tool_parse_translation_langs = _ai_tools._ai_tool_parse_translation_langs
-_ai_tool_guess_translation_source_lang = _ai_tools._ai_tool_guess_translation_source_lang
-_ai_tool_translation_output_is_suspicious = _ai_tools._ai_tool_translation_output_is_suspicious
-_ai_tools_ollama_generate_blocking = _ai_tools._ai_tools_ollama_generate_blocking
-_ai_translator_backend = _ai_tools._ai_translator_backend
-_ai_translator_nllb_lang_code = _ai_tools._ai_translator_nllb_lang_code
-_ai_translator_get_nllb_bundle = _ai_tools._ai_translator_get_nllb_bundle
-_ai_tool_translate_nllb_blocking = _ai_tools._ai_tool_translate_nllb_blocking
-_ai_tool_translation_output_looks_bad = _ai_tools._ai_tool_translation_output_looks_bad
-_ai_tool_translate_ollama_blocking = _ai_tools._ai_tool_translate_ollama_blocking
-_ai_tool_translate_blocking = _ai_tools._ai_tool_translate_blocking
-_ai_tool_translate_with_source_retry_blocking = _ai_tools._ai_tool_translate_with_source_retry_blocking
-# pdf_editor needs translator bindings after AI tools bridge is ready.
-_pdf_editor.configure(_build_pdf_editor_deps())
-_ai_tool_grammar_fix_blocking = _ai_tools._ai_tool_grammar_fix_blocking
-_ai_tool_email_writer_blocking = _ai_tools._ai_tool_email_writer_blocking
-_ai_tool_mode_start_session_from_message = _ai_tools._ai_tool_mode_start_session_from_message
-_ai_tool_mode_handle_text_input = _ai_tools._ai_tool_mode_handle_text_input
-handle_ai_tools_callback = _ai_tools.handle_ai_tools_callback
-handle_ai_quiz_poll_answer = _ai_tools.handle_ai_quiz_poll_answer
-my_quiz_command = _ai_tools.my_quiz_command
-handle_my_quiz_callback = _ai_tools.handle_my_quiz_callback
-_ai_chat_owner_identity_reply = _ai_tools._ai_chat_owner_identity_reply
-_ai_chat_capabilities_reply = _ai_tools._ai_chat_capabilities_reply
-_ai_chat_feature_help_reply = _ai_tools._ai_chat_feature_help_reply
-_ai_chat_admin_contact_reply = _ai_tools._ai_chat_admin_contact_reply
-_ai_chat_builtin_reply = _ai_tools._ai_chat_builtin_reply
-_ai_chat_ollama_reply_blocking = _ai_tools._ai_chat_ollama_reply_blocking
-_ai_chat_start_session_from_message = _ai_tools._ai_chat_start_session_from_message
-_ai_chat_handle_text_input = _ai_tools._ai_chat_handle_text_input
-
-
 # Video downloader extracted module bridge
 _video_downloader.configure(_build_video_downloader_deps())
 
@@ -5576,7 +5068,6 @@ _format_background_tasks_text = _admin_runtime._format_background_tasks_text
 _admin_panel_snapshot_text = _admin_runtime._admin_panel_snapshot_text
 _admin_panel_keyboard = _admin_runtime._admin_panel_keyboard
 _admin_panel_send_or_edit = _admin_runtime._admin_panel_send_or_edit
-_admin_panel_send_upload_local_status = _admin_runtime._admin_panel_send_upload_local_status
 _admin_panel_send_missing_preview = _admin_runtime._admin_panel_send_missing_preview
 admin_panel_command = _admin_runtime.admin_panel_command
 handle_admin_panel_callback = _admin_runtime.handle_admin_panel_callback
@@ -5600,8 +5091,6 @@ es_dupes_command = _admin_runtime.es_dupes_command
 dupes_status_command = _admin_runtime.dupes_status_command
 handle_dupes_confirm_callback = _admin_runtime.handle_dupes_confirm_callback
 user_search_command = _admin_runtime.user_search_command
-_start_upload_local_books = _admin_runtime._start_upload_local_books
-upload_local_books_command = _admin_runtime.upload_local_books_command
 
 # Refresh search_flow again after admin runtime aliases (e.g. user_search_command).
 _search_flow.configure(_build_search_flow_deps())
@@ -5656,19 +5145,19 @@ def main():
         audio_channels_for_log = list(AUDIO_UPLOAD_CHANNEL_IDS or [])
         if not audio_channels_for_log and AUDIO_UPLOAD_CHANNEL_ID:
             audio_channels_for_log = [AUDIO_UPLOAD_CHANNEL_ID]
+        book_storage_channel = BOOK_STORAGE_CHANNEL_ID or 0
         logger.info(
-            "Upload channels: books=%s audio=%s video=%s",
-            ",".join(str(x) for x in (UPLOAD_CHANNEL_IDS or [])) or "none",
+            "Upload channels: audio=%s video=%s book_storage=%s",
             ",".join(str(x) for x in audio_channels_for_log) or "none",
             ",".join(str(x) for x in video_channels_for_log) or "none",
+            str(book_storage_channel) if book_storage_channel else "none",
         )
 
         logger.info(
-            "Ollama config: url=%s chat_model=%s tools_model=%s translator_backend=%s",
+            "Ollama config: url=%s pdf_maker_model=%s tts_model=%s",
             os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/"),
-            os.getenv("AI_CHAT_OLLAMA_MODEL", os.getenv("TTS_OLLAMA_MODEL", os.getenv("PDF_MAKER_OLLAMA_MODEL", "qwen2.5:7b"))),
-            os.getenv("AI_TOOLS_OLLAMA_MODEL", os.getenv("AI_CHAT_OLLAMA_MODEL", os.getenv("TTS_OLLAMA_MODEL", os.getenv("PDF_MAKER_OLLAMA_MODEL", "qwen2.5:7b")))),
-            os.getenv("AI_TRANSLATOR_BACKEND", "nllb"),
+            os.getenv("PDF_MAKER_OLLAMA_MODEL", "qwen2.5:7b"),
+            os.getenv("TTS_OLLAMA_MODEL", os.getenv("PDF_MAKER_OLLAMA_MODEL", "qwen2.5:7b")),
         )
 
         es_status = "down"
@@ -5724,13 +5213,15 @@ def main():
         # Register handlers
         _handler_registry.register_handlers(app, _build_handler_registry_deps())
 
-        sync_unindexed_books()
-
         logger.debug("Handlers registered. Starting polling...")
         print("Bot is running...")
         startup_retry_max = max(0, int(os.getenv("BOT_STARTUP_MAX_RETRIES", "0") or "0"))
         bootstrap_retries = -1 if startup_retry_max == 0 else startup_retry_max
         drop_pending_updates = _env_bool("DROP_PENDING_UPDATES", False)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
         app.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=drop_pending_updates,
