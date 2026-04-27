@@ -761,37 +761,21 @@ async def _pdf_editor_op_compress(update: Update, context: ContextTypes.DEFAULT_
         await _pdf_editor_target_message(update).reply_text(t["no_source"])
         return False
 
-    status = await _send_with_retry(lambda: _pdf_editor_target_message(update).reply_text(t["working"]))
-    try:
-        out_bytes = await run_blocking(_pdf_editor_compress_blocking, pdf_bytes)
-        base = _pdf_editor_sanitize_name(str(src.get("name") or "pdf"))
-        fname = f"{base}_compressed_{_pdf_editor_now_stamp()}.pdf"
-        sent = await _pdf_editor_send_pdf(update, out_bytes, fname, t["caption_pdf"])
-        if sent:
-            _pdf_editor_register_sent_pdf(session, sent, fname)
-            _pdf_editor_touch_session(session)
-            _pdf_editor_save_session(context, session)
-
-        before_mb = round(len(pdf_bytes) / (1024 * 1024), 2)
-        after_mb = round(len(out_bytes) / (1024 * 1024), 2)
-        msg = t["compress_report"].format(before_mb=before_mb, after_mb=after_mb)
-        if status:
-            try:
-                await status.edit_text(msg)
-            except Exception:
-                pass
-        else:
-            await _pdf_editor_target_message(update).reply_text(msg)
-        await _pdf_editor_send_actions(update, context, lang)
-        return bool(sent)
-    except Exception as e:
-        logger.warning("pdf editor compress failed: %s", e, exc_info=True)
-        if status:
-            try:
-                await status.edit_text(t["failed"])
-            except Exception:
-                pass
+    # Enqueue background job
+    user_id = _pdf_editor_target_message(update).chat_id
+    job_data = {
+        "operation": "compress",
+        "pdf_bytes": pdf_bytes,  # Store bytes since it's needed
+        "src_name": str(src.get("name") or "pdf"),
+        "lang": lang,
+    }
+    job_id = db_enqueue_background_job("pdf_editor", user_id, job_data)
+    if not job_id:
+        await _pdf_editor_target_message(update).reply_text(t["failed"])
         return False
+
+    await _pdf_editor_target_message(update).reply_text("✅ PDF compression queued! You'll receive the result soon.")
+    return True
 
 
 async def _pdf_editor_op_to_txt(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
@@ -804,29 +788,21 @@ async def _pdf_editor_op_to_txt(update: Update, context: ContextTypes.DEFAULT_TY
         await _pdf_editor_target_message(update).reply_text(t["no_source"])
         return False
 
-    status = await _send_with_retry(lambda: _pdf_editor_target_message(update).reply_text(t["working"]))
-    try:
-        text = await run_blocking(_pdf_editor_extract_text_blocking, pdf_bytes, lang, 500000)
-        if not text.strip():
-            raise RuntimeError("empty-text")
-        base = _pdf_editor_sanitize_name(str(src.get("name") or "pdf"))
-        fname = f"{base}_{_pdf_editor_now_stamp()}.txt"
-        sent = await _pdf_editor_send_text_file(update, text, fname, t["caption_txt"])
-        if status:
-            try:
-                await status.edit_text(t["done"])
-            except Exception:
-                pass
-        await _pdf_editor_send_actions(update, context, lang)
-        return bool(sent)
-    except Exception as e:
-        logger.warning("pdf editor to-txt failed: %s", e, exc_info=True)
-        if status:
-            try:
-                await status.edit_text(t["failed"])
-            except Exception:
-                pass
+    # Enqueue background job
+    user_id = _pdf_editor_target_message(update).chat_id
+    job_data = {
+        "operation": "to_txt",
+        "pdf_bytes": pdf_bytes,
+        "src_name": str(src.get("name") or "pdf"),
+        "lang": lang,
+    }
+    job_id = db_enqueue_background_job("pdf_editor", user_id, job_data)
+    if not job_id:
+        await _pdf_editor_target_message(update).reply_text(t["failed"])
         return False
+
+    await _pdf_editor_target_message(update).reply_text("✅ PDF to TXT conversion queued! You'll receive the result soon.")
+    return True
 
 
 async def _pdf_editor_op_to_epub(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
@@ -839,33 +815,21 @@ async def _pdf_editor_op_to_epub(update: Update, context: ContextTypes.DEFAULT_T
         await _pdf_editor_target_message(update).reply_text(t["no_source"])
         return False
 
-    status = await _send_with_retry(lambda: _pdf_editor_target_message(update).reply_text(t["working"]))
-    try:
-        text = await run_blocking(_pdf_editor_extract_text_blocking, pdf_bytes, lang, 500000)
-        if not text.strip():
-            raise RuntimeError("empty-text")
-        title = _pdf_editor_sanitize_name(str(src.get("name") or "book"), fallback="book")
-        epub_bytes = await run_blocking(_pdf_editor_build_epub_blocking, title, text, lang)
-        fname = f"{title}_{_pdf_editor_now_stamp()}.epub"
-        target = _pdf_editor_target_message(update)
-        bio = io.BytesIO(epub_bytes)
-        bio.name = fname
-        sent = await _send_with_retry(lambda: target.reply_document(document=bio, caption=t["caption_epub"]))
-        if status:
-            try:
-                await status.edit_text(t["done"])
-            except Exception:
-                pass
-        await _pdf_editor_send_actions(update, context, lang)
-        return bool(sent)
-    except Exception as e:
-        logger.warning("pdf editor to-epub failed: %s", e, exc_info=True)
-        if status:
-            try:
-                await status.edit_text(t["failed"])
-            except Exception:
-                pass
+    # Enqueue background job
+    user_id = _pdf_editor_target_message(update).chat_id
+    job_data = {
+        "operation": "to_epub",
+        "pdf_bytes": pdf_bytes,
+        "src_name": str(src.get("name") or "book"),
+        "lang": lang,
+    }
+    job_id = db_enqueue_background_job("pdf_editor", user_id, job_data)
+    if not job_id:
+        await _pdf_editor_target_message(update).reply_text(t["failed"])
         return False
+
+    await _pdf_editor_target_message(update).reply_text("✅ PDF to EPUB conversion queued! You'll receive the result soon.")
+    return True
 
 
 async def _pdf_editor_op_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
@@ -878,50 +842,21 @@ async def _pdf_editor_op_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await _pdf_editor_target_message(update).reply_text(t["no_source"])
         return False
 
-    status = await _send_with_retry(lambda: _pdf_editor_target_message(update).reply_text(t["working"]))
-    sent_any = False
+    # Enqueue background job
+    user_id = _pdf_editor_target_message(update).chat_id
+    job_data = {
+        "operation": "ocr",
+        "pdf_bytes": pdf_bytes,
+        "src_name": str(src.get("name") or "pdf"),
+        "lang": lang,
+    }
+    job_id = db_enqueue_background_job("pdf_editor", user_id, job_data)
+    if not job_id:
+        await _pdf_editor_target_message(update).reply_text(t["failed"])
+        return False
 
-    try:
-        ocr_pdf_bytes = await run_blocking(_pdf_editor_ocr_pdf_blocking, pdf_bytes, lang)
-    except Exception as e:
-        logger.info("pdf editor ocr searchable failed: %s", e)
-        ocr_pdf_bytes = None
-
-    try:
-        text = await run_blocking(_pdf_editor_extract_text_blocking, ocr_pdf_bytes or pdf_bytes, lang, 500000)
-    except Exception:
-        text = ""
-
-    base = _pdf_editor_sanitize_name(str(src.get("name") or "pdf"), fallback="pdf")
-
-    if ocr_pdf_bytes:
-        fname = f"{base}_ocr_{_pdf_editor_now_stamp()}.pdf"
-        sent_pdf = await _pdf_editor_send_pdf(update, ocr_pdf_bytes, fname, t["caption_pdf"])
-        if sent_pdf:
-            _pdf_editor_register_sent_pdf(session, sent_pdf, fname)
-            _pdf_editor_touch_session(session)
-            _pdf_editor_save_session(context, session)
-            sent_any = True
-
-    if text.strip():
-        txt_name = f"{base}_ocr_{_pdf_editor_now_stamp()}.txt"
-        sent_txt = await _pdf_editor_send_text_file(update, text, txt_name, t["caption_txt"])
-        sent_any = bool(sent_txt) or sent_any
-
-    if status:
-        try:
-            if sent_any:
-                await status.edit_text(t["done"] if ocr_pdf_bytes else t["ocr_text_only"])
-            elif not shutil.which("pdftoppm") and not shutil.which("ocrmypdf"):
-                await status.edit_text(t["ocr_tools_missing"])
-            else:
-                await status.edit_text(t["failed"])
-        except Exception:
-            pass
-
-    if sent_any:
-        await _pdf_editor_send_actions(update, context, lang)
-    return sent_any
+    await _pdf_editor_target_message(update).reply_text("✅ PDF OCR processing queued! You'll receive the result soon.")
+    return True
 
 
 async def _pdf_editor_op_watermark(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, watermark_text: str):

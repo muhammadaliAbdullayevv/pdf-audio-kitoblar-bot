@@ -9,6 +9,7 @@ from typing import Any
 
 from book_thumbnail import get_book_thumbnail_input
 from language import MESSAGES
+from telegram import InputFile
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
 try:
@@ -591,8 +592,32 @@ async def _save_uploaded_book_local(bot, book: dict[str, Any], file_id: str, fil
                 desc=f"download {book_id or file_id}",
             )
             if _UPLOAD_LOCAL_WATERMARK_PDF and _upload_local_is_pdf_path(target_path):
-                await _upload_local_watermark_pdf_in_place(tmp_path, _UPLOAD_LOCAL_WATERMARK_TEXT)
-                result["source_kind"] = "telegram-file-watermarked"
+                try:
+                    await _upload_local_watermark_pdf_in_place(tmp_path, _UPLOAD_LOCAL_WATERMARK_TEXT)
+                    result["source_kind"] = "telegram-file-watermarked"
+                except RuntimeError as e:
+                    if str(e).strip() == "encrypted-pdf":
+                        logger.warning(
+                            "Skipping watermark for encrypted PDF %s; continuing with local save and storage-channel refresh",
+                            book_id,
+                        )
+                        result["source_kind"] = "telegram-file-encrypted-no-watermark"
+                    else:
+                        logger.warning(
+                            "Skipping watermark for PDF %s due to watermark error %s; continuing with local save and storage-channel refresh",
+                            book_id,
+                            e,
+                            exc_info=True,
+                        )
+                        result["source_kind"] = "telegram-file-watermark-skipped"
+                except Exception as e:
+                    logger.warning(
+                        "Skipping watermark for PDF %s due to unexpected watermark error %s; continuing with local save and storage-channel refresh",
+                        book_id,
+                        e,
+                        exc_info=True,
+                    )
+                    result["source_kind"] = "telegram-file-watermark-skipped"
             else:
                 result["source_kind"] = "telegram-file"
             await asyncio.to_thread(tmp_path.replace, target_path)
@@ -658,7 +683,13 @@ async def _save_uploaded_book_local(bot, book: dict[str, Any], file_id: str, fil
         return result
 
 
-async def _refresh_uploaded_book_file_id(bot, book_id: str, local_path: str) -> dict[str, Any]:
+async def _refresh_uploaded_book_file_id(
+    bot,
+    book_id: str,
+    local_path: str,
+    telegram_filename: str | None = None,
+    use_thumbnail: bool = True,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "file_id": None,
         "file_unique_id": None,
@@ -679,15 +710,30 @@ async def _refresh_uploaded_book_file_id(bot, book_id: str, local_path: str) -> 
         return result
 
     try:
-        sent = await _upload_local_retry(
-            lambda: bot.send_document(
-                chat_id=storage_channel_id,
-                document=str(local_path),
-                thumbnail=get_book_thumbnail_input(),
-                disable_notification=True,
-            ),
-            desc=f"refresh file_id {book_id}",
-        )
+        if telegram_filename:
+            async def _send_named_document():
+                with open(local_path, "rb") as fh:
+                    return await bot.send_document(
+                        chat_id=storage_channel_id,
+                        document=InputFile(fh, filename=str(telegram_filename)),
+                        thumbnail=get_book_thumbnail_input() if use_thumbnail else None,
+                        disable_notification=True,
+                    )
+
+            sent = await _upload_local_retry(
+                _send_named_document,
+                desc=f"refresh file_id {book_id}",
+            )
+        else:
+            sent = await _upload_local_retry(
+                lambda: bot.send_document(
+                    chat_id=storage_channel_id,
+                    document=str(local_path),
+                    thumbnail=get_book_thumbnail_input() if use_thumbnail else None,
+                    disable_notification=True,
+                ),
+                desc=f"refresh file_id {book_id}",
+            )
         document = getattr(sent, "document", None)
         file_id = str(getattr(document, "file_id", "") or "").strip()
         if not file_id:
@@ -1295,15 +1341,6 @@ async def _process_upload(
                 except Exception:
                     logger.exception("Failed to update upload receipt for ES unavailable")
 
-        # Notify users who requested this book
-        if not skip_request_notify:
-            async def _notify_request_matches_safe():
-                try:
-                    await notify_request_matches(context.bot, new_book)
-                except Exception as e:
-                    logger.error("Request notify failed for book %s: %s", new_book.get("id"), e)
-
-            context.application.create_task(_notify_request_matches_safe())
     except Exception as e:
         logger.error(f"process upload failed: {e}", exc_info=True)
         if receipt_id:

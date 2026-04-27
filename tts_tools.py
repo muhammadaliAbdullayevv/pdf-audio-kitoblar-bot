@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import asyncio
 import hashlib
 import io
@@ -11,15 +12,27 @@ import shutil
 import subprocess
 import tempfile
 import time
+import zipfile
 import urllib.request
 from collections import OrderedDict
 from threading import Lock
 from typing import Any
+from xml.etree import ElementTree as ET
 
 import safe_subprocess
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    import pdf_editor as _pdf_editor
+except Exception:
+    _pdf_editor = None
 
 MESSAGES: dict[str, dict[str, str]] = {}
 logger = logging.getLogger(__name__)
@@ -65,7 +78,7 @@ def _tts_texts(lang: str) -> dict[str, str]:
                 "🤖 AI tozalash: {ai_label}\n\n"
                 "Sozlang va `Davom etish` ni bosing."
             ),
-            "prompt_text": "📝 Endi matn yuboring.\nQo‘shimcha matn yuborishingiz mumkin.\nBekor qilish: cancel",
+            "prompt_text": "📝 Endi matn yoki kitob fayli yuboring.\nPDF / EPUB / TXT / DOCX yuborishingiz mumkin.\nBekor qilish: cancel",
             "confirm": "✅ Matn qabul qilindi.\n🧾 Belgilar: {chars}\n📄 Qatorlar: {lines}\n\nYana matn yuborsangiz qo‘shiladi. Tayyor bo‘lsa `Ovoz yaratish` ni bosing.",
             "added": "Qo‘shimcha matn qo‘shildi.",
             "working": "🎙️ Ovoz tayyorlanmoqda...",
@@ -75,6 +88,8 @@ def _tts_texts(lang: str) -> dict[str, str]:
             "expired": "Sessiya tugadi. Pastdagi menyudan Text to Voice bo‘limini qayta tanlang.",
             "empty": "Iltimos, matn yuboring.",
             "too_long": "Matn juda uzun. Iltimos, qisqaroq yuboring (taxminan 50000 belgi).",
+            "book_unsupported": "⚠️ Bu kitob faylini o‘qiy olmadim. PDF / EPUB / TXT / DOCX yuboring yoki matn yozing.",
+            "book_empty": "⚠️ Bu kitobdan o‘qiladigan matn topilmadi.",
             "tools_missing": "Natural TTS uchun `ffmpeg` va kamida bitta backend kerak (`edge-tts` yoki `espeak-ng`).",
             "provider_failed": "⚠️ Ovoz generatoriga ulanib bo‘lmadi. Keyinroq qayta urinib ko‘ring.",
             "audio_failed": "⚠️ Ovoz faylini tayyorlab bo‘lmadi. Formatni almashtirib yoki qisqaroq matn bilan urinib ko‘ring.",
@@ -129,7 +144,7 @@ def _tts_texts(lang: str) -> dict[str, str]:
                 "🤖 AI очистка: {ai_label}\n\n"
                 "Настройте и нажмите `Продолжить`."
             ),
-            "prompt_text": "📝 Теперь отправьте текст.\nМожно отправить несколько частей.\nОтмена: cancel",
+            "prompt_text": "📝 Теперь отправьте текст или файл книги.\nМожно PDF / EPUB / TXT / DOCX.\nОтмена: cancel",
             "confirm": "✅ Текст получен.\n🧾 Символы: {chars}\n📄 Строки: {lines}\n\nОтправьте ещё текст для добавления или нажмите `Создать голос`.",
             "added": "Дополнительный текст добавлен.",
             "working": "🎙️ Создаю голос...",
@@ -139,6 +154,8 @@ def _tts_texts(lang: str) -> dict[str, str]:
             "expired": "Сессия истекла. Снова выберите Text to Voice в меню ниже.",
             "empty": "Пожалуйста, отправьте текст.",
             "too_long": "Текст слишком длинный. Отправьте короче (примерно до 50000 символов).",
+            "book_unsupported": "⚠️ Не удалось прочитать этот файл книги. Отправьте PDF / EPUB / TXT / DOCX или просто текст.",
+            "book_empty": "⚠️ В этой книге не найдено читаемого текста.",
             "tools_missing": "Для natural TTS нужен `ffmpeg` и хотя бы один backend (`edge-tts` или `espeak-ng`).",
             "provider_failed": "⚠️ Не удалось связаться с TTS backend. Попробуйте позже.",
             "audio_failed": "⚠️ Не удалось подготовить аудиофайл. Попробуйте другой формат или более короткий текст.",
@@ -192,7 +209,7 @@ def _tts_texts(lang: str) -> dict[str, str]:
             "🤖 AI cleanup: {ai_label}\n\n"
             "Adjust settings and tap `Continue`."
         ),
-        "prompt_text": "📝 Now send text.\nYou can send multiple parts.\nCancel: cancel",
+        "prompt_text": "📝 Now send text or a book file.\nYou can send PDF / EPUB / TXT / DOCX.\nCancel: cancel",
         "confirm": "✅ Text received.\n🧾 Characters: {chars}\n📄 Lines: {lines}\n\nSend more text to append, or tap `Generate Voice`.",
         "added": "Added another text part.",
         "working": "🎙️ Generating voice...",
@@ -202,6 +219,8 @@ def _tts_texts(lang: str) -> dict[str, str]:
         "expired": "Session expired. Please choose Text to Voice again from the menu below.",
         "empty": "Please send text.",
         "too_long": "Text is too long. Please send a shorter text (about 50,000 chars max).",
+        "book_unsupported": "⚠️ I couldn't read this book file. Send PDF / EPUB / TXT / DOCX, or just type text.",
+        "book_empty": "⚠️ I couldn't find readable text in this book.",
         "tools_missing": "Natural TTS requires `ffmpeg` and at least one backend (`edge-tts` or `espeak-ng`).",
         "provider_failed": "⚠️ The TTS backend is unavailable right now. Please try again later.",
         "audio_failed": "⚠️ Audio post-processing failed. Try another format or a shorter text.",
@@ -381,6 +400,140 @@ def _tts_normalize_text(text: str) -> str:
     normalized = re.sub(r"[ \t]+", " ", normalized)
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return normalized.strip()
+
+
+def _tts_book_max_input_chars() -> int:
+    try:
+        return max(8000, min(500000, int(os.getenv("TTS_BOOK_MAX_INPUT_CHARS", "250000") or "250000")))
+    except Exception:
+        return 250000
+
+
+def _tts_detect_book_document_kind(file_name: str | None, mime_type: str | None) -> str | None:
+    name = str(file_name or "").strip().lower()
+    mime = str(mime_type or "").strip().lower()
+    if name.endswith(".pdf") or mime == "application/pdf":
+        return "pdf"
+    if name.endswith(".epub") or mime in {"application/epub+zip", "application/x-epub+zip"}:
+        return "epub"
+    if name.endswith(".docx") or mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        return "docx"
+    if name.endswith((".txt", ".md", ".markdown")) or mime in {"text/plain", "text/markdown"}:
+        return "txt"
+    return None
+
+
+def _tts_extract_docx_text_blocking(data: bytes, *, max_chars: int) -> str:
+    if not data:
+        return ""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = [n for n in zf.namelist() if n.lower().startswith("word/") and n.lower().endswith(".xml")]
+            # Prefer the main document, then headers/footers if present.
+            names.sort(key=lambda n: (0 if n.lower() == "word/document.xml" else 1, n.lower()))
+            parts: list[str] = []
+            for name in names:
+                try:
+                    raw = zf.read(name)
+                except Exception:
+                    continue
+                try:
+                    root = ET.fromstring(raw)
+                except Exception:
+                    continue
+                texts = [str(node.text or "") for node in root.iter() if str(node.tag).endswith("}t") and str(node.text or "").strip()]
+                chunk = _tts_normalize_text(" ".join(texts))
+                if chunk:
+                    parts.append(chunk)
+                if sum(len(p) for p in parts) >= max_chars:
+                    break
+            return _tts_normalize_text("\n\n".join(parts))[:max_chars]
+    except Exception as e:
+        raise RuntimeError(f"docx-extract-failed: {e}") from e
+
+
+def _tts_extract_epub_text_blocking(data: bytes, *, max_chars: int) -> str:
+    if not data:
+        return ""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = []
+            for name in zf.namelist():
+                low = name.lower()
+                if low.startswith("meta-inf/"):
+                    continue
+                if low.endswith((".xhtml", ".html", ".htm")):
+                    names.append(name)
+            names.sort(key=lambda n: n.lower())
+            parts: list[str] = []
+            for name in names:
+                try:
+                    raw = zf.read(name)
+                except Exception:
+                    continue
+                text = raw.decode("utf-8", errors="ignore")
+                text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+                text = re.sub(r"(?s)<[^>]+>", " ", text)
+                text = html.unescape(text)
+                chunk = _tts_normalize_text(text)
+                if chunk:
+                    parts.append(chunk)
+                if sum(len(p) for p in parts) >= max_chars:
+                    break
+            return _tts_normalize_text("\n\n".join(parts))[:max_chars]
+    except Exception as e:
+        raise RuntimeError(f"epub-extract-failed: {e}") from e
+
+
+def _tts_extract_book_text_blocking(data: bytes, *, file_name: str | None, mime_type: str | None, lang: str, max_chars: int) -> str:
+    kind = _tts_detect_book_document_kind(file_name, mime_type)
+    if kind == "pdf":
+        if _pdf_editor is not None and callable(getattr(_pdf_editor, "_pdf_editor_extract_text_blocking", None)):
+            try:
+                return _tts_normalize_text(_pdf_editor._pdf_editor_extract_text_blocking(data, lang, max_chars))
+            except Exception as e:
+                logger.info("TTS PDF text extraction via pdf_editor failed, falling back to pypdf: %s", e)
+        if PdfReader is None:
+            raise RuntimeError("pypdf-missing")
+        try:
+            reader = PdfReader(io.BytesIO(data))
+            try:
+                if getattr(reader, "is_encrypted", False):
+                    try:
+                        reader.decrypt("")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            parts: list[str] = []
+            for page in getattr(reader, "pages", []) or []:
+                try:
+                    txt = page.extract_text() or ""
+                except Exception:
+                    txt = ""
+                if txt:
+                    parts.append(txt)
+                if sum(len(p) for p in parts) >= max_chars:
+                    break
+            return _tts_normalize_text("\n\n".join(parts))[:max_chars]
+        except Exception as e:
+            raise RuntimeError(f"pdf-extract-failed: {e}") from e
+    if kind == "epub":
+        return _tts_extract_epub_text_blocking(data, max_chars=max_chars)
+    if kind == "docx":
+        return _tts_extract_docx_text_blocking(data, max_chars=max_chars)
+    if kind == "txt":
+        text = ""
+        for enc in ("utf-8-sig", "utf-8", "cp1251", "latin-1"):
+            try:
+                text = data.decode(enc)
+                break
+            except Exception:
+                continue
+        if not text:
+            raise RuntimeError("text-decode-failed")
+        return _tts_normalize_text(text)[:max_chars]
+    return ""
 
 
 def _tts_split_text_by_limit(text: str, max_chars: int) -> list[str]:
@@ -1287,10 +1440,12 @@ def _tts_build_audio_bytes_blocking(text: str, opts: dict) -> tuple[bytes, dict[
     speed_key = str(opts.get("speed") or "normal")
     output_key = str(opts.get("output") or "voice")
     use_ai = bool(opts.get("ai"))
+    source_kind = str(opts.get("source") or "text").strip().lower() or "text"
     effective_text = _tts_normalize_text(text)
     if not effective_text:
         raise _TTSBuildError("tts_failed", "empty text")
-    if len(effective_text) > _tts_max_input_chars():
+    max_input_chars = _tts_book_max_input_chars() if source_kind == "book" else _tts_max_input_chars()
+    if len(effective_text) > max_input_chars:
         raise _TTSBuildError("too_long", f"text length {len(effective_text)} exceeds limit")
 
     cache_key = _tts_cache_key(effective_text, opts)
@@ -1348,7 +1503,9 @@ async def _tts_generate_and_send(update: Update, context: ContextTypes.DEFAULT_T
     if not clean:
         await target_message.reply_text(msgs["empty"])
         return False
-    if len(clean) > _tts_max_input_chars():
+    source_kind = str(opts.get("source") or "text").strip().lower() or "text"
+    max_input_chars = _tts_book_max_input_chars() if source_kind == "book" else _tts_max_input_chars()
+    if len(clean) > max_input_chars:
         await target_message.reply_text(msgs["too_long"])
         return False
     lang_key = str(opts.get("lang") or "auto")
@@ -1356,32 +1513,22 @@ async def _tts_generate_and_send(update: Update, context: ContextTypes.DEFAULT_T
         lang_key = _tts_guess_lang_key(clean, lang_ui)
     opts = dict(opts)
     opts["lang"] = lang_key
-    status = await _send_with_retry(lambda: target_message.reply_text(msgs["working"]))
-    try:
-        audio_bytes, meta = await run_blocking(_tts_build_audio_bytes_blocking, clean, opts)
-    except Exception as e:
-        logger.error("text_to_voice generation failed: %s", e, exc_info=True)
-        fail_text = _tts_error_message(e, lang_ui)
-        if status:
-            try:
-                await status.edit_text(fail_text)
-            except Exception:
-                pass
-        else:
-            await target_message.reply_text(fail_text)
+
+    # Enqueue background job instead of processing synchronously
+    user_id = target_message.chat_id
+    job_data = {
+        "text": clean,
+        "opts": opts,
+        "lang_ui": lang_ui,
+    }
+    job_id = db_enqueue_background_job("tts_generate", user_id, job_data)
+    if not job_id:
+        await target_message.reply_text(msgs["tools_missing"])
         return False
-    caption = msgs["caption"]
-    if bool(meta.get("ai_used")):
-        caption += f"\n🤖 {msgs['ai_note']}"
-    if int(meta.get("chunk_count") or 1) > 1:
-        caption += f"\n{msgs['chunking_note']}"
-    sent = await _tts_send_result(update, audio_bytes, str(opts.get("output") or "voice"), caption)
-    if status:
-        try:
-            await status.edit_text(msgs["done"] if sent else MESSAGES[lang_ui]["error"])
-        except Exception:
-            pass
-    return sent is not None
+
+    # Send queued confirmation
+    await target_message.reply_text("✅ Audio generation queued! You'll receive the file soon.")
+    return True
 
 
 async def _tts_handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_ui: str) -> bool:
@@ -1408,6 +1555,7 @@ async def _tts_handle_text_input(update: Update, context: ContextTypes.DEFAULT_T
         return True
     if phase == "awaiting_text":
         session["text_buffer"] = txt
+        session["input_source"] = "text"
         if len(str(session["text_buffer"])) > _tts_max_input_chars():
             session["text_buffer"] = ""
             _tts_save_session(context, session)
@@ -1428,6 +1576,7 @@ async def _tts_handle_text_input(update: Update, context: ContextTypes.DEFAULT_T
     if phase == "awaiting_confirm":
         cur = str(session.get("text_buffer") or "")
         session["text_buffer"] = f"{cur}\n{txt}".strip() if cur else txt
+        session["input_source"] = "text"
         if len(str(session["text_buffer"])) > _tts_max_input_chars():
             session["text_buffer"] = cur
             _tts_save_session(context, session)
@@ -1445,6 +1594,94 @@ async def _tts_handle_text_input(update: Update, context: ContextTypes.DEFAULT_T
         )
         return True
     return False
+
+
+async def _tts_handle_media_input(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_ui: str) -> bool:
+    if not update.message:
+        return False
+    session = _tts_get_session(context)
+    if not session:
+        return False
+    msgs = _tts_texts(lang_ui)
+    if time.time() > float(session.get("expires_at", 0) or 0):
+        _tts_clear_session(context)
+        await update.message.reply_text(msgs["expired"])
+        return True
+    if update.effective_user and session.get("user_id") and int(session["user_id"]) != int(update.effective_user.id):
+        return False
+
+    doc = getattr(update.message, "document", None)
+    if not doc:
+        return False
+
+    file_name = getattr(doc, "file_name", None)
+    mime_type = str(getattr(doc, "mime_type", "") or "")
+    kind = _tts_detect_book_document_kind(file_name, mime_type)
+    if not kind:
+        await update.message.reply_text(msgs["book_unsupported"])
+        return True
+
+    phase = str(session.get("phase") or "")
+    if phase not in {"awaiting_text", "awaiting_confirm"}:
+        await update.message.reply_text(msgs["use_buttons_hint"])
+        return True
+
+    try:
+        file_obj = await context.bot.get_file(doc.file_id)
+        file_bytes = bytes(await file_obj.download_as_bytearray())
+    except Exception as e:
+        logger.warning("TTS book download failed: %s", e, exc_info=True)
+        await update.message.reply_text(msgs["book_unsupported"])
+        return True
+
+    try:
+        effective_lang = str(session.get("lang") or lang_ui or "en").strip() or "en"
+        if effective_lang == "auto":
+            effective_lang = str(lang_ui or "en")
+        extracted = await run_blocking(
+            _tts_extract_book_text_blocking,
+            file_bytes,
+            file_name=file_name,
+            mime_type=mime_type,
+            lang=effective_lang,
+            max_chars=_tts_book_max_input_chars(),
+        )
+    except Exception as e:
+        logger.warning("TTS book text extraction failed: %s", e, exc_info=True)
+        await update.message.reply_text(msgs["book_unsupported"])
+        return True
+
+    extracted = _tts_normalize_text(extracted)
+    if not extracted:
+        await update.message.reply_text(msgs["book_empty"])
+        return True
+
+    if phase == "awaiting_text":
+        session["text_buffer"] = extracted
+    else:
+        cur = str(session.get("text_buffer") or "")
+        session["text_buffer"] = f"{cur}\n{extracted}".strip() if cur else extracted
+
+    if len(str(session.get("text_buffer") or "")) > _tts_book_max_input_chars():
+        # Keep the flow alive, but do not allow unbounded book imports.
+        session["text_buffer"] = str(session.get("text_buffer") or "")[: _tts_book_max_input_chars()]
+        _tts_save_session(context, session)
+        await update.message.reply_text(msgs["too_long"])
+        return True
+
+    session["input_source"] = "book"
+    session["phase"] = "awaiting_confirm"
+    session["expires_at"] = time.time() + 1800
+    _tts_save_session(context, session)
+    await _tts_edit_or_send_prompt(
+        update,
+        context,
+        session,
+        msgs["confirm"].format(**_tts_text_stats(session["text_buffer"])),
+        reply_markup=_tts_confirm_keyboard(lang_ui),
+        prefer_edit=False,
+    )
+    return True
 
 
 async def text_to_voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1475,6 +1712,7 @@ async def _tts_start_session_from_message(target_message, update: Update, contex
         "speed": "normal",
         "output": "voice",
         "ai": False,
+        "input_source": "text",
         "expires_at": time.time() + 1800,
     }
     _tts_save_session(context, session)
@@ -1647,10 +1885,11 @@ async def handle_tts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             "lang": session.get("lang"),
             "sex": session.get("sex"),
             "tone": session.get("tone"),
-            "speed": session.get("speed"),
-            "output": session.get("output"),
-            "ai": bool(session.get("ai")),
-        }
+        "speed": session.get("speed"),
+        "output": session.get("output"),
+        "ai": bool(session.get("ai")),
+        "source": str(session.get("input_source") or "text"),
+    }
         await safe_answer(query, msgs["generating_short"])
         sent_ok = await _tts_generate_and_send(update, context, lang_ui, final_text, opts)
         if sent_ok:

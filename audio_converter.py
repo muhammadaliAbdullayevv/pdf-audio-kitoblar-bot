@@ -932,14 +932,20 @@ async def _audio_conv_handle_text_input(update: Update, context: ContextTypes.DE
         _audio_conv_save_session(context, session)
 
         out_mode = "mp3" if phase == "awaiting_cut_mp3" else "voice"
-        await _audio_conv_process_and_send(
-            update,
-            context,
-            lang=lang,
-            output_mode=out_mode,
-            start_s=start_s,
-            end_s=end_s,
-        )
+        # Enqueue background job
+        user_id = update.effective_user.id if update.effective_user else 0
+        job_data = {
+            "session": session,
+            "output_mode": out_mode,
+            "start_s": start_s,
+            "end_s": end_s,
+            "lang": lang,
+        }
+        job_id = db_enqueue_background_job("audio_convert", user_id, job_data)
+        if not job_id:
+            await update.message.reply_text(t["failed"])
+            return True
+        await update.message.reply_text("✅ Audio cutting queued! You'll receive the file soon.")
         return True
 
     if phase == "awaiting_cover":
@@ -1039,7 +1045,18 @@ async def handle_audio_converter_callback(update: Update, context: ContextTypes.
             await safe_answer(query, t["already_mp3"], show_alert=True)
             return
         await safe_answer(query)
-        await _audio_conv_process_and_send(update, context, lang=lang, output_mode="mp3")
+        # Enqueue background job
+        user_id = query.from_user.id if query.from_user else 0
+        job_data = {
+            "session": session,
+            "output_mode": "mp3",
+            "lang": lang,
+        }
+        job_id = db_enqueue_background_job("audio_convert", user_id, job_data)
+        if not job_id:
+            await _send_with_retry(lambda: query.message.reply_text(t["failed"]))
+            return
+        await _send_with_retry(lambda: query.message.reply_text("✅ Audio conversion to MP3 queued! You'll receive the file soon."))
         return
 
     if action == "atool:to_voice":
@@ -1047,7 +1064,18 @@ async def handle_audio_converter_callback(update: Update, context: ContextTypes.
             await safe_answer(query, t["already_voice"], show_alert=True)
             return
         await safe_answer(query)
-        await _audio_conv_process_and_send(update, context, lang=lang, output_mode="voice")
+        # Enqueue background job
+        user_id = query.from_user.id if query.from_user else 0
+        job_data = {
+            "session": session,
+            "output_mode": "voice",
+            "lang": lang,
+        }
+        job_id = db_enqueue_background_job("audio_convert", user_id, job_data)
+        if not job_id:
+            await _send_with_retry(lambda: query.message.reply_text(t["failed"]))
+            return
+        await _send_with_retry(lambda: query.message.reply_text("✅ Audio conversion to Voice queued! You'll receive the file soon."))
         return
 
     if action == "atool:cut_mp3":

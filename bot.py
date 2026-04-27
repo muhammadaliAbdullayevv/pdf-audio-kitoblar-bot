@@ -6,12 +6,14 @@ import re
 import traceback
 import tempfile
 import io
+import shutil
 import time
 import math
 import asyncio
 import fcntl
 import atexit
 import html
+from pathlib import Path
 from urllib.parse import quote_plus
 from logging.handlers import RotatingFileHandler
 from functools import partial
@@ -34,6 +36,7 @@ from book_thumbnail import get_book_thumbnail_input
 from urllib3.exceptions import InsecureRequestWarning
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -93,6 +96,7 @@ from db import (
     set_user_allowed,
     set_user_audio_allowed,
     set_user_delete_allowed,
+    set_user_rename_allowed,
     set_user_stopped,
     set_user_blocked,
     add_user_coin_adjustment as db_add_user_coin_adjustment,
@@ -147,6 +151,7 @@ from db import (
     get_book_storage_counts as db_get_book_storage_counts,
     get_audio_book_stats as db_get_audio_book_stats,
     get_storage_stats as db_get_storage_stats,
+    get_book_local_download_job_status_counts as db_get_book_local_download_job_status_counts,
     increment_book_download as db_increment_book_download,
     increment_book_searches as db_increment_book_searches,
     set_book_reaction as db_set_book_reaction,
@@ -157,6 +162,7 @@ from db import (
     bulk_upsert_books,
     update_book_file_id,
     update_book_indexed,
+    update_book_rename_meta as db_update_book_rename_meta,
     update_book_path as db_update_book_path,
     update_book_by_path,
     enqueue_book_local_download_job as db_enqueue_book_local_download_job,
@@ -194,12 +200,23 @@ from db import (
     insert_upload_receipt as db_insert_upload_receipt,
     update_upload_receipt as db_update_upload_receipt,
     update_book_upload_meta as db_update_book_upload_meta,
+    enqueue_background_job as db_enqueue_background_job,
+    claim_background_job as db_claim_background_job,
+    complete_background_job as db_complete_background_job,
+    retry_background_job as db_retry_background_job,
+    fail_background_job as db_fail_background_job,
+    get_background_job_status_counts as db_get_background_job_status_counts,
     upsert_book_summary as db_upsert_book_summary,
     search_users_by_name as db_search_users_by_name,
     is_user_delete_allowed as db_is_user_delete_allowed,
     is_user_audio_allowed as db_is_user_audio_allowed,
+    is_user_rename_allowed as db_is_user_rename_allowed,
     is_user_stopped as db_is_user_stopped,
     set_user_referrer as db_set_user_referrer,
+    upsert_group_private_start_prompt as db_upsert_group_private_start_prompt,
+    get_group_private_start_prompt_by_token as db_get_group_private_start_prompt_by_token,
+    get_latest_pending_group_private_start_prompt as db_get_latest_pending_group_private_start_prompt,
+    set_group_private_start_prompt_status as db_set_group_private_start_prompt_status,
 )
 from elasticsearch import Elasticsearch, NotFoundError
 
@@ -222,7 +239,6 @@ from admin_tools import (
 
 import audio_converter as _audio_converter
 import sticker_tools as _sticker_tools
-import video_downloader as _video_downloader
 import search_flow as _search_flow
 import tts_tools as _tts_tools
 
@@ -240,6 +256,7 @@ _BRIDGE_DB_SYMBOLS = (
     update_user_left_date,
     set_user_allowed,
     set_user_delete_allowed,
+    set_user_rename_allowed,
     set_user_stopped,
     set_user_blocked,
     db_add_user_coin_adjustment,
@@ -303,12 +320,14 @@ _BRIDGE_DB_SYMBOLS = (
     update_book_file_id,
     update_book_indexed,
     db_update_book_path,
+    db_update_book_rename_meta,
     update_book_by_path,
     db_enqueue_book_local_download_job,
     db_claim_book_local_download_job,
     db_complete_book_local_download_job,
     db_retry_book_local_download_job,
     db_fail_book_local_download_job,
+    db_get_book_local_download_job_status_counts,
     get_audio_book_for_book,
     get_audio_book_by_id,
     list_audio_book_parts,
@@ -339,6 +358,12 @@ _BRIDGE_DB_SYMBOLS = (
     db_insert_upload_receipt,
     db_update_upload_receipt,
     db_update_book_upload_meta,
+    db_enqueue_background_job,
+    db_claim_background_job,
+    db_complete_background_job,
+    db_retry_background_job,
+    db_fail_background_job,
+    db_get_background_job_status_counts,
     db_upsert_book_summary,
     db_search_users_by_name,
     db_is_user_delete_allowed,
@@ -350,6 +375,7 @@ _BRIDGE_DB_SYMBOLS = (
 _SEARCH_FLOW_DEP_KEYS = (
     "MESSAGES",
     "AUDIT_CACHE_TTL",
+    "BOOK_STORAGE_CHANNEL_ID",
     "AUDIO_UPLOAD_CHANNEL_IDS",
     "AUDIO_UPLOAD_CHANNEL_ID",
     "ApplicationHandlerStop",
@@ -383,23 +409,29 @@ _SEARCH_FLOW_DEP_KEYS = (
     "broadcast",
     "build_book_caption",
     "build_book_keyboard",
-    "build_request_admin_keyboard",
     "build_upload_admin_keyboard",
-    "cache_request",
     "can_delete_books",
+    "apply_book_rename",
     "count_pending_audiobook_requests",
+    "is_allowed",
+    "can_rename_books",
     "db_add_user_coin_adjustment",
     "db_get_book_by_id",
     "db_get_book_stats",
     "db_get_user_reaction",
-    "db_list_requests",
     "db_increment_book_download",
     "db_increment_book_searches",
     "db_increment_counter",
     "db_insert_book",
+    "db_list_requests",
+    "db_enqueue_book_local_download_job",
+    "db_claim_book_local_download_job",
+    "db_complete_book_local_download_job",
+    "db_retry_book_local_download_job",
+    "db_fail_book_local_download_job",
+    "db_get_book_local_download_job_status_counts",
     "ensure_user_language",
     "es_available",
-    "format_request_admin_text",
     "format_upload_request_admin_text",
     "format_user_name",
     "format_user_tag",
@@ -415,10 +447,12 @@ _SEARCH_FLOW_DEP_KEYS = (
     "is_blocked",
     "is_favorited",
     "is_audio_allowed",
+    "is_allowed",
+    "is_user_rename_allowed",
     "is_stopped_user",
+    "load_books",
     "load_requests",
     "mark_request_fulfilled",
-    "load_books",
     "normalize",
     "rate_limited",
     "run_blocking",
@@ -433,8 +467,8 @@ _SEARCH_FLOW_DEP_KEYS = (
     "spam_check_callback",
     "spam_check_message",
     "suggest_books",
-    "update_book_file_id",
     "update_request_status",
+    "update_book_file_id",
     "update_upload_request_status",
     "update_user_info",
     "user_search_command",
@@ -445,20 +479,15 @@ _USER_INTERACTIONS_DEP_KEYS = (
     "InlineKeyboardButton",
     "InlineKeyboardMarkup",
     "MESSAGES",
-    "REQUESTS_PAGE_SIZE",
     "_build_help_text",
     "_is_admin_user",
     "build_results_keyboard",
     "build_results_text",
     "cache_search_results",
     "build_referral_link",
-    "build_request_admin_keyboard",
-    "build_requests_keyboard",
     "build_simple_book_keyboard",
     "compute_coin_breakdown",
-    "db_delete_request",
     "db_increment_book_searches",
-    "db_get_request_by_id",
     "db_get_random_books",
     "db_get_random_book",
     "db_get_user_coin_adjustment",
@@ -471,19 +500,24 @@ _USER_INTERACTIONS_DEP_KEYS = (
     "db_increment_counter",
     "db_list_favorites",
     "db_list_requests_for_user",
+    "db_get_request_by_id",
+    "db_delete_request",
     "ensure_user_language",
-    "format_request_admin_text",
-    "get_request_by_id",
     "get_result_title",
+    "get_request_by_id",
     "get_upload_request_by_id",
     "is_blocked",
     "is_stopped_user",
     "math",
     "quote_plus",
-    "refresh_requests_list",
+    "REQUESTS_PAGE_SIZE",
     "run_blocking",
     "safe_answer",
     "send_request_to_admin",
+    "build_request_admin_keyboard",
+    "format_request_admin_text",
+    "build_requests_keyboard",
+    "refresh_requests_list",
     "send_upload_request_to_admin",
     "spam_check_callback",
     "spam_check_message",
@@ -579,6 +613,7 @@ _ENGAGEMENT_OPTIONAL_DEP_KEYS = (
     "cache_set",
     "cache_top_results",
     "can_delete_books",
+    "can_rename_books",
     "count_pending_audiobook_requests",
     "db_award_favorite_action",
     "db_award_reaction_action",
@@ -613,6 +648,7 @@ _ENGAGEMENT_OPTIONAL_DEP_KEYS = (
     "set_user_audio_allowed",
     "set_user_blocked",
     "set_user_delete_allowed",
+    "set_user_rename_allowed",
     "set_user_stopped",
     "socket",
     "spam_check_message",
@@ -673,18 +709,6 @@ _TTS_REQUIRED_DEP_KEYS = (
     "update_user_info",
 )
 
-_VIDEO_DOWNLOADER_REQUIRED_DEP_KEYS = (
-    "MESSAGES",
-    "_main_menu_keyboard",
-    "_send_with_retry",
-    "db_get_counters",
-    "db_increment_counter",
-    "ensure_user_language",
-    "run_blocking",
-    "safe_answer",
-    "spam_check_callback",
-)
-
 _AUDIO_CONVERTER_REQUIRED_DEP_KEYS = (
     "MESSAGES",
     "_main_menu_keyboard",
@@ -699,10 +723,12 @@ _STICKER_TOOLS_REQUIRED_DEP_KEYS = (
     "MESSAGES",
     "_main_menu_keyboard",
     "_send_with_retry",
+    "db_enqueue_background_job",
     "ensure_user_language",
     "is_blocked",
     "is_stopped_user",
     "run_blocking",
+    "run_blocking_heavy",
     "safe_answer",
     "spam_check_callback",
     "spam_check_message",
@@ -813,14 +839,6 @@ def _build_tts_tools_deps() -> dict[str, object]:
     return _build_bridge_deps(_TTS_REQUIRED_DEP_KEYS, (), "tts_tools")
 
 
-def _build_video_downloader_deps() -> dict[str, object]:
-    return _build_bridge_deps(
-        _VIDEO_DOWNLOADER_REQUIRED_DEP_KEYS,
-        (),
-        "video_downloader",
-    )
-
-
 def _build_audio_converter_deps() -> dict[str, object]:
     return _build_bridge_deps(
         _AUDIO_CONVERTER_REQUIRED_DEP_KEYS,
@@ -872,6 +890,16 @@ async def admin_only_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not user_id or not _is_admin_user(user_id):
         lang = ensure_user_language(update, context)
         await safe_reply(update, MESSAGES[lang]["admin_only"])
+        return
+    await command_func(update, context)
+
+
+async def owner_only_command(update: Update, context: ContextTypes.DEFAULT_TYPE, command_func):
+    """Wrapper for owner-only commands."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if not user_id or not _is_owner_user(user_id):
+        lang = ensure_user_language(update, context)
+        await safe_reply(update, MESSAGES[lang].get("owner_only", MESSAGES[lang]["admin_only"]))
         return
     await command_func(update, context)
 
@@ -1062,6 +1090,27 @@ def _safe_filename(name: str, default: str = "book") -> str:
     return name[:120] if name else default
 
 
+def _telegram_safe_filename_title(name: str) -> str:
+    """
+    Keep human-readable apostrophes in Telegram filenames.
+    Telegram may strip U+02BB (ʻ) and some curly variants in filenames.
+    Map all common apostrophe variants to plain ASCII apostrophe.
+    """
+    text = str(name or "")
+    return re.sub(r"[ʻʼ’'`´‘]", "'", text)
+
+
+def _normalize_title_apostrophes(name: str) -> str:
+    """
+    Preserve Uzbek spelling in owner-set titles by converting common
+    apostrophe variants to the Uzbek apostrophe character.
+    """
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"[ʼ’'`´‘]", "ʻ", text)
+
+
 def parse_referral_payload(payload: str | None) -> int | None:
     if not payload:
         return None
@@ -1076,6 +1125,32 @@ def parse_referral_payload(payload: str | None) -> int | None:
     if token.isdigit():
         return int(token)
     return None
+
+
+def parse_group_private_start_payload(payload: str | None) -> tuple[int | None, str | None]:
+    if not payload:
+        return None, None
+    token = str(payload).strip()
+    if not token:
+        return None, None
+    if token == "group_start":
+        return None, None
+    if token.startswith("gstart_"):
+        body = token[len("gstart_") :].strip()
+        if not body:
+            return None, None
+        parts = body.split("_", 1)
+        if len(parts) != 2:
+            return None, None
+        try:
+            user_id = int(parts[0])
+        except Exception:
+            return None, None
+        prompt_token = str(parts[1]).strip()
+        if not user_id or not prompt_token:
+            return None, None
+        return user_id, prompt_token
+    return None, None
 
 
 def format_user_name(user: dict) -> str:
@@ -1192,7 +1267,7 @@ def build_top_users_keyboard(total: int, limit: int, lang: str) -> InlineKeyboar
 
 
 def _book_filename(book) -> str:
-    display = _safe_filename(get_display_name(book))
+    display = str(get_display_name(book) or "").strip() or "book"
     ext = ""
     path = book.get("path") or ""
     if path:
@@ -1216,6 +1291,7 @@ def build_book_keyboard(
     is_fav: bool,
     user_reaction: str | None = None,
     can_delete: bool = False,
+    can_rename_book: bool = False,
     lang: str = "en",
     has_audiobook: bool = False,
     can_add_audiobook: bool = False,
@@ -1227,9 +1303,12 @@ def build_book_keyboard(
     dislike = counts.get("dislike", 0)
     berry = counts.get("berry", 0)
     whale = counts.get("whale", 0)
-    fav_label = "❌ Remove" if show_personal_state and is_fav else "⭐ Favorite"
     m = MESSAGES.get(lang, MESSAGES["en"])
-    ## summary_label = m.get("summary_button", "🧠 Summarize")
+    fav_label = (
+        m.get("book_action_remove_favorite", "❌ Remove")
+        if show_personal_state and is_fav
+        else m.get("book_action_favorite", "⭐ Favorite")
+    )
 
     def label(key: str, emoji: str, count: int) -> str:
         prefix = "★ " if show_personal_state and user_reaction == key else ""
@@ -1242,7 +1321,6 @@ def build_book_keyboard(
             InlineKeyboardButton(label("like", REACTION_EMOJI["like"], like), callback_data=f"react:{book_id}:like"),
             InlineKeyboardButton(label("dislike", REACTION_EMOJI["dislike"], dislike), callback_data=f"react:{book_id}:dislike"),
         ],
-        ## [InlineKeyboardButton(summary_label, callback_data=f"summary:{book_id}")],
     ]
 
     if show_listen_button:
@@ -1250,6 +1328,9 @@ def build_book_keyboard(
         rows.append([InlineKeyboardButton(listen_label, callback_data=f"abook:{book_id}")])
 
     rows.append([InlineKeyboardButton(fav_label, callback_data=f"fav:toggle:{book_id}")])
+
+    if can_rename_book:
+        rows.append([InlineKeyboardButton(m.get("book_action_rename", "✏️ Edit name"), callback_data=f"bookrename:{book_id}")])
 
     if can_add_audiobook:
         add_label = m.get("audiobook_add_button", "➕ Add Audiobook")
@@ -1267,16 +1348,21 @@ def build_book_keyboard(
         rows.append([InlineKeyboardButton(del_audio_label, callback_data=f"abdelbook:{book_id}")])
 
     if can_delete:
-        rows.append([InlineKeyboardButton("🗑️ Delete book", callback_data=f"delbook:{book_id}")])
+        rows.append([InlineKeyboardButton(m.get("book_action_delete", "🗑️ Delete book"), callback_data=f"delbook:{book_id}")])
 
     return InlineKeyboardMarkup(rows)
 
 
 
 def build_book_caption(book, downloads: int, fav_count: int, counts: dict) -> str:
-    return (
-        f"⬇️ {downloads} | ⭐ {fav_count}"
-    )
+    title = str(get_display_name(book) or "").strip() or "Book"
+    if len(title) > 96:
+        title = title[:93].rstrip() + "..."
+    lines = [
+        f"📖 {title}",
+        f"⬇️ {downloads}   ⭐ {fav_count}",
+    ]
+    return "\n".join(lines)
 
 
 async def send_book(bot, chat_id, book):
@@ -1326,6 +1412,11 @@ async def send_book(bot, chat_id, book):
             logger.warning("Failed to load audiobook metadata for %s: %s", book_id, e)
     has_ab = bool(audio_book)
     can_add_ab = bool(is_audio_allowed(user_id)) if user_id else False
+    try:
+        chat_id_int = int(chat_id)
+    except Exception:
+        chat_id_int = 0
+    can_rename_book = bool(can_rename_books(user_id)) if user_id and chat_id_int > 0 else False
     is_owner_user = bool(_is_owner_user(user_id)) if user_id and callable(globals().get("_is_owner_user")) else False
     show_listen_btn = has_ab if is_owner_user else True
     ab_request_count = 0
@@ -1341,6 +1432,7 @@ async def send_book(bot, chat_id, book):
             is_fav,
             user_reaction,
             can_delete,
+            can_rename_book,
             "en",
             has_audiobook=has_ab,
             can_add_audiobook=can_add_ab,
@@ -1511,7 +1603,7 @@ ES_CA_CERT = os.getenv("ES_CA_CERT", "")
 ES_USER = os.getenv("ES_USER", "")
 ES_PASS = os.getenv("ES_PASS", "")
 _ES_CLIENT = None
-BOOK_LOVERS_GROUP_URL = (os.getenv("BOOK_LOVERS_GROUP_URL", "https://t.me/book_lovers_clubb") or "").strip()
+BOOK_LOVERS_GROUP_URL = (os.getenv("BOOK_LOVERS_GROUP_URL", "") or "").strip()
 _BOOK_LOVERS_GROUP_HANDLE_RAW = (os.getenv("BOOK_LOVERS_GROUP_HANDLE", "") or "").strip()
 BOT_OWNER_USERNAME = (os.getenv("BOT_OWNER_USERNAME", "@MuhammadaliAbdullayev") or "@MuhammadaliAbdullayev").strip()
 BOT_DISPLAY_NAME = (os.getenv("BOT_DISPLAY_NAME", "Pdf va audio kitoblar") or "Pdf va audio kitoblar").strip()
@@ -1530,7 +1622,10 @@ REQUESTS_PAGE_SIZE = 10
 USER_SEARCH_LIMIT = 30
 LOCAL_SEND_RETRIES = 3
 LOCAL_SEND_BACKOFF_SEC = 3
-UPLOAD_LOCAL_WORKERS = 1
+try:
+    UPLOAD_LOCAL_WORKERS = max(1, int(os.getenv("UPLOAD_LOCAL_WORKERS", "5")))
+except Exception:
+    UPLOAD_LOCAL_WORKERS = 5
 UPLOAD_LOCAL_WRITE_TIMEOUT = 3600
 UPLOAD_LOCAL_READ_TIMEOUT = 120
 UPLOAD_LOCAL_CONNECT_TIMEOUT = 60
@@ -1550,13 +1645,13 @@ BOOK_SEARCH_RESULT_CACHE_TTL = max(10, int(os.getenv("BOOK_SEARCH_RESULT_CACHE_T
 TOP_USERS_CACHE_TTL = max(5, int(os.getenv("TOP_USERS_CACHE_TTL", "45") or "45"))
 SEARCH_CACHE_NS = (os.getenv("SEARCH_CACHE_NS", "v1") or "v1").strip()
 try:
-    THREAD_POOL_WORKERS = max(4, int(os.getenv("THREAD_POOL_WORKERS", "50")))
+    THREAD_POOL_WORKERS = max(4, int(os.getenv("THREAD_POOL_WORKERS", "100")))
 except Exception:
-    THREAD_POOL_WORKERS = 50
+    THREAD_POOL_WORKERS = 100
 try:
-    HEAVY_THREAD_POOL_WORKERS = max(1, int(os.getenv("HEAVY_THREAD_POOL_WORKERS", "10")))
+    HEAVY_THREAD_POOL_WORKERS = max(1, int(os.getenv("HEAVY_THREAD_POOL_WORKERS", "20")))
 except Exception:
-    HEAVY_THREAD_POOL_WORKERS = 10
+    HEAVY_THREAD_POOL_WORKERS = 20
 try:
     DB_RETRY_ATTEMPTS = max(0, int(os.getenv("DB_RETRY_ATTEMPTS", "2")))
 except Exception:
@@ -1925,7 +2020,7 @@ def get_display_name(book: dict) -> str:
     return (book.get("display_name") or book.get("book_name") or "Untitled").strip()
 
 def get_result_title(book: dict) -> str:
-    return (book.get("book_name") or book.get("display_name") or "Untitled").strip()
+    return (book.get("display_name") or book.get("book_name") or "Untitled").strip()
 
 
 def rate_limited(context: ContextTypes.DEFAULT_TYPE, key: str, cooldown: int):
@@ -2225,17 +2320,6 @@ def build_upload_admin_keyboard(status: str, request_id: str):
     return None
 
 
-def build_request_admin_keyboard(status: str, request_id: str):
-    if status in {"done", "no"}:
-        return None
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(MESSAGES["en"]["request_action_seen"], callback_data=f"reqstatus:seen:{request_id}"),
-            InlineKeyboardButton(MESSAGES["en"]["request_action_done"], callback_data=f"reqstatus:done:{request_id}"),
-            InlineKeyboardButton(MESSAGES["en"]["request_action_no"], callback_data=f"reqstatus:no:{request_id}")
-        ]]
-    )
-
 
 def add_recent_download(user_id: int, book_id: str, title: str):
     db_add_recent(user_id, book_id, title, MAX_RECENTS)
@@ -2251,6 +2335,17 @@ def remove_favorite(user_id: int, book_id: str):
 
 def is_favorited(user_id: int, book_id: str):
     return db_is_favorited(user_id, book_id)
+
+def build_request_admin_keyboard(status: str, request_id: str):
+    if status in {"done", "no"}:
+        return None
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(MESSAGES["en"]["request_action_seen"], callback_data=f"reqstatus:seen:{request_id}"),
+            InlineKeyboardButton(MESSAGES["en"]["request_action_done"], callback_data=f"reqstatus:done:{request_id}"),
+            InlineKeyboardButton(MESSAGES["en"]["request_action_no"], callback_data=f"reqstatus:no:{request_id}")
+        ]]
+    )
 
 
 def suggest_books(books: list, query: str, limit: int = 5):
@@ -2488,6 +2583,12 @@ async def post_init(application):
         except Exception as e:
             logger.error(f"Failed to ensure local backup worker: {e}")
 
+    async def _bg_process_jobs():
+        try:
+            await _process_background_jobs(application)
+        except Exception as e:
+            logger.error(f"Background job processor failed: {e}")
+
     asyncio.create_task(_bg_set_commands())
     try:
         application.job_queue.run_repeating(prune_blocked_users, interval=3 * 60 * 60, first=60)
@@ -2496,6 +2597,7 @@ async def post_init(application):
         logger.error(f"Failed to schedule prune_blocked_users: {e}")
     asyncio.create_task(_bg_backfill_awards())
     asyncio.create_task(_bg_sync_unindexed_books())
+    asyncio.create_task(_bg_process_jobs())
     try:
         starter = getattr(_upload_flow, "start_upload_local_backup_worker", None)
         if callable(starter):
@@ -2696,6 +2798,60 @@ def search_es(query, size: int = MAX_SEARCH_RESULTS):
         return []
 
 
+def _inline_search_books(query: str, size: int = 10) -> list[dict]:
+    query = str(query or "").strip()
+    if not query:
+        return []
+
+    results: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for source, _score, book_id in search_es(query, size=size):
+        bid = str(book_id or source.get("id") or "").strip()
+        if not bid or bid in seen_ids:
+            continue
+        book = {}
+        try:
+            book = dict(db_get_book_by_id(bid) or {})
+        except Exception as e:
+            logger.debug("Inline DB hydration failed for book %s: %s", bid, e, exc_info=True)
+        if not book:
+            book = dict(source or {})
+        book["id"] = bid
+        results.append(book)
+        seen_ids.add(bid)
+        if len(results) >= size:
+            return results
+
+    try:
+        query_norm = normalize(query).lower()
+        query_tokens = [token for token in query_norm.split() if token]
+        if not query_tokens:
+            return results
+
+        for book in list(db_list_books() or []):
+            bid = str(book.get("id") or "").strip()
+            if not bid or bid in seen_ids:
+                continue
+            haystacks = [
+                normalize(str(book.get("book_name") or "")).lower(),
+                normalize(str(book.get("display_name") or "")).lower(),
+                normalize(str(book.get("path") or "")).lower(),
+            ]
+            if any(query_norm in text for text in haystacks if text):
+                results.append(book)
+                seen_ids.add(bid)
+            elif all(any(token in text for text in haystacks if text) for token in query_tokens):
+                results.append(book)
+                seen_ids.add(bid)
+            if len(results) >= size:
+                break
+    except Exception as e:
+        logger.debug("Inline DB fallback search failed for '%s': %s", query, e, exc_info=True)
+
+    return results
+
+
 def get_es_health_summary(es):
     status = "unknown"
     count = 0
@@ -2800,6 +2956,174 @@ def save_books(books):
 def clean_query(text: str) -> str:
     return normalize(text)
 
+
+async def apply_book_rename(
+    bot,
+    book_id: str,
+    new_title: str,
+    actor_user_id: int | None = None,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "ok": False,
+        "changed": False,
+        "retryable": False,
+        "book_id": str(book_id or "").strip(),
+        "book_name": None,
+        "display_name": None,
+        "path": None,
+        "file_id": None,
+        "file_unique_id": None,
+        "error": None,
+    }
+
+    try:
+        if actor_user_id is not None:
+            rename_allowed_fn = globals().get("can_rename_books")
+            if not callable(rename_allowed_fn) or not rename_allowed_fn(actor_user_id):
+                result["error"] = "not authorized"
+                return result
+
+        bid = str(book_id or "").strip()
+        if not bid:
+            result["error"] = "missing book_id"
+            return result
+
+        book = await run_blocking(db_get_book_by_id, bid)
+        if not book:
+            result["error"] = "book not found"
+            return result
+
+        requested_title = _normalize_title_apostrophes(new_title)
+        if not requested_title:
+            result["error"] = "empty book name"
+            result["retryable"] = True
+            return result
+        display_title = requested_title
+
+        current_display = str(get_display_name(book) or "").strip()
+        if display_title == current_display:
+            result.update(
+                {
+                    "ok": True,
+                    "changed": False,
+                    "book_name": display_title,
+                    "display_name": display_title,
+                    "path": str(book.get("path") or "").strip() or None,
+                    "file_id": str(book.get("file_id") or "").strip() or None,
+                    "file_unique_id": str(book.get("file_unique_id") or "").strip() or None,
+                }
+            )
+            return result
+
+        local_path_str = str(book.get("path") or "").strip()
+        if not local_path_str:
+            result["error"] = "local copy not ready"
+            result["retryable"] = True
+            return result
+
+        old_path = Path(local_path_str)
+        if not old_path.exists():
+            result["error"] = "local copy missing"
+            result["retryable"] = True
+            return result
+
+        file_id = str(book.get("file_id") or "").strip()
+        if not file_id:
+            result["error"] = "missing file_id"
+            result["retryable"] = True
+            return result
+
+        updated_book = dict(book)
+        updated_book["book_name"] = display_title
+        updated_book["display_name"] = display_title
+
+        # Keep the local file path unchanged so owner-edited names stay exact in DB/UI
+        # and are never transformed by filesystem-safe filename rules.
+        target_path = old_path
+        old_ext = old_path.suffix or ".pdf"
+        telegram_file_name = f"{display_title}{old_ext}"
+
+        refresh_info = await _upload_flow._refresh_uploaded_book_file_id(
+            bot,
+            bid,
+            str(target_path),
+            telegram_filename=telegram_file_name,
+            use_thumbnail=True,
+        )
+        if not refresh_info.get("file_id"):
+            result["error"] = f"file_id refresh failed: {refresh_info.get('error') or 'unknown error'}"
+            result["retryable"] = True
+            return result
+
+        new_file_id = str(refresh_info.get("file_id") or "").strip()
+        new_file_unique_id = str(refresh_info.get("file_unique_id") or "").strip() or None
+
+        update_rowcount = await run_blocking(
+            db_update_book_rename_meta,
+            bid,
+            display_title,
+            display_title,
+            str(target_path),
+            new_file_id,
+            new_file_unique_id,
+            True,
+        )
+        if not update_rowcount:
+            result["error"] = "database update failed"
+            result["retryable"] = True
+            logger.error("db_update_book_rename_meta returned rowcount=%s for book_id=%s", update_rowcount, bid)
+            return result
+
+        updated_book["path"] = str(target_path)
+        updated_book["file_id"] = new_file_id
+        if new_file_unique_id:
+            updated_book["file_unique_id"] = new_file_unique_id
+
+        if es_available():
+            try:
+                await run_blocking(
+                    index_book,
+                    display_title,
+                    new_file_id,
+                    str(target_path),
+                    bid,
+                    display_title,
+                    new_file_unique_id,
+                )
+            except Exception as e:
+                logger.warning("Failed to reindex renamed book %s: %s", bid, e, exc_info=True)
+
+        try:
+            search_cache_ns = str(globals().get("SEARCH_CACHE_NS", os.getenv("SEARCH_CACHE_NS", "v1")) or "v1")
+            clear_pattern = globals().get("cache_clear_pattern")
+            delete_cache_key = globals().get("cache_delete")
+            if callable(clear_pattern):
+                clear_pattern(f"search:books:entries:{search_cache_ns}:*")
+                clear_pattern("top_results:*")
+            if callable(delete_cache_key):
+                delete_cache_key("top:books:entries")
+        except Exception as e:
+            logger.debug("Failed to clear discovery caches after rename for %s: %s", bid, e)
+
+        result.update(
+            {
+                "ok": True,
+                "changed": True,
+                "book_name": display_title,
+                "display_name": display_title,
+                "path": str(target_path),
+                "file_id": new_file_id,
+                "file_unique_id": new_file_unique_id,
+            }
+        )
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        result["retryable"] = True
+        logger.error("apply_book_rename failed for %s: %s", book_id, e, exc_info=True)
+        return result
+
+
 def reindex_books():
     if not es_available():
         logger.error("Elasticsearch not available, skipping reindex.")
@@ -2821,9 +3145,8 @@ def reindex_books():
                 skipped += 1
                 continue
 
-            # Clean the book_name before indexing
+            # Normalize only for Elasticsearch search; keep DB-stored names exact.
             clean_name = normalize(raw_name)
-            book["book_name"] = clean_name  # normalized for search
             if not book.get("display_name"):
                 book["display_name"] = raw_name
 
@@ -2885,6 +3208,7 @@ def save_users(users):
                 delete_allowed=bool(u.get("delete_allowed", False)),
                 stopped=bool(u.get("stopped", False)),
                 audio_allowed=bool(u.get("audio_allowed", False)),
+                rename_allowed=bool(u.get("rename_allowed", False)),
                 language_selected=u.get("language_selected"),
                 group_language=u.get("group_language"),
             )
@@ -2931,21 +3255,43 @@ async def _reply_group_private_start_prompt(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     lang: str,
+    user_id: int | None = None,
 ) -> bool:
     if not update.message:
         return False
+    start_token = uuid.uuid4().hex
+    start_url = await _build_private_start_url(context, payload=f"gstart_{int(user_id or 0)}_{start_token}")
     text = MESSAGES.get(lang, MESSAGES["en"]).get(
         "group_private_start_required",
         MESSAGES["en"]["group_private_start_required"],
     )
-    start_url = await _build_private_start_url(context)
     reply_markup = None
     if start_url:
         reply_markup = InlineKeyboardMarkup(
             [[InlineKeyboardButton(MESSAGES.get(lang, MESSAGES["en"]).get("group_private_start_button", "🚀 Start Bot"), url=start_url)]]
         )
-    await _send_with_retry(lambda: update.message.reply_text(text, reply_markup=reply_markup))
-    return True
+    sent = await _send_with_retry(lambda: update.message.reply_text(text, reply_markup=reply_markup))
+    if sent and user_id and start_url:
+        try:
+            await run_blocking_db_retry(
+                db_upsert_group_private_start_prompt,
+                start_token,
+                int(user_id),
+                int(getattr(sent.chat, "id", update.effective_chat.id)),
+                int(getattr(sent, "message_id", 0)),
+                lang,
+                retries=DB_RETRY_ATTEMPTS,
+                base_delay=DB_RETRY_BASE_DELAY_SEC,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to persist group private-start prompt for user %s in chat %s: %s",
+                user_id,
+                getattr(sent.chat, "id", None),
+                e,
+                exc_info=True,
+            )
+    return bool(sent)
 
 
 async def _reply_group_language_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> bool:
@@ -2968,6 +3314,90 @@ async def _send_group_search_ready_message(target_message, context: ContextTypes
     )
 
 
+async def _resolve_group_private_start_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    actor_user_id: int,
+    payload_user_id: int | None,
+    prompt_token: str | None,
+    lang: str,
+) -> bool:
+    if not actor_user_id:
+        return False
+    prompt = None
+    try:
+        if prompt_token:
+            prompt = await run_blocking_db_retry(
+                db_get_group_private_start_prompt_by_token,
+                prompt_token,
+                retries=DB_RETRY_ATTEMPTS,
+                base_delay=DB_RETRY_BASE_DELAY_SEC,
+            )
+        if not prompt:
+            prompt = await run_blocking_db_retry(
+                db_get_latest_pending_group_private_start_prompt,
+                actor_user_id,
+                retries=DB_RETRY_ATTEMPTS,
+                base_delay=DB_RETRY_BASE_DELAY_SEC,
+            )
+        if not prompt:
+            return False
+        prompt_user_id = int(prompt.get("user_id") or 0)
+        if prompt_user_id and prompt_user_id != int(actor_user_id):
+            return False
+        if payload_user_id and prompt_user_id and payload_user_id != prompt_user_id:
+            return False
+        chat_id = int(prompt.get("chat_id") or 0)
+        message_id = int(prompt.get("message_id") or 0)
+        if not chat_id or not message_id:
+            return False
+        prompt_lang = str(prompt.get("prompt_lang") or lang or "en").strip() or "en"
+        text = MESSAGES.get(prompt_lang, MESSAGES["en"]).get(
+            "group_private_start_ready",
+            "✅ Great! You have started the bot.\n🌐 Please choose your language below:",
+        )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=get_language_keyboard(),
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to edit private-start prompt for user %s in chat %s message %s: %s",
+                actor_user_id,
+                chat_id,
+                message_id,
+                e,
+                exc_info=True,
+            )
+            return False
+        try:
+            await run_blocking_db_retry(
+                db_set_group_private_start_prompt_status,
+                str(prompt.get("token") or prompt_token or ""),
+                "resolved",
+                retries=DB_RETRY_ATTEMPTS,
+                base_delay=DB_RETRY_BASE_DELAY_SEC,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to mark private-start prompt resolved for user %s: %s",
+                actor_user_id,
+                e,
+                exc_info=True,
+            )
+        return True
+    except Exception as e:
+        logger.error(
+            "Failed to resolve group private-start prompt for user %s: %s",
+            actor_user_id,
+            e,
+            exc_info=True,
+        )
+        return False
+
+
 def set_user_language(user_id: int, lang: str):
     user = get_user(user_id)
     if not user:
@@ -2978,6 +3408,7 @@ def set_user_language(user_id: int, lang: str):
             last_name=None,
             blocked=False,
             allowed=False,
+            rename_allowed=False,
             joined_date=datetime.now().date(),
             left_date=None,
             language=lang,
@@ -2997,6 +3428,7 @@ def set_user_group_language(user_id: int, lang: str):
             last_name=None,
             blocked=False,
             allowed=False,
+            rename_allowed=False,
             joined_date=datetime.now().date(),
             left_date=None,
             language=None,
@@ -3074,6 +3506,7 @@ async def update_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE | 
             last_name=user.last_name,
             blocked=bool(existing.get("blocked", False)),
             allowed=bool(existing.get("allowed", False)),
+            rename_allowed=bool(existing.get("rename_allowed", False)),
             joined_date=existing.get("joined_date") or today,
             left_date=existing.get("left_date"),
             language=effective_lang,
@@ -3128,6 +3561,16 @@ def is_audio_allowed(user_id: int) -> bool:
     except Exception:
         user = get_user(user_id)
         return bool(user.get("audio_allowed")) if user else False
+
+
+def can_rename_books(user_id: int) -> bool:
+    if _is_owner_user(user_id):
+        return True
+    try:
+        return bool(db_is_user_rename_allowed(user_id))
+    except Exception:
+        user = get_user(user_id)
+        return bool(user.get("rename_allowed")) if user else False
 
 
 def is_bot_paused(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -3341,7 +3784,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             referrer_id = parse_referral_payload(context.args[0] if context.args else None)
             if not _has_private_bot_start(user_record):
-                await _reply_group_private_start_prompt(update, context, prompt_lang)
+                await _reply_group_private_start_prompt(update, context, prompt_lang, update.effective_user.id)
             elif user_record.get("group_language"):
                 await _send_group_search_ready_message(update.message, context, str(user_record.get("group_language") or prompt_lang))
             else:
@@ -3356,14 +3799,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("main_menu_section", None)
         context.user_data["awaiting_book_search"] = False
         context.user_data.pop("search_mode", None)
-        referrer_id = parse_referral_payload(context.args[0] if context.args else None)
+        start_payload = context.args[0] if context.args else None
+        referrer_id = parse_referral_payload(start_payload)
+        group_prompt_user_id, group_prompt_token = parse_group_private_start_payload(start_payload)
         prompt_lang = _language_picker_prompt_lang(user_record, update.effective_user)
-        # Always ask user to choose language on /start (do not auto-use Telegram locale).
-        await safe_reply(
-            update,
-            MESSAGES[prompt_lang]["choose_language"],
-            reply_markup=get_language_keyboard()
-        )
+        selected_lang = str(user_record.get("language") or "").strip()
+        language_selected = bool(user_record.get("language_selected")) and bool(selected_lang)
+        if language_selected:
+            await _send_animated_start_greeting(update, context, detect_language_code(selected_lang))
+        else:
+            # First-time users see the language picker on /start.
+            await safe_reply(
+                update,
+                MESSAGES[prompt_lang]["choose_language"],
+                reply_markup=get_language_keyboard()
+            )
+        if start_payload and (str(start_payload).startswith("gstart_") or str(start_payload) == "group_start"):
+            try:
+                await _resolve_group_private_start_prompt(
+                    context,
+                    update.effective_user.id,
+                    group_prompt_user_id,
+                    group_prompt_token,
+                    prompt_lang,
+                )
+            except Exception as e:
+                logger.warning("Failed to reveal group private-start prompt for %s: %s", update.effective_user.id, e, exc_info=True)
         _schedule_application_task(
             context.application,
             _post_start_background_sync(update, context, referrer_id),
@@ -3395,7 +3856,7 @@ async def language_command_handler(update: Update, context: ContextTypes.DEFAULT
             or getattr(update.effective_user, "language_code", None)
         )
         if not _has_private_bot_start(user_record):
-            await _reply_group_private_start_prompt(update, context, prompt_lang)
+            await _reply_group_private_start_prompt(update, context, prompt_lang, update.effective_user.id)
         else:
             await _reply_group_language_prompt(update, context, prompt_lang)
         return
@@ -3577,12 +4038,6 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
         context.user_data.pop("pending_abook", None)
         cancelled = True
 
-    video_dl_session = _video_dl_get_session(context)
-    if video_dl_session and (not user_id or video_dl_session.get("user_id") in {None, user_id}):
-        await _edit_prompt_if_any(video_dl_session)
-        _video_dl_clear_session(context)
-        cancelled = True
-
     audio_conv_session = _audio_conv_get_session(context) if callable(globals().get("_audio_conv_get_session")) else None
     if audio_conv_session and (not user_id or audio_conv_session.get("user_id") in {None, user_id}):
         await _edit_prompt_if_any(audio_conv_session)
@@ -3618,8 +4073,18 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(
             m.get("menu_search_prompt", "Send a book name to search."),
             reply_markup=_main_menu_keyboard(lang, "main", user_id),
+            parse_mode="HTML",
         )
         context.user_data["main_menu_section"] = "main"
+        return True
+    if action == "request":
+        context.user_data["awaiting_request"] = True
+        context.user_data["awaiting_request_until"] = time.time() + 30
+        context.user_data["main_menu_section"] = "main"
+        await update.message.reply_text(
+            m.get("request_prompt", "✍️ Send the title of the book you need."),
+            reply_markup=_main_menu_keyboard(lang, "main", user_id),
+        )
         return True
     context.user_data["awaiting_book_search"] = False
     context.user_data.pop("search_mode", None)
@@ -3634,16 +4099,6 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     if action == "pdf_editor":
         context.user_data["main_menu_section"] = "other"
         await _pdfed_start_session_from_message(update.message, update, context, lang)
-        return True
-    if action == "request":
-        keep_section = "other" if current_section == "other" else "main"
-        context.user_data["awaiting_request"] = True
-        context.user_data["awaiting_request_until"] = time.time() + 30
-        context.user_data["main_menu_section"] = keep_section
-        await update.message.reply_text(
-            m.get("menu_request_prompt", m.get("request_prompt", "Send book name.")),
-            reply_markup=_main_menu_keyboard(lang, keep_section, user_id),
-        )
         return True
     if action == "favorites":
         context.user_data["main_menu_section"] = "other" if current_section == "other" else "main"
@@ -3687,10 +4142,6 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         context.user_data["_skip_spam_check_once"] = True
         await upload_command(update, context)
         return True
-    if action == "video_downloader":
-        context.user_data["main_menu_section"] = "video_downloader"
-        await _video_dl_start_session_from_message(update.message, update, context, lang)
-        return True
     if action == "audio_converter":
         context.user_data["main_menu_section"] = "other"
         await _audio_conv_start_session_from_message(update.message, update, context, lang)
@@ -3703,15 +4154,19 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         context.user_data["main_menu_section"] = "other"
         info_tpl = m.get(
             "contact_admin_info",
-            "📞 Contact Admin\n👤 Bot owner/developer: {owner}\n🌍 Group: {group}",
+            "📞 Contact Admin\n\nIf you have a question, suggestion, or problem, you can contact the bot owner directly.",
         )
-        try:
-            info_text = info_tpl.format(owner=BOT_OWNER_USERNAME, group=BOOK_LOVERS_GROUP_HANDLE)
-        except Exception:
-            info_text = info_tpl
+        info_text = info_tpl
+        reply_markup = _main_menu_keyboard(lang, "other", user_id)
+        owner_username = str(BOT_OWNER_USERNAME or "").strip()
+        owner_handle = owner_username[1:] if owner_username.startswith("@") else owner_username
+        if owner_handle:
+            reply_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(m.get("contact_admin_button", "👤 Message Admin"), url=f"https://t.me/{owner_handle}")]]
+            )
         await update.message.reply_text(
             info_text,
-            reply_markup=_main_menu_keyboard(lang, "other", user_id),
+            reply_markup=reply_markup,
         )
         return True
     handled_admin = await _admin_tools_handle_admin_menu_action(
@@ -3957,6 +4412,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise
         except Exception as e:
             logger.warning("sticker tools file handler failed: %s", e, exc_info=True)
+    tts_media_handler = globals().get("_tts_handle_media_input")
+    if callable(tts_media_handler):
+        try:
+            lang = ensure_user_language(update, context)
+            handled = await tts_media_handler(update, context, lang)
+            if handled:
+                return
+        except ApplicationHandlerStop:
+            raise
+        except Exception as e:
+            logger.warning("tts media file handler failed: %s", e, exc_info=True)
     pdf_editor_handler = globals().get("_pdfed_handle_media_input")
     if callable(pdf_editor_handler):
         try:
@@ -4071,6 +4537,12 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Storage stats failed: {e}")
             storage_stats = {'total_files': 0, 'total_size': 0, 'book_count': 0, 'total_book_size': 0, 'audio_count': 0, 'total_audio_size': 0, 'avg_book_size': 0, 'avg_audio_size': 0}
 
+        try:
+            local_backup_queue = await run_blocking(db_get_book_local_download_job_status_counts)
+        except Exception as e:
+            logger.error(f"Local backup queue stats failed: {e}")
+            local_backup_queue = {'queued': 0, 'downloading': 0, 'done': 0, 'failed': 0, 'total': 0, 'pending': 0}
+
         # --- Lifetime analytics counters ---
         counter_keys = [
             "search_total",
@@ -4089,7 +4561,6 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "reaction_dislike",
             "reaction_berry",
             "reaction_whale",
-            "video_downloads",
             "ai_pdf_created",
         ]
         counters = await run_blocking(db_get_counters, counter_keys)
@@ -4178,7 +4649,6 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             MESSAGES[lang]["audit_section_events"],
             f"- {MESSAGES[lang]['audit_search_total']}: {counters.get('search_total', 0)}",
             f"- {MESSAGES[lang]['audit_download_total']}: {counters.get('download_total', 0)}",
-            f"- Video downloader downloads: {counters.get('video_downloads', 0)}",
             f"- {MESSAGES[lang]['audit_requests_created']}: {counters.get('request_created', 0)}",
             f"- {MESSAGES[lang]['audit_requests_cancelled']}: {counters.get('request_cancelled', 0)}",
             f"- {MESSAGES[lang]['audit_requests_seen_total']}: {counters.get('request_seen', 0)}",
@@ -4200,10 +4670,21 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💾 Storage",
             f"- Total files: {storage_stats.get('total_files', 0)}",
             f"- Total size: {_format_bytes(storage_stats.get('total_size', 0))}",
-            f"- Books: {storage_stats.get('book_count', 0)} files ({_format_bytes(storage_stats.get('total_book_size', 0))})",
+            f"- 📚 Local books: {storage_stats.get('book_count', 0)} files ({_format_bytes(storage_stats.get('total_book_size', 0))})",
             f"- Audio: {storage_stats.get('audio_count', 0)} files ({_format_bytes(storage_stats.get('total_audio_size', 0))})",
             f"- Avg book size: {_format_bytes(storage_stats.get('avg_book_size', 0))}",
             f"- Avg audio size: {_format_bytes(storage_stats.get('avg_audio_size', 0))}",
+        ]
+
+        lines += [
+            "──────────",
+            "📦 Local backup queue",
+            f"- Queued: {local_backup_queue.get('queued', 0)}",
+            f"- Downloading: {local_backup_queue.get('downloading', 0)}",
+            f"- Done: {local_backup_queue.get('done', 0)}",
+            f"- Failed: {local_backup_queue.get('failed', 0)}",
+            f"- Left to process: {local_backup_queue.get('pending', 0)}",
+            "──────────",
         ]
 
         lines += [
@@ -4242,6 +4723,7 @@ handle_audiobook_listen_callback = _search_flow.handle_audiobook_listen_callback
 handle_audiobook_page_callback = _search_flow.handle_audiobook_page_callback
 handle_audiobook_part_play_callback = _search_flow.handle_audiobook_part_play_callback
 handle_audiobook_add_callback = _search_flow.handle_audiobook_add_callback
+handle_book_rename_callback = _search_flow.handle_book_rename_callback
 handle_abook_audio = _search_flow.handle_abook_audio
 handle_page_callback = _search_flow.handle_page_callback
 handle_user_page_callback = _search_flow.handle_user_page_callback
@@ -4367,13 +4849,13 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("Broadcast completed with %s transient/non-definitive failures", transient_failures)
 
     
-
 async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and is_blocked(update.effective_user.id):
         return
     if update.effective_user and await is_stopped_user(update.effective_user.id):
         return
     query = update.inline_query.query.strip()
+    lang = ensure_user_language(update, context)
     results = []
 
     if not query:
@@ -4386,27 +4868,12 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        es = get_es()
-        if not es:
-            await update.inline_query.answer([], cache_time=0)
-            return
-        response = await run_blocking(
-            lambda: es.search(
-                index="books",
-                size=10,
-                query={
-                    "multi_match": {
-                        "query": query,
-                        "fields": ["book_name^2", "path", "file_id"],
-                        "fuzziness": "AUTO"
-                    }
-                }
-            )
-        )
+        books = await run_blocking(_inline_search_books, query, 10)
 
-        for hit in response["hits"]["hits"]:
-            book = hit["_source"]
-            book_id = hit["_id"]
+        for book in books:
+            book_id = str(book.get("id") or "").strip()
+            if not book_id:
+                continue
             title = get_result_title(book)
             path = book.get("path")
             file_id = book.get("file_id")
@@ -4426,7 +4893,7 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     input_message_content=InputTextMessageContent(
                         message, parse_mode="Markdown"
                     ),
-                    description="Tap to upload book"
+                    description=MESSAGES[lang]["inline_book_upload_description"]
                 )
             else:
                 result = InlineQueryResultArticle(
@@ -4436,13 +4903,13 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"📖 *{title}*",
                         parse_mode="Markdown"
                     ),
-                    description="Book info only"
+                    description=MESSAGES[lang]["inline_book_info_only"]
                 )
 
             results.append(result)
 
     except Exception as e:
-        logger.error(f"⚠️ Elasticsearch error: {e}")
+        logger.error(f"Inline search failed: {e}", exc_info=True)
         await update.inline_query.answer([], cache_time=0)
         return
 
@@ -5021,18 +5488,10 @@ _tts_build_audio_bytes_blocking = _tts_tools._tts_build_audio_bytes_blocking
 _tts_send_result = _tts_tools._tts_send_result
 _tts_generate_and_send = _tts_tools._tts_generate_and_send
 _tts_handle_text_input = _tts_tools._tts_handle_text_input
+_tts_handle_media_input = _tts_tools._tts_handle_media_input
 text_to_voice_command = _tts_tools.text_to_voice_command
 _tts_start_session_from_message = _tts_tools._tts_start_session_from_message
 handle_tts_callback = _tts_tools.handle_tts_callback
-
-# Video downloader extracted module bridge
-_video_downloader.configure(_build_video_downloader_deps())
-
-_video_dl_clear_session = _video_downloader._video_dl_clear_session
-_video_dl_get_session = _video_downloader._video_dl_get_session
-_video_dl_start_session_from_message = _video_downloader._video_dl_start_session_from_message
-_video_dl_handle_text_input = _video_downloader._video_dl_handle_text_input
-handle_video_downloader_callback = _video_downloader.handle_video_downloader_callback
 
 # Audio converter extracted module bridge
 _audio_converter.configure(_build_audio_converter_deps())
@@ -5096,6 +5555,493 @@ user_search_command = _admin_runtime.user_search_command
 _search_flow.configure(_build_search_flow_deps())
 
 
+async def _process_background_jobs(app: Application) -> None:
+    """Background task to process queued jobs."""
+    worker_id = f"worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    logger.info(f"Starting background job processor: {worker_id}")
+    while True:
+        try:
+            job = db_claim_background_job(worker_id)
+            if not job:
+                await asyncio.sleep(10)  # No jobs, wait
+                continue
+
+            job_id = job["id"]
+            job_type = job["job_type"]
+            user_id = job["user_id"]
+            data = json.loads(job.get("data_json", "{}"))
+
+            logger.info(f"Processing job {job_id}: {job_type} for user {user_id}")
+
+            success = False
+            result_data = None
+            error_msg = None
+
+            try:
+                if job_type == "pdf_maker":
+                    result_data = await _process_pdf_maker_job(data)
+                elif job_type == "pdf_editor":
+                    result_data = await _process_pdf_editor_job(data)
+                elif job_type == "tts_generate":
+                    result_data = await _process_tts_job(data)
+                elif job_type == "audio_convert":
+                    result_data = await _process_audio_convert_job(data, app)
+                elif job_type == "sticker_convert":
+                    result_data = await _process_sticker_convert_job(data, app)
+                elif job_type == "book_summary":
+                    result_data = await _process_book_summary_job(data, app)
+                else:
+                    error_msg = f"Unknown job type: {job_type}"
+                    logger.error(error_msg)
+
+                if result_data:
+                    success = True
+                    # Send result to user
+                    await _send_job_result(app, user_id, job_type, result_data)
+                else:
+                    error_msg = error_msg or "Job processing failed"
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Job {job_id} failed: {error_msg}", exc_info=True)
+
+            if success:
+                db_complete_background_job(job_id)
+                logger.info(f"Job {job_id} completed successfully")
+            else:
+                attempts = job.get("attempts", 0)
+                if attempts >= job.get("max_attempts", 3):
+                    db_fail_background_job(job_id, error_msg or "Max attempts reached")
+                    logger.error(f"Job {job_id} failed permanently after {attempts} attempts")
+                    # Notify user of failure
+                    await _send_job_failure(app, user_id, job_type, error_msg or "Processing failed")
+                else:
+                    db_retry_background_job(job_id, error_msg or "Processing failed")
+                    logger.warning(f"Job {job_id} retrying (attempt {attempts})")
+
+        except Exception as e:
+            logger.error(f"Background job processor error: {e}", exc_info=True)
+            await asyncio.sleep(30)  # Back off on errors
+
+
+async def _process_pdf_maker_job(data: dict) -> dict | None:
+    """Process PDF maker job."""
+    # Extract data
+    text = data.get("text", "")
+    title = data.get("title")
+    style_key = data.get("style_key", "plain")
+    paper_key = data.get("paper_key", "a4")
+    orientation_key = data.get("orientation_key", "portrait")
+    lang = data.get("lang", "en")
+
+    if not text:
+        return None
+
+    # Reuse existing logic
+    from pdf_maker import _pdf_maker_resolve_body_font_size, _build_text_only_pdf_bytes, _pdf_maker_paper_label, _pdf_maker_orientation_label, _pdf_maker_texts, _pdf_maker_sanitize_name
+    msgs = _pdf_maker_texts(lang)
+    try:
+        chosen_font_size, used_ai_fallback = await run_blocking(
+            _pdf_maker_resolve_body_font_size, text, style_key, paper_key, orientation_key
+        )
+        pdf_bytes = _build_text_only_pdf_bytes(
+            text,
+            paper_key=paper_key,
+            orientation_key=orientation_key,
+            body_font_size=chosen_font_size,
+        )
+        if pdf_bytes:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            pdf_title = _pdf_maker_sanitize_name(title or "PDF Maker") or "PDF Maker"
+            safe_file_base = re.sub(r"\s+", "_", pdf_title).strip("._") or "pdf_maker"
+            safe_file_base = re.sub(r"[^A-Za-z0-9._-]", "", safe_file_base)[:50] or "pdf_maker"
+            filename = f"{safe_file_base}_{ts}.pdf"
+            caption = msgs["caption"]
+            caption += f"\n📐 {_pdf_maker_paper_label(paper_key, lang)} • {_pdf_maker_orientation_label(orientation_key, lang)}"
+            if style_key == "auto":
+                caption += f"\n🤖 AI Style"
+            else:
+                caption += f"\n📖 Simple"
+            caption += f"\n🔠 {chosen_font_size}"
+            if style_key == "auto" and used_ai_fallback:
+                caption += f"\n{msgs.get('ai_fallback', '')}"
+            return {"file_bytes": pdf_bytes, "filename": filename, "caption": caption}
+    except Exception as e:
+        logger.error(f"PDF maker job failed: {e}", exc_info=True)
+    return None
+
+
+async def _process_pdf_editor_job(data: dict) -> dict | None:
+    """Process PDF editor job."""
+    operation = data.get("operation")
+    pdf_bytes = data.get("pdf_bytes")
+    src_name = data.get("src_name", "pdf")
+    lang = data.get("lang", "en")
+
+    if not pdf_bytes or not operation:
+        return None
+
+    from pdf_editor import (
+        _pdf_editor_compress_blocking, _pdf_editor_extract_text_blocking, _pdf_editor_build_epub_blocking,
+        _pdf_editor_ocr_pdf_blocking, _pdf_editor_sanitize_name, _pdf_editor_now_stamp,
+        _pdf_editor_texts
+    )
+    t = _pdf_editor_texts(lang)
+
+    try:
+        if operation == "compress":
+            out_bytes = await run_blocking(_pdf_editor_compress_blocking, pdf_bytes)
+            base = _pdf_editor_sanitize_name(src_name)
+            fname = f"{base}_compressed_{_pdf_editor_now_stamp()}.pdf"
+            before_mb = round(len(pdf_bytes) / (1024 * 1024), 2)
+            after_mb = round(len(out_bytes) / (1024 * 1024), 2)
+            caption = t["compress_report"].format(before_mb=before_mb, after_mb=after_mb)
+            return {"file_bytes": out_bytes, "filename": fname, "caption": caption}
+
+        elif operation == "to_txt":
+            text = await run_blocking(_pdf_editor_extract_text_blocking, pdf_bytes, lang, 500000)
+            if not text.strip():
+                raise RuntimeError("empty-text")
+            base = _pdf_editor_sanitize_name(src_name)
+            fname = f"{base}_{_pdf_editor_now_stamp()}.txt"
+            return {"file_content": text, "filename": fname, "caption": t["caption_txt"]}
+
+        elif operation == "to_epub":
+            text = await run_blocking(_pdf_editor_extract_text_blocking, pdf_bytes, lang, 500000)
+            if not text.strip():
+                raise RuntimeError("empty-text")
+            title = _pdf_editor_sanitize_name(src_name, fallback="book")
+            epub_bytes = await run_blocking(_pdf_editor_build_epub_blocking, title, text, lang)
+            fname = f"{title}_{_pdf_editor_now_stamp()}.epub"
+            return {"file_bytes": epub_bytes, "filename": fname, "caption": t["caption_epub"]}
+
+        elif operation == "ocr":
+            try:
+                ocr_pdf_bytes = await run_blocking(_pdf_editor_ocr_pdf_blocking, pdf_bytes, lang)
+            except Exception:
+                ocr_pdf_bytes = None
+
+            text = await run_blocking(_pdf_editor_extract_text_blocking, ocr_pdf_bytes or pdf_bytes, lang, 500000) if ocr_pdf_bytes or pdf_bytes else ""
+
+            base = _pdf_editor_sanitize_name(src_name, fallback="pdf")
+            results = []
+            if ocr_pdf_bytes:
+                fname_pdf = f"{base}_ocr_{_pdf_editor_now_stamp()}.pdf"
+                results.append({"file_bytes": ocr_pdf_bytes, "filename": fname_pdf, "caption": t["caption_pdf"]})
+            if text.strip():
+                fname_txt = f"{base}_ocr_{_pdf_editor_now_stamp()}.txt"
+                results.append({"file_content": text, "filename": fname_txt, "caption": t["caption_txt"]})
+            return {"multiple": results} if results else None
+
+    except Exception as e:
+        logger.error(f"PDF editor job {operation} failed: {e}", exc_info=True)
+    return None
+
+
+async def _process_tts_job(data: dict) -> dict | None:
+    """Process TTS job."""
+    # Extract data
+    text = data.get("text", "")
+    opts = data.get("opts", {})
+    lang_ui = data.get("lang_ui", "en")
+
+    if not text:
+        return None
+
+    # Reuse existing logic
+    from tts_tools import _tts_build_audio_bytes_blocking, _tts_texts
+    msgs = _tts_texts(lang_ui)
+    try:
+        audio_bytes, meta = await run_blocking(_tts_build_audio_bytes_blocking, text, opts)
+        if audio_bytes:
+            filename = f"tts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
+            caption = msgs["caption"]
+            if bool(meta.get("ai_used")):
+                caption += f"\n🤖 {msgs.get('ai_note', 'AI enhanced')}"
+            if int(meta.get("chunk_count") or 1) > 1:
+                caption += f"\n{msgs.get('chunking_note', 'Multiple parts')}"
+            output_key = str(opts.get("output") or "voice")
+            return {"file_bytes": audio_bytes, "filename": filename, "caption": caption, "output_key": output_key}
+    except Exception as e:
+        logger.error(f"TTS job failed: {e}", exc_info=True)
+    return None
+
+
+async def _process_audio_convert_job(data: dict, app: Application) -> dict | None:
+    """Process audio convert job."""
+    session = data.get("session", {})
+    output_mode = data.get("output_mode")
+    lang = data.get("lang", "en")
+    start_s = data.get("start_s")
+    end_s = data.get("end_s")
+
+    if not session or not output_mode:
+        return None
+
+    from audio_converter import (
+        _audio_conv_download_source_bytes, _audio_conv_transform_blocking, _audio_conv_apply_cover_blocking,
+        _audio_conv_sanitize_name, _audio_conv_default_name, _audio_conv_texts
+    )
+    t = _audio_conv_texts(lang)
+
+    try:
+        # Create a mock context for downloading
+        class MockContext:
+            def __init__(self, bot):
+                self.bot = bot
+
+        context = MockContext(app.bot)
+        source_bytes = await _audio_conv_download_source_bytes(context, str(session.get("file_id")))
+
+        out_bytes = await run_blocking(
+            _audio_conv_transform_blocking,
+            source_bytes,
+            output_mode=output_mode,
+            start_s=start_s,
+            end_s=end_s,
+        )
+
+        if output_mode == "mp3" and session.get("cover_file_id"):
+            try:
+                cover_bytes = await _audio_conv_download_source_bytes(context, str(session.get("cover_file_id")))
+                out_bytes = await run_blocking(_audio_conv_apply_cover_blocking, out_bytes, cover_bytes)
+            except Exception as cover_exc:
+                logger.warning("audio converter cover apply failed: %s", cover_exc, exc_info=True)
+
+        base_name = _audio_conv_sanitize_name(str(session.get("target_name") or "")) or _audio_conv_default_name(
+            str(session.get("file_name") or ""),
+            str(session.get("source_kind") or "audio"),
+        )
+        fname = f"{base_name}.ogg" if output_mode == "voice" else f"{base_name}.mp3"
+        caption = t["done_mp3"] if output_mode == "mp3" else t["done_voice"]
+
+        return {"file_bytes": out_bytes, "filename": fname, "caption": caption}
+
+    except Exception as e:
+        logger.error(f"Audio convert job failed: {e}", exc_info=True)
+    return None
+
+
+async def _process_sticker_convert_job(data: dict, app: Application) -> dict | None:
+    """Process sticker conversion job."""
+    source = data.get("source", {})
+    output_kind = str(data.get("output_kind") or "").strip()
+    lang = str(data.get("lang") or "en")
+    chat_id = int(data.get("chat_id") or 0)
+    reply_to_message_id = int(data.get("reply_to_message_id") or 0) or None
+
+    if not source or not output_kind or not chat_id:
+        return None
+
+    t = _sticker_tools._sticker_texts(lang)
+    file_id = str(source.get("file_id") or "").strip()
+    if not file_id:
+        return {"text": t["no_source"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
+
+    if not shutil.which("ffmpeg"):
+        return {"text": t["tools_missing"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
+
+    try:
+        class MockContext:
+            def __init__(self, bot):
+                self.bot = bot
+
+        context = MockContext(app.bot)
+        source_bytes = await _sticker_tools._sticker_download_source_bytes(context, file_id)
+        input_ext = _sticker_tools._sticker_guess_ext(
+            str(source.get("file_name") or ""),
+            str(source.get("mime_type") or ""),
+            str(source.get("kind") or "image"),
+        )
+
+        if output_kind == "static":
+            out_bytes = await run_blocking_heavy(
+                _sticker_tools._sticker_make_static_blocking,
+                source_bytes,
+                input_ext=input_ext,
+            )
+            done_msg = t["done_static"]
+            sticker_ext = ".webp"
+        elif output_kind == "remove_bg":
+            if not _sticker_tools._sticker_rembg_available():
+                return {
+                    "text": t["remove_bg_unavailable"],
+                    "chat_id": chat_id,
+                    "reply_to_message_id": reply_to_message_id,
+                }
+            removed_bg_png = await run_blocking_heavy(
+                _sticker_tools._sticker_remove_bg_blocking,
+                source_bytes,
+                input_ext=input_ext,
+            )
+            out_bytes = await run_blocking_heavy(
+                _sticker_tools._sticker_make_static_blocking,
+                removed_bg_png,
+                input_ext=".png",
+            )
+            done_msg = t["done_remove_bg"]
+            sticker_ext = ".webp"
+        elif output_kind == "video":
+            out_bytes = await run_blocking_heavy(
+                _sticker_tools._sticker_make_video_blocking,
+                source_bytes,
+                input_ext=input_ext,
+                max_seconds=_sticker_tools._sticker_video_max_seconds(),
+            )
+            done_msg = t["done_video"]
+            sticker_ext = ".webm"
+        else:
+            return None
+
+        return {
+            "multiple": [
+                {
+                    "sticker_bytes": out_bytes,
+                    "sticker_ext": sticker_ext,
+                    "chat_id": chat_id,
+                    "reply_to_message_id": reply_to_message_id,
+                },
+                {
+                    "text": done_msg,
+                    "chat_id": chat_id,
+                    "reply_to_message_id": reply_to_message_id,
+                },
+            ]
+        }
+
+    except Exception as e:
+        logger.error(f"Sticker convert job failed: {e}", exc_info=True)
+    return None
+
+
+async def _process_book_summary_job(data: dict, app: Application) -> dict | None:
+    """Process book summary job."""
+    book_id = data.get("book_id")
+    lang = data.get("lang", "en")
+    mode = data.get("mode")
+    chat_id = data.get("chat_id")
+    reply_to_message_id = data.get("reply_to_message_id")
+
+    if not book_id or not mode or not chat_id:
+        return None
+
+    from engagement_handlers import (
+        _run_book_summary_job, MESSAGES, _summary_send_text, _summary_progress_set, _summary_prepare_text_for_book,
+        _summary_summarize_text_blocking, get_result_title, _summary_mode_label, db_get_book_by_id, db_get_book_summary, db_upsert_book_summary
+    )
+    m = MESSAGES.get(lang, MESSAGES["en"])
+
+    try:
+        # Check cache first
+        cached = await run_blocking(db_get_book_summary, book_id, lang, mode)
+        if cached and cached.get("summary_text"):
+            book = await run_blocking(db_get_book_by_id, book_id)
+            if book:
+                title = get_result_title(book)
+                mode_label = _summary_mode_label(lang, mode)
+                header = m["summary_ready_title"].format(mode=mode_label)
+                body = f"{header}\n📘 {title}\n{m['summary_cached_note']}\n\n{cached['summary_text']}"
+                return {"text": body, "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
+
+        # Prepare text
+        book = await run_blocking(db_get_book_by_id, book_id)
+        if not book:
+            return {"text": m["summary_book_missing"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
+
+        extracted_text, source_hash = await _summary_prepare_text_for_book(None, book, lang, None)
+        if not extracted_text or len(extracted_text.strip()) < 80:
+            return {"text": m["summary_empty_text"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
+
+        title = get_result_title(book)
+        summary_text, model_name = await run_blocking(
+            _summary_summarize_text_blocking,
+            extracted_text,
+            lang,
+            mode,
+            title,
+            None,
+        )
+
+        summary_text = summary_text.strip()
+        if not summary_text:
+            return {"text": m["summary_ai_unavailable"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
+
+        # Save to DB
+        await run_blocking(
+            db_upsert_book_summary,
+            book_id,
+            lang,
+            mode,
+            summary_text,
+            model_name,
+            source_hash,
+        )
+
+        mode_label = _summary_mode_label(lang, mode)
+        header = m["summary_ready_title"].format(mode=mode_label)
+        body = f"{header}\n📘 {title}\n\n{summary_text}"
+        return {"text": body, "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
+
+    except Exception as e:
+        logger.error(f"Book summary job failed: {e}", exc_info=True)
+        return {"text": m["summary_error"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
+
+
+async def _send_job_result(app: Application, user_id: int, job_type: str, result: dict) -> None:
+    """Send job result to user."""
+    try:
+        multiple = result.get("multiple")
+        if multiple:
+            for item in multiple:
+                await _send_single_result(app, user_id, item)
+        else:
+            await _send_single_result(app, user_id, result)
+    except Exception as e:
+        logger.error(f"Failed to send job result to user {user_id}: {e}")
+
+
+async def _send_single_result(app: Application, user_id: int, result: dict) -> None:
+    """Send a single result item."""
+    sticker_bytes = result.get("sticker_bytes")
+    sticker_ext = result.get("sticker_ext")
+    file_bytes = result.get("file_bytes")
+    file_content = result.get("file_content")
+    filename = result.get("filename")
+    caption = result.get("caption", "Result")
+    text = result.get("text")
+    chat_id = result.get("chat_id", user_id)
+    reply_to_message_id = result.get("reply_to_message_id")
+    output_key = result.get("output_key")
+
+    if sticker_bytes and sticker_ext:
+        bio = io.BytesIO(sticker_bytes)
+        bio.name = f"sticker{sticker_ext}"
+        await app.bot.send_sticker(chat_id=chat_id, sticker=bio, reply_to_message_id=reply_to_message_id)
+    elif file_bytes and filename:
+        bio = io.BytesIO(file_bytes)
+        bio.name = filename
+        if output_key == "voice":
+            await app.bot.send_voice(chat_id=chat_id, voice=bio, caption=caption, reply_to_message_id=reply_to_message_id)
+        else:
+            await app.bot.send_document(chat_id=chat_id, document=bio, caption=caption, reply_to_message_id=reply_to_message_id)
+    elif file_content and filename:
+        bio = io.BytesIO(file_content.encode('utf-8'))
+        bio.name = filename
+        await app.bot.send_document(chat_id=chat_id, document=bio, caption=caption, reply_to_message_id=reply_to_message_id)
+    elif text:
+        await app.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
+    else:
+        await app.bot.send_message(chat_id=chat_id, text=f"✅ {caption}", reply_to_message_id=reply_to_message_id)
+
+
+async def _send_job_failure(app: Application, user_id: int, job_type: str, error: str) -> None:
+    """Send job failure notification to user."""
+    try:
+        await app.bot.send_message(chat_id=user_id, text=f"❌ {job_type.replace('_', ' ').title()} failed: {error}")
+    except Exception as e:
+        logger.error(f"Failed to send job failure to user {user_id}: {e}")
+
+
 def _build_handler_registry_deps() -> dict[str, object]:
     deps: dict[str, object] = {}
     missing: list[str] = []
@@ -5152,7 +6098,6 @@ def main():
             ",".join(str(x) for x in video_channels_for_log) or "none",
             str(book_storage_channel) if book_storage_channel else "none",
         )
-
         logger.info(
             "Ollama config: url=%s pdf_maker_model=%s tts_model=%s",
             os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/"),

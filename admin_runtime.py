@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
+import os
 import re
 import textwrap
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import ContextTypes
+
+try:
+    from rapidfuzz import fuzz
+except Exception:
+    fuzz = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +45,56 @@ def configure(deps: dict[str, Any]) -> None:
     missing = [key for key in _CONFIG_REQUIRED_KEYS if key not in globals()]
     if missing:
         raise RuntimeError(f"admin_runtime missing configured dependencies: {', '.join(missing)}")
+
+
+# Placeholder definitions for runtime-injected dependencies (replaced by configure())
+MESSAGES: dict[str, dict[str, str]] = {}
+def ensure_user_language(*args: Any, **kwargs: Any) -> str: raise RuntimeError("admin_runtime not configured")
+def _is_admin_user(*args: Any, **kwargs: Any) -> bool: raise RuntimeError("admin_runtime not configured")
+def spam_check_message(*args: Any, **kwargs: Any) -> tuple: raise RuntimeError("admin_runtime not configured")
+async def run_blocking(*args: Any, **kwargs: Any) -> Any: raise RuntimeError("admin_runtime not configured")
+async def safe_answer(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def _edit_progress_message(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def _send_chat_message(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def _send_preview_pdf(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def _send_progress_message(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+def _edit_progress_or_reply(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+def db_list_admin_task_runs(*args: Any, **kwargs: Any) -> list: raise RuntimeError("admin_runtime not configured")
+def db_insert_admin_task_run(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+def db_update_admin_task_run(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+def es_available(*args: Any, **kwargs: Any) -> bool: raise RuntimeError("admin_runtime not configured")
+def _tts_tools_available(*args: Any, **kwargs: Any) -> bool: raise RuntimeError("admin_runtime not configured")
+def _dupes_confirm_keyboard(*args: Any, **kwargs: Any): raise RuntimeError("admin_runtime not configured")
+def _update_dupes_status(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+def _compute_db_duplicate_cleanup_plan(*args: Any, **kwargs: Any) -> tuple: raise RuntimeError("admin_runtime not configured")
+def _compute_es_duplicate_cleanup_plan(*args: Any, **kwargs: Any) -> tuple: raise RuntimeError("admin_runtime not configured")
+def _format_dupes_status_text(*args: Any, **kwargs: Any) -> str: raise RuntimeError("admin_runtime not configured")
+def _get_dupes_status(*args: Any, **kwargs: Any) -> dict: raise RuntimeError("admin_runtime not configured")
+def is_bot_paused(*args: Any, **kwargs: Any) -> bool: raise RuntimeError("admin_runtime not configured")
+def get_missing_file_info(*args: Any, **kwargs: Any) -> list: raise RuntimeError("admin_runtime not configured")
+async def update_user_info(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def _send_main_menu(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def pause_bot_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def resume_bot_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def audit_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def prune_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+def InlineKeyboardButton(*args: Any, **kwargs: Any): raise RuntimeError("admin_runtime not configured")
+canvas: Any = None
+A4: Any = None
+pdfmetrics: Any = None
+TTFont: Any = None
+def _build_dupe_preview_lines(*args: Any, **kwargs: Any) -> list: raise RuntimeError("admin_runtime not configured")
+def get_es(*args: Any, **kwargs: Any) -> Any: raise RuntimeError("admin_runtime not configured")
+def delete_book_and_related(*args: Any, **kwargs: Any) -> int: raise RuntimeError("admin_runtime not configured")
+def list_users(*args: Any, **kwargs: Any) -> list: raise RuntimeError("admin_runtime not configured")
+def normalize(*args: Any, **kwargs: Any) -> str: raise RuntimeError("admin_runtime not configured")
+def latinize_text(*args: Any, **kwargs: Any) -> str: raise RuntimeError("admin_runtime not configured")
+def cache_user_results(*args: Any, **kwargs: Any) -> str: raise RuntimeError("admin_runtime not configured")
+def build_user_results_text(*args: Any, **kwargs: Any) -> tuple: raise RuntimeError("admin_runtime not configured")
+def build_user_results_keyboard(*args: Any, **kwargs: Any): raise RuntimeError("admin_runtime not configured")
+ES_INDEX: str = "books"
+USER_SEARCH_LIMIT: int = 30
+class NotFoundError(Exception): pass
 
 
 def _safe_asyncio_current_task():
@@ -173,15 +237,6 @@ def _admin_panel_keyboard(section: str = "main") -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🔄 Refresh panel", callback_data="adminp:nav:main"),
              InlineKeyboardButton("⬅ Back", callback_data="adminp:nav:main")],
         ]
-    elif section == "uploads":
-        rows = [
-            [InlineKeyboardButton("📊 Status", callback_data="adminp:act:upload_status")],
-            [InlineKeyboardButton("⬆ All", callback_data="adminp:act:upload_all"),
-             InlineKeyboardButton("🩹 Missing", callback_data="adminp:act:upload_missing")],
-            [InlineKeyboardButton("🆔 Unique", callback_data="adminp:act:upload_unique"),
-             InlineKeyboardButton("📦 Large", callback_data="adminp:act:upload_large")],
-            [InlineKeyboardButton("⬅ Back", callback_data="adminp:nav:main")],
-        ]
     elif section == "dupes":
         rows = [
             [InlineKeyboardButton("📊 Dupes status", callback_data="adminp:act:dupes_status")],
@@ -203,11 +258,10 @@ def _admin_panel_keyboard(section: str = "main") -> InlineKeyboardMarkup:
     else:
         rows = [
             [InlineKeyboardButton("🖥 System", callback_data="adminp:nav:system"),
-             InlineKeyboardButton("⬆ Uploads", callback_data="adminp:nav:uploads")],
-            [InlineKeyboardButton("🧼 Duplicates", callback_data="adminp:nav:dupes"),
-             InlineKeyboardButton("🧵 Tasks", callback_data="adminp:nav:tasks")],
-            [InlineKeyboardButton("🛠 Maintenance", callback_data="adminp:nav:maint"),
-             InlineKeyboardButton("🔄 Refresh", callback_data="adminp:nav:main")],
+             InlineKeyboardButton("🧼 Duplicates", callback_data="adminp:nav:dupes")],
+            [InlineKeyboardButton("🧵 Tasks", callback_data="adminp:nav:tasks"),
+             InlineKeyboardButton("🛠 Maintenance", callback_data="adminp:nav:maint")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="adminp:nav:main")],
             [InlineKeyboardButton("❌ Close", callback_data="adminp:act:close")],
         ]
     return InlineKeyboardMarkup(rows)
@@ -314,10 +368,9 @@ async def smoke_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "3. `🎙️ Text to Voice` -> wizard -> generate voice/audio",
         "4. `📄 PDF Maker` -> name/style/paper/orientation -> PDF send",
         "5. `🤖 AI Tools` -> AI Chat / Translator / Grammar / Email",
-        "6. `🛠️ Other Functions` -> Help / Top / Requests / Favorites / Profile",
+        "6. `🛠️ Other Functions` -> Help / Top / Favorites / Profile",
         "7. `🛠 Admin Control` -> User search / audit / admin actions",
-        "8. Request callbacks: request -> admin status -> user notification",
-        "9. Favorite / reaction buttons update caption counts correctly",
+        "8. Favorite / reaction buttons update caption counts correctly",
         "──────────",
         "Tip: test one feature per menu group after every refactor.",
     ])
@@ -342,6 +395,9 @@ async def handle_admin_panel_callback(update: Update, context: ContextTypes.DEFA
     await safe_answer(query)
 
     if kind == "nav":
+        if value == "uploads":
+            await _admin_panel_send_or_edit(update, context, "main")
+            return
         await _admin_panel_send_or_edit(update, context, value or "main")
         return
 

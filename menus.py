@@ -42,9 +42,9 @@ def build_main_menu_keyboard(
 
     if section == "other":
         keyboard = [
-            [m.get("menu_top_users", "🏆 Top Users")],
-            [m.get("menu_pdf_maker", "🤖 AI PDF Maker"), m.get("menu_pdf_editor", "🧰 PDF Editor")],
-            [m.get("menu_audio_converter", "🎛️ Audio Editor"), m.get("menu_sticker_tools", "🧩 Sticker Tools")],
+            [m.get("menu_text_to_voice", "🎙️ Text to Voice"), m.get("menu_pdf_maker", "🤖 AI PDF Maker")],
+            [m.get("menu_pdf_editor", "🧰 PDF Editor"), m.get("menu_audio_converter", "🎛️ Audio Editor")],
+            [m.get("menu_sticker_tools", "🧩 Sticker Tools"), m.get("menu_top_users", "🏆 Top Users")],
             [m.get("menu_contact_admin", "📞 Contact Admin"), m.get("menu_help", "❓ Help")],
             [m.get("menu_back", "⬅️ Back")],
         ]
@@ -86,8 +86,8 @@ def build_main_menu_keyboard(
     else:
         keyboard = [
             [m.get("menu_search_books", "🔎 Search Books")],
-            [m.get("menu_top_books", "🔥 Top Books")],
-            [m.get("menu_video_downloader", "⬇️ Insta Youtub"), m.get("menu_text_to_voice", "🎙️ Text to Voice")],
+            [m.get("menu_favorites", "⭐ Favorites")],
+            [m.get("menu_myprofile", "👤 My Profile"), m.get("menu_top_books", "🔥 Top Books")],
             [m.get("menu_other_functions", "🛠️ Other Functions")],
         ]
         if is_admin:
@@ -115,7 +115,7 @@ def build_main_menu_message_text(
 
     if section == "other":
         title = m.get("menu_other_functions", "🛠️ Other Functions")
-        subtitle = m.get("start_menu_subtitle", "Choose what you want to do 👇")
+        subtitle = m.get("menu_other_subtitle", "More tools and sections 👇")
         return f"{title}\n{subtitle}"
     if section == "admin":
         return admin_guide_text_fn() if admin_guide_text_fn else labels["admin_panel"]
@@ -139,7 +139,7 @@ def build_main_menu_chat_text(
 ) -> str:
     m = messages.get(lang, messages["en"])
     return (
-        f"{m.get('menu_other_functions', '🛠️ Other Functions')}\n{m.get('start_menu_subtitle', 'Choose what you want to do 👇')}"
+        f"{m.get('menu_other_functions', '🛠️ Other Functions')}\n{m.get('menu_other_subtitle', 'More tools and sections 👇')}"
         if section == "other"
         else m.get("start_menu_subtitle", "Choose what you want to do 👇")
     )

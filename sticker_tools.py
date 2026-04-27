@@ -29,6 +29,7 @@ async def _sticker_missing_dep_async(*args, **kwargs):
 
 _send_with_retry = _sticker_missing_dep_async
 run_blocking = _sticker_missing_dep_async
+run_blocking_heavy = None
 safe_answer = _sticker_missing_dep_async
 ensure_user_language = _sticker_missing_dep
 spam_check_callback = _sticker_missing_dep
@@ -37,6 +38,7 @@ _main_menu_keyboard = _sticker_missing_dep
 is_blocked = _sticker_missing_dep
 is_stopped_user = _sticker_missing_dep_async
 update_user_info = _sticker_missing_dep_async
+db_enqueue_background_job = _sticker_missing_dep
 
 
 def configure(deps: dict[str, Any]) -> None:
@@ -57,10 +59,12 @@ def _sticker_texts(lang: str) -> dict[str, str]:
             "source_saved": "✅ Qabul qilindi: {name}",
             "choose_action": "👇 Amalni tanlang.",
             "working": "⏳ Sticker tayyorlanmoqda...",
+            "queued": "✅ Sticker jarayoni fon rejimida boshlandi. Botdan foydalanishda davom etishingiz mumkin.",
+            "working_background": "⏳ Sticker fon rejimida tayyorlanmoqda. Botdan foydalanishda davom etishingiz mumkin.",
             "done_static": "✅ Sticker tayyor (WEBP).",
             "done_video": "✅ Video sticker tayyor (WEBM).",
             "done_remove_bg": "✅ Fon olib tashlandi va sticker tayyorlandi.",
-            "send_next": "📥 Yana media yuboring yoki tugmalar orqali davom eting.",
+            "send_next": "📥 Yana media yuborish uchun Sticker Tools bo‘limini qayta oching yoki boshqaruv xabariga javob bering.",
             "failed": "⚠️ Amal bajarilmadi. Qayta urinib ko‘ring.",
             "tools_missing": "⚠️ `ffmpeg` topilmadi.",
             "remove_bg_unavailable": "⚠️ Background remove hozircha mavjud emas (`rembg` o'rnatilmagan).",
@@ -78,7 +82,7 @@ def _sticker_texts(lang: str) -> dict[str, str]:
             "btn_remove_bg": "🪄 Fonni olib tashlash",
             "btn_complete": "✅ Yakunlash",
             "btn_cancel": "❌ Bekor",
-            "hint_buttons": "💡 Rasm/video yuboring yoki pastdagi tugmalarni bosing.",
+            "hint_buttons": "💡 Yangi media yubormoqchi bo‘lsangiz shu xabarga javob bering yoki pastdagi tugmalarni bosing.",
         }
     if lang == "ru":
         return {
@@ -87,10 +91,12 @@ def _sticker_texts(lang: str) -> dict[str, str]:
             "source_saved": "✅ Получено: {name}",
             "choose_action": "👇 Выберите действие.",
             "working": "⏳ Готовлю стикер...",
+            "queued": "✅ Задача стикера запущена в фоне. Можете продолжать пользоваться ботом.",
+            "working_background": "⏳ Стикер готовится в фоне. Можете продолжать пользоваться ботом.",
             "done_static": "✅ Стикер готов (WEBP).",
             "done_video": "✅ Видео-стикер готов (WEBM).",
             "done_remove_bg": "✅ Фон удалён, стикер готов.",
-            "send_next": "📥 Отправьте ещё медиа или продолжайте кнопками.",
+            "send_next": "📥 Чтобы отправить ещё медиа, снова откройте Sticker Tools или ответьте на служебное сообщение.",
             "failed": "⚠️ Операция не выполнена. Попробуйте снова.",
             "tools_missing": "⚠️ `ffmpeg` не найден.",
             "remove_bg_unavailable": "⚠️ Удаление фона сейчас недоступно (`rembg` не установлен).",
@@ -108,7 +114,7 @@ def _sticker_texts(lang: str) -> dict[str, str]:
             "btn_remove_bg": "🪄 Удалить фон",
             "btn_complete": "✅ Готово",
             "btn_cancel": "❌ Отмена",
-            "hint_buttons": "💡 Отправьте фото/видео или используйте кнопки ниже.",
+            "hint_buttons": "💡 Если хотите отправить новый файл, ответьте на это сообщение или используйте кнопки ниже.",
         }
     return {
         "start": "🧩 Sticker Tools is on.\n📥 Send photo, video, GIF, or sticker.",
@@ -116,10 +122,12 @@ def _sticker_texts(lang: str) -> dict[str, str]:
         "source_saved": "✅ Received: {name}",
         "choose_action": "👇 Choose an action.",
         "working": "⏳ Building sticker...",
+        "queued": "✅ Sticker task started in background. You can keep using the bot.",
+        "working_background": "⏳ Sticker is being prepared in background. You can keep using the bot.",
         "done_static": "✅ Sticker is ready (WEBP).",
         "done_video": "✅ Video sticker is ready (WEBM).",
         "done_remove_bg": "✅ Background removed and sticker is ready.",
-        "send_next": "📥 Send another media or continue with buttons.",
+        "send_next": "📥 To send another media, open Sticker Tools again or reply to the control message.",
         "failed": "⚠️ Operation failed. Please try again.",
         "tools_missing": "⚠️ `ffmpeg` is missing.",
         "remove_bg_unavailable": "⚠️ Background removal is unavailable right now (`rembg` is not installed).",
@@ -137,7 +145,7 @@ def _sticker_texts(lang: str) -> dict[str, str]:
         "btn_remove_bg": "🪄 Remove background",
         "btn_complete": "✅ Complete",
         "btn_cancel": "❌ Cancel",
-        "hint_buttons": "💡 Send photo/video or use buttons below.",
+        "hint_buttons": "💡 If you want to send new media, reply to this message or use the buttons below.",
     }
 
 
@@ -152,6 +160,46 @@ def _sticker_get_session(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
 
 def _sticker_save_session(context: ContextTypes.DEFAULT_TYPE, session: dict):
     context.user_data[_STICKER_SESSION_KEY] = dict(session)
+
+
+def _sticker_set_control_message(session: dict, message) -> None:
+    if not isinstance(session, dict) or not message:
+        return
+    try:
+        session["control_chat_id"] = int(getattr(message, "chat_id", 0) or 0)
+    except Exception:
+        session["control_chat_id"] = 0
+    try:
+        session["control_message_id"] = int(getattr(message, "message_id", 0) or 0)
+    except Exception:
+        session["control_message_id"] = 0
+
+
+def _sticker_is_reply_to_control(message, session: dict) -> bool:
+    if not message or not isinstance(session, dict):
+        return False
+    reply = getattr(message, "reply_to_message", None)
+    if not reply:
+        return False
+    try:
+        reply_message_id = int(getattr(reply, "message_id", 0) or 0)
+    except Exception:
+        reply_message_id = 0
+    try:
+        control_message_id = int(session.get("control_message_id") or 0)
+    except Exception:
+        control_message_id = 0
+    if not reply_message_id or not control_message_id or reply_message_id != control_message_id:
+        return False
+    try:
+        reply_chat_id = int(getattr(reply, "chat_id", 0) or 0)
+    except Exception:
+        reply_chat_id = 0
+    try:
+        control_chat_id = int(session.get("control_chat_id") or 0)
+    except Exception:
+        control_chat_id = 0
+    return not control_chat_id or reply_chat_id == control_chat_id
 
 
 def _sticker_max_bytes() -> int:
@@ -452,9 +500,124 @@ async def _sticker_send_result(update: Update, sticker_bytes: bytes, *, ext: str
     target_message = update.message or (update.callback_query.message if update.callback_query else None)
     if not target_message:
         return None
-    bio = io.BytesIO(sticker_bytes)
-    bio.name = f"sticker{ext}"
-    return await _send_with_retry(lambda: target_message.reply_sticker(sticker=bio))
+    def _build_sticker():
+        bio = io.BytesIO(sticker_bytes)
+        bio.name = f"sticker{ext}"
+        return bio
+    return await _send_with_retry(lambda: target_message.reply_sticker(sticker=_build_sticker()))
+
+
+async def _sticker_send_result_to_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    sticker_bytes: bytes,
+    *,
+    ext: str,
+    reply_to_message_id: int | None = None,
+):
+    def _build_sticker():
+        bio = io.BytesIO(sticker_bytes)
+        bio.name = f"sticker{ext}"
+        return bio
+
+    return await _send_with_retry(
+        lambda: context.bot.send_sticker(
+            chat_id=chat_id,
+            sticker=_build_sticker(),
+            reply_to_message_id=reply_to_message_id,
+        )
+    )
+
+
+def _sticker_source_snapshot(session: dict) -> dict[str, Any]:
+    return {
+        "kind": str(session.get("kind") or ""),
+        "file_id": str(session.get("file_id") or ""),
+        "file_unique_id": str(session.get("file_unique_id") or ""),
+        "file_size": int(session.get("file_size") or 0),
+        "file_name": str(session.get("file_name") or ""),
+        "mime_type": str(session.get("mime_type") or ""),
+    }
+
+
+async def _sticker_process_source_background(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    lang: str,
+    output_kind: str,
+    source: dict[str, Any],
+    chat_id: int,
+    reply_to_message_id: int | None = None,
+) -> bool:
+    t = _sticker_texts(lang)
+    file_id = str(source.get("file_id") or "").strip()
+    if not file_id:
+        if chat_id:
+            await _send_with_retry(lambda: context.bot.send_message(chat_id=chat_id, text=t["no_source"], reply_to_message_id=reply_to_message_id))
+        return False
+
+    if not shutil.which("ffmpeg"):
+        if chat_id:
+            await _send_with_retry(lambda: context.bot.send_message(chat_id=chat_id, text=t["tools_missing"], reply_to_message_id=reply_to_message_id))
+        return False
+
+    status = None
+    if chat_id:
+        status = await _send_with_retry(
+            lambda: context.bot.send_message(
+                chat_id=chat_id,
+                text=t["working_background"],
+                reply_to_message_id=reply_to_message_id,
+            )
+        )
+
+    blocking_runner = run_blocking_heavy if callable(globals().get("run_blocking_heavy")) else run_blocking
+
+    try:
+        source_bytes = await _sticker_download_source_bytes(context, file_id)
+        input_ext = _sticker_guess_ext(
+            str(source.get("file_name") or ""),
+            str(source.get("mime_type") or ""),
+            str(source.get("kind") or "image"),
+        )
+
+        if output_kind == "static":
+            out_bytes = await blocking_runner(_sticker_make_static_blocking, source_bytes, input_ext=input_ext)
+            sent = await _sticker_send_result_to_chat(context, chat_id, out_bytes, ext=".webp", reply_to_message_id=reply_to_message_id)
+            done_msg = t["done_static"]
+        elif output_kind == "remove_bg":
+            removed_bg_png = await blocking_runner(_sticker_remove_bg_blocking, source_bytes, input_ext=input_ext)
+            out_bytes = await blocking_runner(_sticker_make_static_blocking, removed_bg_png, input_ext=".png")
+            sent = await _sticker_send_result_to_chat(context, chat_id, out_bytes, ext=".webp", reply_to_message_id=reply_to_message_id)
+            done_msg = t["done_remove_bg"]
+        else:
+            out_bytes = await blocking_runner(
+                _sticker_make_video_blocking,
+                source_bytes,
+                input_ext=input_ext,
+                max_seconds=_sticker_video_max_seconds(),
+            )
+            sent = await _sticker_send_result_to_chat(context, chat_id, out_bytes, ext=".webm", reply_to_message_id=reply_to_message_id)
+            done_msg = t["done_video"]
+
+        if status:
+            try:
+                await status.edit_text(done_msg if sent else t["failed"])
+            except Exception:
+                pass
+        elif chat_id:
+            await _send_with_retry(lambda: context.bot.send_message(chat_id=chat_id, text=done_msg if sent else t["failed"], reply_to_message_id=reply_to_message_id))
+        return bool(sent)
+    except Exception as e:
+        logger.warning("sticker tools background processing failed: %s", e, exc_info=True)
+        if status:
+            try:
+                await status.edit_text(t["failed"])
+            except Exception:
+                pass
+        elif chat_id:
+            await _send_with_retry(lambda: context.bot.send_message(chat_id=chat_id, text=t["failed"], reply_to_message_id=reply_to_message_id))
+        return False
 
 
 async def _sticker_process_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, *, lang: str, output_kind: str) -> bool:
@@ -485,17 +648,19 @@ async def _sticker_process_and_send(update: Update, context: ContextTypes.DEFAUL
             str(session.get("kind") or "image"),
         )
 
+        blocking_runner = run_blocking_heavy if callable(globals().get("run_blocking_heavy")) else run_blocking
+
         if output_kind == "static":
-            out_bytes = await run_blocking(_sticker_make_static_blocking, source_bytes, input_ext=input_ext)
+            out_bytes = await blocking_runner(_sticker_make_static_blocking, source_bytes, input_ext=input_ext)
             sent = await _sticker_send_result(update, out_bytes, ext=".webp")
             done_msg = t["done_static"]
         elif output_kind == "remove_bg":
-            removed_bg_png = await run_blocking(_sticker_remove_bg_blocking, source_bytes, input_ext=input_ext)
-            out_bytes = await run_blocking(_sticker_make_static_blocking, removed_bg_png, input_ext=".png")
+            removed_bg_png = await blocking_runner(_sticker_remove_bg_blocking, source_bytes, input_ext=input_ext)
+            out_bytes = await blocking_runner(_sticker_make_static_blocking, removed_bg_png, input_ext=".png")
             sent = await _sticker_send_result(update, out_bytes, ext=".webp")
             done_msg = t["done_remove_bg"]
         else:
-            out_bytes = await run_blocking(
+            out_bytes = await blocking_runner(
                 _sticker_make_video_blocking,
                 source_bytes,
                 input_ext=input_ext,
@@ -574,8 +739,7 @@ async def _sticker_start_session_from_message(target_message, update: Update, co
         )
     )
     if sent:
-        session["prompt_chat_id"] = sent.chat_id
-        session["prompt_message_id"] = sent.message_id
+        _sticker_set_control_message(session, sent)
         _sticker_save_session(context, session)
 
 
@@ -593,6 +757,16 @@ async def _sticker_handle_media_input(update: Update, context: ContextTypes.DEFA
         _sticker_clear_session(context)
         await update.message.reply_text(t["expired"])
         return True
+
+    replied_to_control = _sticker_is_reply_to_control(update.message, session)
+    if session.get("processing"):
+        if not replied_to_control:
+            return False
+        await update.message.reply_text(t["working_background"])
+        return True
+
+    if session.get("file_id") and not replied_to_control:
+        return False
 
     media = _sticker_extract_media_info(update.message)
     if not media:
@@ -618,7 +792,7 @@ async def _sticker_handle_media_input(update: Update, context: ContextTypes.DEFA
     )
     _sticker_save_session(context, session)
 
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         f"{t['source_saved'].format(name=file_name)}\n{t['choose_action']}",
         reply_markup=_sticker_action_keyboard(
             lang,
@@ -626,6 +800,8 @@ async def _sticker_handle_media_input(update: Update, context: ContextTypes.DEFA
             has_source=True,
         ),
     )
+    _sticker_set_control_message(session, sent)
+    _sticker_save_session(context, session)
     return True
 
 
@@ -646,6 +822,15 @@ async def _sticker_handle_text_input(update: Update, context: ContextTypes.DEFAU
         return False
 
     txt = (update.message.text or "").strip()
+    replied_to_control = _sticker_is_reply_to_control(update.message, session)
+
+    if not replied_to_control:
+        return False
+
+    if session.get("processing"):
+        await update.message.reply_text(t["working_background"])
+        return True
+
     if txt.lower() in {"cancel", "stop"}:
         _sticker_clear_session(context)
         uid = update.effective_user.id if update.effective_user else None
@@ -656,9 +841,9 @@ async def _sticker_handle_text_input(update: Update, context: ContextTypes.DEFAU
         return False
 
     if not session.get("file_id"):
-        await update.message.reply_text(t["prompt_send_media"])
+        sent = await update.message.reply_text(t["prompt_send_media"])
     else:
-        await update.message.reply_text(
+        sent = await update.message.reply_text(
             t["hint_buttons"],
             reply_markup=_sticker_action_keyboard(
                 lang,
@@ -666,6 +851,8 @@ async def _sticker_handle_text_input(update: Update, context: ContextTypes.DEFAU
                 has_source=True,
             ),
         )
+    _sticker_set_control_message(session, sent)
+    _sticker_save_session(context, session)
     return True
 
 
@@ -726,21 +913,57 @@ async def handle_sticker_tools_callback(update: Update, context: ContextTypes.DE
         return
 
     media_kind = str(session.get("kind") or "")
+    chat_id = query.message.chat_id if query.message else (query.from_user.id if query.from_user else None)
+    reply_to_message_id = query.message.message_id if query.message else None
+    if not chat_id:
+        await safe_answer(query, t["failed"], show_alert=True)
+        return
+
+    async def _spawn_background(output_kind: str) -> None:
+        source = _sticker_source_snapshot(session)
+        user_id = query.from_user.id if query.from_user else 0
+        job_data = {
+            "lang": lang,
+            "output_kind": output_kind,
+            "source": source,
+            "chat_id": int(chat_id),
+            "reply_to_message_id": int(reply_to_message_id or 0),
+        }
+        job_id = db_enqueue_background_job("sticker_convert", user_id, job_data)
+        if not job_id:
+            await safe_answer(query, t["failed"], show_alert=True)
+            if query.message:
+                try:
+                    await query.message.reply_text(t["failed"])
+                except Exception:
+                    pass
+            return
+        _sticker_clear_session(context)
+        await safe_answer(query, t["queued"])
+        if query.message:
+            try:
+                await query.message.reply_text(t["queued"])
+            except Exception:
+                pass
 
     if action == "stkr:make_static":
         if media_kind == "image" and str(session.get("mime_type") or "").startswith("image/webp"):
             await safe_answer(query, t["already_static"], show_alert=False)
             return
-        await safe_answer(query)
-        await _sticker_process_and_send(update, context, lang=lang, output_kind="static")
+        if session.get("processing"):
+            await safe_answer(query, t["working_background"], show_alert=True)
+            return
+        await _spawn_background("static")
         return
 
     if action == "stkr:make_video":
         if media_kind != "video":
             await safe_answer(query, t["unsupported"], show_alert=True)
             return
-        await safe_answer(query)
-        await _sticker_process_and_send(update, context, lang=lang, output_kind="video")
+        if session.get("processing"):
+            await safe_answer(query, t["working_background"], show_alert=True)
+            return
+        await _spawn_background("video")
         return
 
     if action == "stkr:remove_bg":
@@ -750,8 +973,10 @@ async def handle_sticker_tools_callback(update: Update, context: ContextTypes.DE
         if not _sticker_rembg_available():
             await safe_answer(query, t["remove_bg_unavailable"], show_alert=True)
             return
-        await safe_answer(query)
-        await _sticker_process_and_send(update, context, lang=lang, output_kind="remove_bg")
+        if session.get("processing"):
+            await safe_answer(query, t["working_background"], show_alert=True)
+            return
+        await _spawn_background("remove_bg")
         return
 
     await safe_answer(query)

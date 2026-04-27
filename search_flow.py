@@ -9,6 +9,7 @@ import os
 import re
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
@@ -42,6 +43,43 @@ def _ttl_value(name: str, default: int, minimum: int = 1) -> int:
         return max(minimum, int(raw))
     except Exception:
         return max(minimum, int(default))
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        raw = globals().get(name, None)
+        if raw is None:
+            raw = os.getenv(name, str(default))
+        return int(str(raw).strip())
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    try:
+        raw = globals().get(name, None)
+        if raw is None:
+            raw = os.getenv(name, str(default))
+        return float(str(raw).strip())
+    except Exception:
+        return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = globals().get(name, None)
+        if raw is None:
+            raw = os.getenv(name, "1" if default else "0")
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
 
 
 def _search_cache_namespace() -> str:
@@ -161,6 +199,49 @@ async def _send_reaction_for_message(update: Update, context: ContextTypes.DEFAU
 async def _send_heart_reaction_for_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_reaction_for_message(update, context, "❤️")
 
+
+def _normalize_audiobook_part_title(raw_name: str | None, part_index: int | None = None) -> str:
+    """
+    Normalize audiobook part titles using the project's existing book normalizer.
+    Falls back to a safe lowercase stem if the normalizer is unavailable.
+    """
+    candidate = str(raw_name or "").strip()
+    if candidate:
+        candidate = Path(candidate).stem or candidate
+    else:
+        candidate = f"Part {part_index or 1}"
+
+    norm_fn = globals().get("normalize")
+    if callable(norm_fn):
+        try:
+            normalized = str(norm_fn(candidate)).strip()
+            if normalized:
+                return normalized
+        except Exception:
+            pass
+
+    candidate = re.sub(r"\s+", " ", candidate).strip().lower()
+    return candidate or f"part {part_index or 1}"
+
+
+def _normalize_audiobook_folder_title(raw_name: str | None, fallback_id: str | None = None) -> str:
+    """
+    Normalize the audiobook folder name to match the book layout style.
+    """
+    candidate = str(raw_name or "").strip()
+    if candidate:
+        candidate = Path(candidate).stem or candidate
+    else:
+        candidate = str(fallback_id or "audiobook").strip()
+
+    norm_fn = globals().get("normalize")
+    if callable(norm_fn):
+        try:
+            normalized = str(norm_fn(candidate)).strip()
+            if normalized:
+                return normalized
+        except Exception:
+            pass
 
 def _callback_reaction_state_key(query) -> str | None:
     msg = getattr(query, "message", None)
@@ -371,6 +452,25 @@ async def _pick_audio_upload_channel_id(
         return channel_id
 
 
+def _resolve_audio_storage_channel_id() -> int | None:
+    """
+    Resolve the single Telegram channel used for audiobook storage.
+    Reuse the book storage channel so audiobook parts follow the same pipeline.
+    """
+    raw_candidates: tuple[Any, ...] = (
+        globals().get("BOOK_STORAGE_CHANNEL_ID"),
+        os.getenv("BOOK_STORAGE_CHANNEL_ID", ""),
+    )
+    for raw in raw_candidates:
+        try:
+            value = int(str(raw or "").strip())
+        except Exception:
+            continue
+        if value != 0:
+            return value
+    return None
+
+
 async def _can_show_delete_button(update: Update, user_id: int | None) -> bool:
     if not user_id:
         return False
@@ -391,11 +491,18 @@ async def _can_show_delete_button(update: Update, user_id: int | None) -> bool:
     return True
 
 
-def _is_group_chat(update: Update) -> bool:
-    chat_type = str(getattr(update.effective_chat, "type", "") or "").lower()
-    if not chat_type:
-        cb = getattr(update, "callback_query", None)
-        msg = getattr(cb, "message", None) or getattr(update, "effective_message", None)
+def _is_group_chat(update_or_chat) -> bool:
+    """Return True for either an Update or a Chat object in a group/supergroup."""
+    chat = getattr(update_or_chat, "effective_chat", None)
+    if chat is None:
+        chat = getattr(update_or_chat, "chat", None)
+    if chat is None and hasattr(update_or_chat, "type"):
+        chat = update_or_chat
+
+    chat_type = str(getattr(chat, "type", "") or "").lower()
+    if not chat_type and hasattr(update_or_chat, "callback_query"):
+        cb = getattr(update_or_chat, "callback_query", None)
+        msg = getattr(cb, "message", None) or getattr(update_or_chat, "effective_message", None)
         chat_type = str(getattr(getattr(msg, "chat", None), "type", "") or "").lower()
     return chat_type in {"group", "supergroup"}
 
@@ -546,16 +653,21 @@ def build_results_text(query: str, entries: list, page: int, lang: str):
     end = start + PAGE_SIZE
     page_entries = entries[start:end]
 
-    header = MESSAGES[lang]["results_header"].format(
-        query=query,
-        page=page + 1,
-        pages=pages,
-        total=total
-    ) + "\n\n"
-    lines = [f"{i}. {e['title']}" for i, e in enumerate(page_entries, start=start + 1)]
+    header = MESSAGES[lang]["results_header"].format(query=query, page=page + 1, pages=pages, total=total)
+    subtitle = MESSAGES[lang]["results_pick_hint"]
+    page_line = MESSAGES[lang]["results_page_line"].format(page=page + 1, pages=pages)
+    lines = []
+    for i, e in enumerate(page_entries, start=start + 1):
+        title = str(e.get("title") or "").strip()
+        if len(title) > 88:
+            title = title[:85].rstrip() + "..."
+        lines.append(MESSAGES[lang]["results_item_line"].format(index=i, title=title))
+        subtitle = str(e.get("subtitle") or "").strip()
+        if subtitle:
+            lines.append(f"   {subtitle}")
     body = "\n".join(lines)
     footer = "\n\n" + MESSAGES[lang]["use_buttons"]
-    return header + body + footer, page_entries, pages
+    return "\n".join([header, subtitle, page_line, "", body]) + footer, page_entries, pages
 
 
 def build_results_keyboard(entries: list, page: int, pages: int, query_id: str):
@@ -593,16 +705,95 @@ def build_user_results_text(query: str, entries: list, page: int, lang: str):
     end = start + PAGE_SIZE
     page_entries = entries[start:end]
 
-    header = MESSAGES[lang]["user_results_header"].format(
-        query=query,
-        page=page + 1,
-        pages=pages,
-        total=total
-    ) + "\n\n"
-    lines = [f"{i}. {e['title']}" for i, e in enumerate(page_entries, start=start + 1)]
+    header = MESSAGES[lang]["user_results_header"].format(query=query, page=page + 1, pages=pages, total=total)
+    subtitle = MESSAGES[lang]["user_results_pick_hint"]
+    page_line = MESSAGES[lang]["results_page_line"].format(page=page + 1, pages=pages)
+    lines = []
+    for i, e in enumerate(page_entries, start=start + 1):
+        lines.append(MESSAGES[lang]["results_item_line"].format(index=i, title=e["title"]))
+        subtitle = str(e.get("subtitle") or "").strip()
+        if subtitle:
+            lines.append(f"   {subtitle}")
     body = "\n".join(lines)
     footer = "\n\n" + MESSAGES[lang]["use_buttons"]
-    return header + body + footer, page_entries, pages
+    return "\n".join([header, subtitle, page_line, "", body]) + footer, page_entries, pages
+
+
+def _book_entry_format(book: dict) -> str:
+    path = str((book or {}).get("path") or "").strip()
+    if path:
+        ext = os.path.splitext(path)[1].lstrip(".").upper()
+        if ext:
+            return ext
+    title = str((book or {}).get("title") or (book or {}).get("display_name") or (book or {}).get("book_name") or "").strip()
+    if "." in title:
+        ext = title.rsplit(".", 1)[-1].strip().upper()
+        if 1 <= len(ext) <= 5 and ext.isalnum():
+            return ext
+    return ""
+
+
+def _score_book_entry(book: dict, query_text: str, base_score: float = 0.0) -> float:
+    query_norm = normalize(query_text).lower().strip()
+    tokenize_fn = globals().get("tokenize")
+    if callable(tokenize_fn):
+        try:
+            query_tokens = [token for token in tokenize_fn(query_text) if token]
+        except Exception:
+            query_tokens = [token for token in query_norm.split() if token]
+    else:
+        query_tokens = [token for token in query_norm.split() if token]
+    title = normalize(get_result_title(book)).lower().strip()
+    display = normalize(str(book.get("display_name") or "")).lower().strip()
+    haystacks = [text for text in (title, display) if text]
+    haystack_token_sets: list[set[str]] = []
+    for text in haystacks:
+        if callable(tokenize_fn):
+            try:
+                haystack_token_sets.append(set(tokenize_fn(text)))
+                continue
+            except Exception:
+                pass
+        haystack_token_sets.append(set(token for token in text.split() if token))
+
+    score = float(base_score or 0.0)
+    if query_tokens and not any(set(query_tokens) & token_set for token_set in haystack_token_sets):
+        return -10000.0
+    if query_norm:
+        if any(text == query_norm for text in haystacks):
+            score += 1000
+        elif any(text.startswith(query_norm) for text in haystacks):
+            score += 700
+        elif query_tokens and any(all(token in text for token in query_tokens) for text in haystacks):
+            score += 400
+        elif any(query_norm in text for text in haystacks):
+            score += 250
+
+    file_id = str(book.get("file_id") or "").strip()
+    path = str(book.get("path") or "").strip()
+    if file_id:
+        score += 120
+    if path:
+        score += 60
+    if str(book.get("indexed") or "").lower() in {"1", "true"}:
+        score += 15
+    return score
+
+
+def _build_book_entry(book: dict, query_text: str, base_score: float = 0.0) -> dict:
+    return {
+        "id": str(book.get("id") or "").strip(),
+        "title": get_result_title(book),
+        "subtitle": "",
+        "score": _score_book_entry(book, query_text, base_score),
+    }
+
+
+def _book_entry_dedupe_key(entry: dict) -> str:
+    title = normalize(str((entry or {}).get("title") or "")).lower().strip()
+    title = re.sub(r"\b(pdf|epub|djvu|fb2|mobi|docx?|txt|rtf)\b", "", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
 
 
 def build_user_results_keyboard(entries: list, page: int, pages: int, query_id: str):
@@ -638,12 +829,14 @@ def build_user_info_text(user: dict) -> str:
     language = user.get("language") or "—"
     joined = user.get("joined_date") or "—"
     audio_allowed = "✅" if bool(user.get("audio_allowed")) else "❌"
+    rename_allowed = "✅" if bool(user.get("rename_allowed")) else "❌"
     return "\n".join([
         f"👤 Name: {name}",
         f"🔤 Username: {username}",
         f"🆔 User ID: {user.get('id')}",
         f"🌐 Language: {language}",
         f"📅 Joined: {joined}",
+        f"✏️ Rename allowed: {rename_allowed}",
         f"🎧 Audio allowed: {audio_allowed}",
     ])
 
@@ -653,6 +846,7 @@ def build_user_admin_keyboard(user: dict) -> InlineKeyboardMarkup:
     blocked = bool(user.get("blocked"))
     upload_allowed = bool(user.get("allowed"))
     delete_allowed = bool(user.get("delete_allowed"))
+    rename_allowed = bool(user.get("rename_allowed"))
     audio_allowed = bool(user.get("audio_allowed"))
     stopped = bool(user.get("stopped"))
 
@@ -666,9 +860,10 @@ def build_user_admin_keyboard(user: dict) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(f"🗑️ Delete {mark(delete_allowed)}", callback_data=f"uact:del:{user_id}"),
-            InlineKeyboardButton(f"🔇 Stop {mark(stopped)}", callback_data=f"uact:stop:{user_id}"),
+            InlineKeyboardButton(f"✏️ Rename {mark(rename_allowed)}", callback_data=f"uact:rename:{user_id}"),
         ],
         [
+            InlineKeyboardButton(f"🔇 Stop {mark(stopped)}", callback_data=f"uact:stop:{user_id}"),
             InlineKeyboardButton(f"🎧 Audio {mark(audio_allowed)}", callback_data=f"uact:audio:{user_id}"),
         ],
         [
@@ -937,6 +1132,18 @@ async def _cache_audiobook_part_file_id(part: dict, message) -> None:
         )
 
 
+def _audiobook_part_media_kind(part: dict) -> str:
+    kind = str(part.get("media_kind") or "").strip().lower()
+    if kind in {"audio", "voice", "document"}:
+        return kind
+    path = str(part.get("path") or "").strip().lower()
+    if path.endswith((".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".oga", ".opus")):
+        return "audio"
+    if path.endswith((".pdf", ".txt", ".doc", ".docx", ".epub", ".rtf", ".mobi", ".djvu", ".fb2")):
+        return "document"
+    return "document"
+
+
 async def _send_audiobook_part_to_chat(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -948,6 +1155,9 @@ async def _send_audiobook_part_to_chat(
     file_id = str(part.get("file_id") or "").strip()
     title = str(part.get("title") or f"Part {part.get('part_index', 0)}").strip() or None
     duration = part.get("duration_seconds")
+    media_kind = _audiobook_part_media_kind(part)
+    local_path = str(part.get("path") or "").strip()
+    cover_input = get_book_thumbnail_input() if media_kind in {"audio", "document"} else None
 
     if file_id:
         send_attempts = (
@@ -967,6 +1177,48 @@ async def _send_audiobook_part_to_chat(
                     part.get("id"),
                     e,
                 )
+
+    if local_path and Path(local_path).exists():
+        try:
+            filename = Path(local_path).name
+            if media_kind == "audio":
+                with open(local_path, "rb") as fh:
+                    sent = await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=InputFile(fh, filename=filename),
+                        caption=caption,
+                        title=title,
+                        duration=duration,
+                        reply_markup=reply_markup,
+                        thumbnail=cover_input,
+                    )
+            elif media_kind == "voice":
+                with open(local_path, "rb") as fh:
+                    sent = await context.bot.send_voice(
+                        chat_id=chat_id,
+                        voice=InputFile(fh, filename=filename),
+                        caption=caption,
+                        duration=duration,
+                        reply_markup=reply_markup,
+                    )
+            else:
+                with open(local_path, "rb") as fh:
+                    sent = await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=InputFile(fh, filename=filename),
+                        caption=caption,
+                        reply_markup=reply_markup,
+                        thumbnail=cover_input,
+                    )
+            await _cache_audiobook_part_file_id(part, sent)
+            return sent
+        except Exception as e:
+            logger.debug(
+                "Audiobook part local-path send failed for %s (%s): %s",
+                part.get("id"),
+                local_path,
+                e,
+            )
 
     try:
         channel_id = int(part.get("channel_id") or 0)
@@ -1091,7 +1343,7 @@ async def handle_audiobook_part_callback(update: Update, context: ContextTypes.D
     caption = f"{part_index}/{len(all_parts)}"
     # Build keyboard with delete button (admin only)
     kb = None
-    if _is_admin_user(query.from_user.id) and not _is_group_chat(update):
+    if _is_admin_user(query.from_user.id) and not _is_group_chat(getattr(update, "effective_chat", None)):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Delete Part", callback_data=f"apdel:{part_id}")]])
     sent = await _send_audiobook_part_to_chat(
         context,
@@ -1250,7 +1502,7 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # not an audio attachment
         logger.debug("handle_abook_audio: not an audio attachment, returning")
         return
-    # insert part record
+
     lang = ensure_user_language(update, context)
     audio_book_id = pending.get("audio_book_id")
     part_index = pending.get("next_part_index", 1)
@@ -1259,6 +1511,7 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     file_id = file.file_id
     file_unique = getattr(file, "file_unique_id", None)
     duration = getattr(file, "duration", None)
+    media_kind = "audio" if getattr(msg, "audio", None) else "voice" if getattr(msg, "voice", None) else "document"
     stored_channel_id = None
     stored_channel_message_id = None
 
@@ -1439,17 +1692,18 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.error(f"Failed to shift audiobook parts: {e}")
             try:
-                await msg.reply_text("❌ Couldn't prepare insert position. Please try again.")
+                await msg.reply_text(MESSAGES[lang]["audiobook_insert_prepare_failed"])
             except Exception:
                 pass
             raise ApplicationHandlerStop()
 
     try:
-        await run_blocking(
+        part_id = await run_blocking(
             insert_audio_book_part,
             audio_book_id=audio_book_id,
             part_index=part_index,
             title=title,
+            media_kind=media_kind,
             file_id=file_id,
             file_unique_id=file_unique,
             path=None,
@@ -1462,12 +1716,19 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # a part_index collision (or other constraint). Don't block reuse across books.
         if "duplicate" in str(e).lower() or "unique" in str(e).lower():
             try:
-                await msg.reply_text("❌ Couldn't save this audio part. Please try again.")
+                await msg.reply_text(MESSAGES[lang]["audiobook_part_save_constraint"])
             except Exception:
                 pass
             logger.warning(f"Audio part insertion failed (constraint): {e}")
             raise ApplicationHandlerStop()
-        raise
+        error_text = str(e).strip()[:200] or "unknown error"
+        failure_text = MESSAGES[lang]["audiobook_part_save_failed"].format(error=error_text)
+        logger.error("Audio part insertion failed for audiobook=%s part_index=%s: %s", audio_book_id, part_index, e, exc_info=True)
+        try:
+            await msg.reply_text(failure_text)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop()
 
     if is_insert_mode:
         # Single-file insert: clear the flow after insertion
@@ -1475,7 +1736,7 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         pending["next_part_index"] = part_index + 1
     try:
-        await msg.reply_text(MESSAGES[lang]["audiobook_part_saved"].format(index=part_index))
+        await msg.reply_text(MESSAGES[lang].get("audiobook_part_saved", "✅ Part #{index} saved.").format(index=part_index))
     except Exception:
         pass
 
@@ -1501,8 +1762,8 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             title = str(t)
                     if title == notify_book_id:
                         title = str(
-                            book_row.get("book_name")
-                            or book_row.get("display_name")
+                            book_row.get("display_name")
+                            or book_row.get("book_name")
                             or title
                         )
 
@@ -1550,27 +1811,17 @@ async def _handle_missing_audiobook_request(
     except Exception as e:
         logger.debug("Failed to resolve title for audiobook request (book_id=%s): %s", book_id, e)
 
-    request_query = msgs.get(
-        "audiobook_missing_request_query",
-        "🎧 Audiobook request: {title} [book_id: {book_id}]",
-    ).format(title=book_title, book_id=book_id)
-
     try:
+        sender = update.effective_user or getattr(query, "from_user", None)
         send_request = globals().get("send_request_to_admin")
-        if callable(send_request) and update.effective_user:
-            try:
-                await send_request(
-                    context,
-                    update.effective_user,
-                    request_query,
-                    lang,
-                    book_id=book_id,
-                )
-            except TypeError:
-                # Backward compatibility for older bot bridge signatures.
-                await send_request(context, update.effective_user, request_query, lang)
+        request_query = msgs.get(
+            "audiobook_missing_request_query",
+            "🎧 Audiobook request: {title} [book_id: {book_id}]",
+        ).format(title=book_title, book_id=book_id)
+        if callable(send_request) and sender:
+            await send_request(context, sender, request_query, lang, book_id=book_id)
     except Exception as e:
-        logger.warning("Failed to send audiobook request to admin group (book_id=%s): %s", book_id, e)
+        logger.warning("Failed to create audiobook request (book_id=%s): %s", book_id, e)
 
     try:
         await query.message.reply_text(
@@ -1791,7 +2042,7 @@ async def handle_audiobook_part_play_callback(update: Update, context: ContextTy
     # Send the audio file with delete button for audio managers
     keyboard = []
     can_manage_audio = False
-    if not _is_group_chat(update) and callable(globals().get("is_audio_allowed")):
+    if not _is_group_chat(getattr(update, "effective_chat", None)) and callable(globals().get("is_audio_allowed")):
         try:
             can_manage_audio = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
         except Exception:
@@ -1819,7 +2070,7 @@ async def handle_audiobook_part_delete_callback(update: Update, context: Context
     if not query:
         return
     lang = ensure_user_language(update, context)
-    if _is_group_chat(update):
+    if _is_group_chat(getattr(update, "effective_chat", None)):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     can_manage_audio = False
@@ -1855,7 +2106,7 @@ async def handle_audiobook_delete_callback(update: Update, context: ContextTypes
     if not query:
         return
     lang = ensure_user_language(update, context)
-    if _is_group_chat(update):
+    if _is_group_chat(getattr(update, "effective_chat", None)):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     can_manage_audio = False
@@ -1887,7 +2138,7 @@ async def handle_audiobook_delete_by_book_callback(update: Update, context: Cont
     if not query:
         return
     lang = ensure_user_language(update, context)
-    if _is_group_chat(update):
+    if _is_group_chat(getattr(update, "effective_chat", None)):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     can_manage_audio = False
@@ -1933,7 +2184,7 @@ async def handle_audiobook_add_callback(update: Update, context: ContextTypes.DE
     if not query:
         return
     lang = ensure_user_language(update, context)
-    if _is_group_chat(update):
+    if _is_group_chat(getattr(update, "effective_chat", None)):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     can_manage_audio = False
@@ -2001,7 +2252,7 @@ async def handle_audiobook_add_callback(update: Update, context: ContextTypes.DE
         logger.error(f"Failed to create audiobook for book {book_id}: {e}")
         await safe_answer(query)
         try:
-            await query.message.reply_text("❌ Failed to create audiobook. Please try again.")
+            await query.message.reply_text(MESSAGES[lang]["audiobook_create_failed"])
         except Exception:
             pass
 
@@ -2036,6 +2287,27 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             handled = await _handle_main_menu_action(update, context, lang, menu_action)
             if handled:
                 return
+
+        if context.user_data.get("awaiting_request"):
+            expires_at = float(context.user_data.get("awaiting_request_until") or 0)
+            if expires_at and time.time() > expires_at:
+                context.user_data["awaiting_request"] = False
+                context.user_data.pop("awaiting_request_until", None)
+            else:
+                query_text = update.message.text.strip()
+                if query_text.lower() in {"cancel", "stop", "/cancel"}:
+                    context.user_data["awaiting_request"] = False
+                    context.user_data.pop("awaiting_request_until", None)
+                    await update.message.reply_text(MESSAGES[lang].get("menu_flow_cancelled", "❌ Cancelled."))
+                    return
+                if query_text:
+                    context.user_data["awaiting_request"] = False
+                    context.user_data.pop("awaiting_request_until", None)
+                    send_request = globals().get("send_request_to_admin")
+                    if callable(send_request):
+                        await send_request(context, update.effective_user, query_text, lang)
+                        await update.message.reply_text(MESSAGES[lang]["request_sent"])
+                        return
 
         # Keep search mode stable between messages.
         search_mode = str(context.user_data.get("search_mode") or "").strip().lower()
@@ -2112,54 +2384,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 return
 
-        # Admin reply to request status
-        pending = context.user_data.get("pending_request_reply")
-        if pending and _is_admin_user(update.effective_user.id):
-            if time.time() > pending.get("expires_at", 0):
-                context.user_data.pop("pending_request_reply", None)
-            else:
-                admin_text = update.message.text.strip()
-                if admin_text.lower() in {"cancel", "stop"}:
-                    context.user_data.pop("pending_request_reply", None)
-                    await update.message.reply_text(MESSAGES[lang]["request_admin_cancelled"])
-                    return
-
-                record = await run_blocking(
-                    update_request_status,
-                    pending["request_id"],
-                    pending["status"],
-                    update.effective_user,
-                    admin_text,
-                )
-                if not record:
-                    await update.message.reply_text(MESSAGES[lang]["page_expired"])
-                    context.user_data.pop("pending_request_reply", None)
-                    return
-
-                # Notify requester in their language
-                req_lang = record.get("language", "en")
-                base = MESSAGES[req_lang].get(f"request_reply_{record.get('status')}", "")
-                msg = base.format(query=record.get("query"))
-                if admin_text:
-                    msg += "\n\n" + MESSAGES[req_lang]["request_reply_note"].format(note=admin_text)
-                await context.bot.send_message(chat_id=record["user_id"], text=msg)
-
-                # Update admin message if possible
-                try:
-                    keyboard = build_request_admin_keyboard(record.get("status", "open"), record.get("id"))
-                    await context.bot.edit_message_text(
-                        chat_id=pending["admin_chat_id"],
-                        message_id=pending["admin_message_id"],
-                        text=format_request_admin_text(record),
-                        reply_markup=keyboard
-                    )
-                except Exception:
-                    pass
-
-                context.user_data.pop("pending_request_reply", None)
-                await update.message.reply_text(MESSAGES[lang]["request_status_updated_admin"].format(status=record.get("status")))
-                return
-
         # Admin reply to upload access request
         pending_upload = context.user_data.get("pending_upload_reply")
         if pending_upload and _is_admin_user(update.effective_user.id):
@@ -2213,6 +2437,89 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(MESSAGES[lang]["upload_status_updated_admin"].format(status=record.get("status")))
                 return
 
+        pending_book_rename = context.user_data.get("pending_book_rename")
+        can_rename_books_fn = globals().get("can_rename_books")
+        if pending_book_rename and callable(can_rename_books_fn) and can_rename_books_fn(update.effective_user.id):
+            if time.time() > pending_book_rename.get("expires_at", 0):
+                context.user_data.pop("pending_book_rename", None)
+            else:
+                rename_text = update.message.text.strip()
+                if rename_text.lower() in {"cancel", "stop", "/cancel"}:
+                    context.user_data.pop("pending_book_rename", None)
+                    await update.message.reply_text(
+                        MESSAGES[lang].get("book_rename_cancelled", "✖️ Book rename cancelled.")
+                    )
+                    return
+
+                rename_fn = globals().get("apply_book_rename")
+                if not callable(rename_fn):
+                    context.user_data.pop("pending_book_rename", None)
+                    await update.message.reply_text(MESSAGES[lang]["error"])
+                    return
+
+                book_id = str(pending_book_rename.get("book_id") or "").strip()
+                if not book_id:
+                    context.user_data.pop("pending_book_rename", None)
+                    await update.message.reply_text(MESSAGES[lang]["page_expired"])
+                    return
+
+                progress_text = MESSAGES[lang].get(
+                    "book_rename_processing",
+                    "⏳ Updating book name...",
+                )
+                progress_msg = None
+                try:
+                    progress_msg = await update.message.reply_text(progress_text)
+                except Exception:
+                    progress_msg = None
+
+                result = await rename_fn(context.bot, book_id, rename_text, update.effective_user.id)
+                if result.get("ok"):
+                    context.user_data.pop("pending_book_rename", None)
+                    new_name = str(result.get("display_name") or result.get("book_name") or rename_text).strip()
+                    if result.get("changed"):
+                        done_text = MESSAGES[lang].get(
+                            "book_rename_done",
+                            "✅ Book name updated to: {name}",
+                        ).format(name=new_name)
+                    else:
+                        done_text = MESSAGES[lang].get(
+                            "book_rename_unchanged",
+                            "ℹ️ Book name is already set to: {name}",
+                        ).format(name=new_name)
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit_text(done_text)
+                        except Exception:
+                            await update.message.reply_text(done_text)
+                    else:
+                        await update.message.reply_text(done_text)
+                    return
+
+                error_text = str(result.get("error") or MESSAGES[lang]["error"])
+                if bool(result.get("retryable")):
+                    retry_text = MESSAGES[lang].get(
+                        "book_rename_retry",
+                        "⚠️ Could not update that name. Send another name or /cancel.",
+                    )
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit_text(f"{retry_text}\n\n{error_text}")
+                        except Exception:
+                            await update.message.reply_text(f"{retry_text}\n\n{error_text}")
+                    else:
+                        await update.message.reply_text(f"{retry_text}\n\n{error_text}")
+                else:
+                    context.user_data.pop("pending_book_rename", None)
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit_text(error_text)
+                        except Exception:
+                            await update.message.reply_text(error_text)
+                    else:
+                        await update.message.reply_text(error_text)
+                return
+
         # Admin adding audiobook parts
         pending_abook = context.user_data.get("pending_abook")
         if pending_abook and _is_admin_user(update.effective_user.id):
@@ -2248,11 +2555,9 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         MESSAGES[lang]["audiobook_insert_invalid"].format(max=insert_max)
                     )
                     return
-            # If in audiobook flow and not a command, don't process as search
-            # This prevents interfering with normal search when audiobook mode is active
+            # If in audiobook flow and not a command, don't process as search.
+            # This prevents interfering with normal search when audiobook mode is active.
             return
-
-
         if await _admin_tools_handle_admin_menu_prompt_input(
             update=update,
             context=context,
@@ -2265,8 +2570,9 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ):
             return
 
-        if await _video_dl_handle_text_input(update, context, lang):
-            return
+        if callable(globals().get("_video_dl_handle_text_input")):
+            if await _video_dl_handle_text_input(update, context, lang):
+                return
 
         if callable(globals().get("_audio_conv_handle_text_input")):
             if await _audio_conv_handle_text_input(update, context, lang):
@@ -2283,29 +2589,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_lang = thanks_lang if thanks_lang in MESSAGES else lang
             await safe_reply(update, MESSAGES[reply_lang]["thanks_reply"])
             return
-
-        if context.user_data.get("awaiting_request"):
-            expires_at = context.user_data.get("awaiting_request_until", 0)
-            if expires_at and time.time() > expires_at:
-                context.user_data["awaiting_request"] = False
-                context.user_data.pop("awaiting_request_until", None)
-            else:
-                request_text = update.message.text.strip()
-                if not request_text:
-                    await update.message.reply_text(MESSAGES[lang]["request_prompt"])
-                    return
-                menu_action = _main_menu_text_action(request_text)
-                if menu_action:
-                    context.user_data["awaiting_request"] = False
-                    context.user_data.pop("awaiting_request_until", None)
-                    handled = await _handle_main_menu_action(update, context, lang, menu_action)
-                    if handled:
-                        return
-                await send_request_to_admin(context, update.effective_user, request_text, lang)
-                context.user_data["awaiting_request"] = False
-                context.user_data.pop("awaiting_request_until", None)
-                await update.message.reply_text(MESSAGES[lang]["request_sent"])
-                return
 
         chat_type = str(getattr(update.effective_chat, "type", "") or "").lower()
         is_group_chat = chat_type in {"group", "supergroup"}
@@ -2410,11 +2693,34 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 book_id = str(book.get("id") or es_id).strip() if book else None
                 if not book_id:
                     continue
-                title = get_result_title(book)
-                if book_id not in unique_matches or score > unique_matches[book_id]["score"]:
-                    unique_matches[book_id] = {"id": book_id, "title": title, "score": score}
+                full_book = None
+                try:
+                    full_book = db_get_book_by_id(book_id)
+                except Exception:
+                    full_book = None
+                merged_book = dict(book or {})
+                if isinstance(full_book, dict) and full_book:
+                    merged_book.update(full_book)
+                merged_book["id"] = book_id
+                entry = _build_book_entry(merged_book, query, score)
+                if book_id not in unique_matches or entry["score"] > unique_matches[book_id]["score"]:
+                    unique_matches[book_id] = entry
 
-            entries = sorted(unique_matches.values(), key=lambda e: e["score"], reverse=True)
+            deduped_entries: dict[str, dict] = {}
+            for entry in unique_matches.values():
+                dedupe_key = _book_entry_dedupe_key(entry) or str(entry.get("id") or "")
+                current = deduped_entries.get(dedupe_key)
+                if current is None or float(entry.get("score") or 0.0) > float(current.get("score") or 0.0):
+                    deduped_entries[dedupe_key] = entry
+
+            entries = sorted(
+                deduped_entries.values(),
+                key=lambda e: (
+                    -float(e.get("score") or 0.0),
+                    len(str(e.get("title") or "")),
+                    str(e.get("title") or "").lower(),
+                ),
+            )
             entries = entries[:MAX_SEARCH_RESULTS]
             if entries:
                 set_cached_book_search_entries(query, entries)
@@ -2437,8 +2743,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         row = []
                 if row:
                     keyboard.append(row)
-                req_id = cache_request(context, query, update.effective_user)
-                keyboard.append([InlineKeyboardButton(MESSAGES[lang]["request_button"], callback_data=f"request:{req_id}")])
                 await _edit_progress_or_reply(
                     progress_message,
                     update.message,
@@ -2446,13 +2750,20 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
             else:
-                req_id = cache_request(context, query, update.effective_user)
-                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES[lang]["request_button"], callback_data=f"request:{req_id}")]])
+                request_id = uuid.uuid4().hex[:10]
+                pending_requests = context.user_data.setdefault("requests", {})
+                pending_requests[request_id] = {
+                    "query": query,
+                    "created_ts": time.time(),
+                }
+                reply_markup = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(MESSAGES[lang]["request_button"], callback_data=f"req:{request_id}")]]
+                )
                 await _edit_progress_or_reply(
                     progress_message,
                     update.message,
                     MESSAGES[lang]["not_found"],
-                    reply_markup=keyboard,
+                    reply_markup=reply_markup,
                 )
             return
 
@@ -2504,6 +2815,7 @@ from telegram.ext import ContextTypes
 
 from db import (
     get_audio_book_for_book,
+    get_audio_book_by_id,
     create_audio_book_for_book,
     insert_audio_book_part,
     list_audio_book_parts,
@@ -2516,6 +2828,11 @@ from db import (
     increment_audio_book_download,
     increment_audio_book_searches,
     shift_audio_book_parts_from,
+    enqueue_audio_book_part_local_download_job,
+    claim_audio_book_part_local_download_job,
+    complete_audio_book_part_local_download_job,
+    retry_audio_book_part_local_download_job,
+    fail_audio_book_part_local_download_job,
 )
 
 async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2622,12 +2939,15 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                 ab_request_count = await run_blocking(count_pending_audiobook_requests, book_id)
             except Exception:
                 ab_request_count = 0
+        can_rename_books_fn = globals().get("can_rename_books")
+        can_rename_book = bool(callable(can_rename_books_fn) and can_rename_books_fn(query.from_user.id) and not is_group_chat)
         reactions_kb = build_book_keyboard(
             book_id,
             counts,
             is_fav_now,
             user_reaction,
             can_delete,
+            can_rename_book,
             lang,
             has_audiobook=has_ab,
             can_add_audiobook=can_add_ab,
@@ -2768,6 +3088,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             is_fav_now,
                             user_reaction,
                             can_delete,
+                            can_rename_book,
                             lang,
                             has_audiobook=has_ab2,
                             can_add_audiobook=can_add_ab2,
@@ -2791,6 +3112,74 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"handle_book_selection failed: {e}", exc_info=True)
         lang = ensure_user_language(update, context)
         await update.callback_query.message.reply_text(MESSAGES[lang]["error"])
+        raise
+
+
+async def handle_book_rename_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        if update.effective_user and await is_stopped_user(update.effective_user.id):
+            if query:
+                await safe_answer(query)
+            return
+        lang = ensure_user_language(update, context)
+        limited, wait_s = spam_check_callback(update, context)
+        if limited:
+            await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
+            return
+
+        data = str(query.data or "").strip()
+        if not data.startswith("bookrename:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+
+        book_id = data.split(":", 1)[1].strip()
+        if not book_id:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+
+        can_rename_books_fn = globals().get("can_rename_books")
+        if not callable(can_rename_books_fn) or not can_rename_books_fn(query.from_user.id):
+            await safe_answer(query, MESSAGES[lang].get("not_authorized", "Not authorized"), show_alert=True)
+            return
+        if _is_group_chat(update):
+            await safe_answer(
+                query,
+                MESSAGES[lang].get(
+                    "book_rename_private_only",
+                    "✏️ Book renaming is available only in private chat.",
+                ),
+                show_alert=True,
+            )
+            return
+
+        book = await run_blocking(db_get_book_by_id, book_id)
+        if not book:
+            await safe_answer(query, MESSAGES[lang]["book_not_found"], show_alert=True)
+            return
+
+        context.user_data["pending_book_rename"] = {
+            "book_id": book_id,
+            "expires_at": time.time() + 300,
+            "book_name": book.get("book_name"),
+            "display_name": book.get("display_name"),
+        }
+        prompt = MESSAGES[lang].get(
+            "book_rename_prompt",
+            "✏️ Send the new name for this book.\nSend /cancel to abort.",
+        )
+        try:
+            await query.message.reply_text(prompt.format(title=get_display_name(book)))
+        except Exception:
+            pass
+        await safe_answer(query)
+    except Exception as e:
+        logger.error(f"handle_book_rename_callback failed: {e}", exc_info=True)
+        lang = ensure_user_language(update, context)
+        try:
+            await query.message.reply_text(MESSAGES[lang]["error"])
+        except Exception:
+            pass
         raise
 
 

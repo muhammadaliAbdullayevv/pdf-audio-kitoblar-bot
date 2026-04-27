@@ -1161,56 +1161,25 @@ async def _pdf_maker_send_text_as_pdf(
     if len(clean) > 50000:
         await target_message.reply_text(msgs["too_long"])
         return False
-    pdf_title = _pdf_maker_sanitize_name(title or "PDF Maker") or "PDF Maker"
-    style_key = (style_key or "plain").lower()
-    paper_key = (paper_key or "a4").lower()
-    orientation_key = (orientation_key or "portrait").lower()
-    status_text = msgs["working_ai"] if style_key == "auto" else msgs["working"]
-    status_msg = await _send_with_retry(lambda: target_message.reply_text(status_text))
-    try:
-        chosen_font_size, used_ai_fallback = await run_blocking(
-            _pdf_maker_resolve_body_font_size, clean, style_key, paper_key, orientation_key
-        )
-    except Exception:
-        chosen_font_size = _pdf_maker_heuristic_body_font_size(clean, paper_key, orientation_key)
-        used_ai_fallback = True
-    pdf_bytes = _build_text_only_pdf_bytes(
-        clean,
-        paper_key=paper_key,
-        orientation_key=orientation_key,
-        body_font_size=chosen_font_size,
-    )
-    if not pdf_bytes:
+
+    # Enqueue background job instead of processing synchronously
+    user_id = target_message.chat_id
+    job_data = {
+        "text": clean,
+        "title": title,
+        "style_key": style_key,
+        "paper_key": paper_key,
+        "orientation_key": orientation_key,
+        "lang": lang,
+    }
+    job_id = db_enqueue_background_job("pdf_maker", user_id, job_data)
+    if not job_id:
         await target_message.reply_text(msgs["unavailable"])
         return False
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_file_base = re.sub(r"\s+", "_", pdf_title).strip("._") or "pdf_maker"
-    safe_file_base = re.sub(r"[^A-Za-z0-9._-]", "", safe_file_base)[:50] or "pdf_maker"
-    caption = msgs["caption"]
-    caption += f"\n📐 {_pdf_maker_paper_label(paper_key, lang)} • {_pdf_maker_orientation_label(orientation_key, lang)}"
-    if style_key == "auto":
-        caption += f"\n🤖 AI Style"
-    else:
-        caption += f"\n📖 Simple"
-    caption += f"\n🔠 {chosen_font_size}"
-    if style_key == "auto" and used_ai_fallback:
-        caption += f"\n{msgs['ai_fallback']}"
-    sent = await _reply_pdf_document(update, pdf_bytes, f"{safe_file_base}_{ts}.pdf", caption=caption)
-    if status_msg:
-        try:
-            if sent:
-                done_text = msgs["done"]
-                if style_key == "auto":
-                    note_key = "ai_size_fallback" if used_ai_fallback else "ai_size_applied"
-                    done_text += f"\n{msgs[note_key].format(size=chosen_font_size)}"
-                else:
-                    done_text += f"\n{msgs['smart_size_applied'].format(size=chosen_font_size)}"
-                await status_msg.edit_text(done_text)
-            else:
-                await status_msg.edit_text(MESSAGES[lang]["error"])
-        except Exception:
-            pass
-    return sent is not None
+
+    # Send queued confirmation
+    await target_message.reply_text("✅ PDF generation queued! You'll receive the file soon.")
+    return True
 
 
 async def _pdf_maker_handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> bool:

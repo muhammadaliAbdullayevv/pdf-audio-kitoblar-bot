@@ -1,4 +1,9 @@
+from __future__ import annotations
+
+import logging
 import time
+
+logger = logging.getLogger(__name__)
 
 
 async def handle_admin_menu_action(
@@ -54,9 +59,9 @@ async def handle_admin_menu_action(
             await update.message.reply_text(messages[lang]["admin_only"])
             return True
         prompt_text = (
-            "📣 Broadcast: send the message to send to all users.\nCancel: cancel"
+            messages[lang]["admin_broadcast_prompt"]
             if action == "admin_broadcast"
-            else "👤 User search: send name, username, or user ID (full/partial).\nCancel: cancel"
+            else messages[lang]["admin_user_search_prompt"]
         )
         context.user_data["admin_menu_prompt"] = {
             "type": "broadcast" if action == "admin_broadcast" else "user_search",
@@ -143,7 +148,7 @@ async def handle_admin_menu_prompt_input(
         return False
 
     admin_text = (update.message.text or "").strip()
-    if admin_text.lower() in {"cancel", "stop"}:
+    if admin_text.lower() in {"cancel", "stop", "/cancel"}:
         context.user_data.pop("admin_menu_prompt", None)
         await update.message.reply_text(
             messages.get(lang, messages["en"]).get("menu_flow_cancelled", "❌ Previous process was cancelled."),

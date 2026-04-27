@@ -1248,23 +1248,22 @@ async def handle_video_downloader_callback(update: Update, context: ContextTypes
             await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        status_msg = await _send_with_retry(lambda: query.message.reply_text(t["downloading"]))
-        job_key = f"{query.from_user.id}:{int(time.time())}"
-        jobs = context.application.bot_data.setdefault("video_dl_jobs", {})
-        task = asyncio.create_task(
-            _video_dl_run_download_job(
-                update,
-                context,
-                url=url,
-                quality=value,
-                title=str(meta.get("title") or "Video"),
-                lang=lang,
-                status_msg=status_msg,
-                job_key=job_key,
-                platform=str(session.get("platform") or "generic"),
-            )
-        )
-        jobs[job_key] = task
+
+        # Enqueue background job
+        user_id = query.from_user.id if query.from_user else 0
+        job_data = {
+            "url": url,
+            "quality": value,
+            "title": str(meta.get("title") or "Video"),
+            "lang": lang,
+            "platform": str(session.get("platform") or "generic"),
+        }
+        job_id = db_enqueue_background_job("video_download", user_id, job_data)
+        if not job_id:
+            await _send_with_retry(lambda: query.message.reply_text(t["download_failed"]))
+            return
+
+        await _send_with_retry(lambda: query.message.reply_text("✅ Video download queued! You'll receive the file soon."))
         _video_dl_clear_session(context)
     except Exception:
         logger.exception("video downloader: callback handler failed")

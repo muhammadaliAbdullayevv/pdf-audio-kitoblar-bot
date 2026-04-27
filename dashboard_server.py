@@ -1448,7 +1448,6 @@ def _build_downloader_quality(counters: dict[str, int], log_signals: dict[str, A
 
     success_total = max(
         _safe_int(counters.get("video_dl_success_total", 0)),
-        _safe_int(counters.get("video_downloads", 0)),
         sum(_safe_int(v) for v in success_by_platform.values()),
     )
     fail_total = max(

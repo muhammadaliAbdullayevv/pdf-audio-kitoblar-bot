@@ -168,8 +168,7 @@ const FALLBACK_DATA = {
     recent_video_errors: 4,
     recent_video_warns: 9,
     recent_issues: [
-      { time: "19:16:08", service: "video_downloader", message: "upload timeout from local uplink", status: "warn" },
-      { time: "19:12:42", service: "video_downloader", message: "source stream interrupted", status: "err" },
+      // Video downloader removed
     ],
   },
   audience: {
@@ -197,13 +196,11 @@ const FALLBACK_DATA = {
   reliability: {
     log_errors: 6,
     log_warns: 19,
-    video_errors: 4,
-    video_warns: 9,
+    video_errors: 0,
+    video_warns: 0,
   },
   events: [
-    { time: "19:16:08", service: "video_downloader", message: "upload timeout from local uplink", status: "warn" },
     { time: "19:14:12", service: "search_flow", message: "query cache hit: 14ms", status: "ok" },
-    { time: "19:12:42", service: "video_downloader", message: "source stream interrupted", status: "err" },
     { time: "19:10:05", service: "dashboard_server", message: "API payload refresh complete", status: "ok" },
     { time: "19:08:32", service: "elasticsearch", message: "health yellow (replicas pending)", status: "warn" },
   ],

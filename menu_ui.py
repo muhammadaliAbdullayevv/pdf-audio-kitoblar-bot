@@ -52,98 +52,87 @@ def build_help_text(
     is_admin_user_fn: Callable[[int], bool],
     user_id: int | None = None,
 ) -> str:
-    # Import custom menu system
-    try:
-        from custom_menu import get_effective_menu
-        custom_menu = get_effective_menu(user_id, lang) if user_id else None
-    except ImportError:
-        custom_menu = None
-    
     m = messages.get(lang, messages["en"])
     border = "──────────"
 
     if lang == "uz":
         title = "📚 Yordam"
-        intro = "👇 Botdan pastdagi menyu orqali foydalaning."
+        intro = "👇 Botdan menyu orqali foydalaning."
         main_title = "🏠 Asosiy menyu"
         other_title = "🛠️ Boshqa funksiyalar"
         notes_title = "ℹ️ Eslatma"
         main_lines = [
             f"{m.get('menu_search_books', '🔎 Kitob qidirish')} — kitob nomini yuborib qidiring.",
-            f"{m.get('menu_top_books', '🔥 Top kitoblar')} — eng mashhur kitoblar.",
-            f"{m.get('menu_video_downloader', '⬇️ Insta Youtub')} — video yuklab olish bo‘limi.",
-            f"{m.get('menu_text_to_voice', '🎙️ Matndan ovoz')} — matndan audio yarating.",
+            f"{m.get('menu_favorites', '⭐ Sevimlilar')} — saqlangan kitoblaringiz.",
+            f"{m.get('menu_myprofile', '👤 Mening profilim')} — statistika va tangalarni ko‘ring.",
         ]
         other_lines = [
-            "⌨️ /upload — yuklash buyrug‘i (admin).",
+            f"{m.get('menu_text_to_voice', '🎙️ Matndan ovoz')} — matndan audio yarating.",
             f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — matndan PDF tayyorlaydi.",
             f"{m.get('menu_pdf_editor', '🧰 PDF muharriri')} — PDF siqish, OCR, TXT/EPUB va suv belgisi.",
-            f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — voice/mp3 format o‘zgartirish, kesish va nomini o‘zgartirish.",
-            f"{m.get('menu_sticker_tools', '🧩 Sticker Tools')} — rasm/video dan sticker tayyorlash.",
-            f"{m.get('menu_help', '❓ Yordam')} — ushbu yo‘riqnoma.",
-            "⌨️ /myprofile, /favorite, /request — buyruqlar menyusida.",
+            f"{m.get('menu_audio_converter', '🎛️ Audio muharriri')} — audio kesish va formatlash.",
+            f"{m.get('menu_sticker_tools', '🧩 Sticker vositalar')} — rasm/video dan sticker tayyorlash.",
+            f"{m.get('menu_top_users', '🏆 Top foydalanuvchilar')} — eng faol foydalanuvchilar.",
+            f"{m.get('menu_contact_admin', '📞 Admin bilan aloqa')} — bog‘lanish ma’lumoti.",
         ]
         note_lines = [
             "🌐 Tilni o‘zgartirish uchun Language bo‘limidan foydalaning.",
-            "⌨️ Buyruqlar fallback sifatida ishlaydi, lekin asosiy foydalanish menyu orqali.",
+            "💡 Kitob topish uchun nomini oddiy xabar qilib yuborish kifoya.",
         ]
         admin_line = "🛠 Admin Control menyusi faqat adminlarga ko‘rinadi."
     elif lang == "ru":
         title = "📚 Помощь"
-        intro = "👇 Пользуйтесь ботом через меню ниже."
+        intro = "👇 Пользуйтесь ботом через меню."
         main_title = "🏠 Главное меню"
         other_title = "🛠️ Другие функции"
         notes_title = "ℹ️ Примечание"
         main_lines = [
             f"{m.get('menu_search_books', '🔎 Поиск книг')} — отправьте название книги для поиска.",
-            f"{m.get('menu_top_books', '🔥 Топ книг')} — самые популярные книги.",
-            f"{m.get('menu_video_downloader', '⬇️ Insta Youtub')} — раздел загрузки видео.",
-            f"{m.get('menu_text_to_voice', '🎙️ Текст в голос')} — преобразование текста в аудио.",
+            f"{m.get('menu_favorites', '⭐ Избранное')} — сохранённые книги.",
+            f"{m.get('menu_myprofile', '👤 Мой профиль')} — статистика и монеты.",
         ]
         other_lines = [
-            "⌨️ /upload — команда загрузки (админ).",
+            f"{m.get('menu_text_to_voice', '🎙️ Текст в голос')} — преобразование текста в аудио.",
             f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — создание PDF из текста.",
             f"{m.get('menu_pdf_editor', '🧰 PDF редактор')} — сжатие PDF, OCR, TXT/EPUB и водяной знак.",
-            f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — конвертация voice/mp3, обрезка и переименование.",
-            f"{m.get('menu_sticker_tools', '🧩 Sticker Tools')} — создание стикеров из фото/видео.",
-            f"{m.get('menu_help', '❓ Помощь')} — эта инструкция.",
-            "⌨️ /myprofile, /favorite, /request — в меню команд.",
+            f"{m.get('menu_audio_converter', '🎛️ Аудиоредактор')} — обрезка и форматирование аудио.",
+            f"{m.get('menu_sticker_tools', '🧩 Стикер инструменты')} — создание стикеров.",
+            f"{m.get('menu_top_users', '🏆 Топ пользователей')} — самые активные пользователи.",
+            f"{m.get('menu_contact_admin', '📞 Связаться с админом')} — контакты и группа.",
         ]
         note_lines = [
             "🌐 Язык можно изменить через раздел Language.",
-            "⌨️ Команды остаются как резервный вариант, но основной способ — меню.",
+            "💡 Для поиска книги достаточно отправить её название обычным сообщением.",
         ]
         admin_line = "🛠 Admin Control отображается только для админов."
     else:
         title = "📚 Help"
-        intro = "👇 Use the bot through the menu below."
+        intro = "👇 Use the bot through the menu."
         main_title = "🏠 Main Menu"
         other_title = "🛠️ Other Functions"
         notes_title = "ℹ️ Notes"
         main_lines = [
             f"{m.get('menu_search_books', '🔎 Search Books')} — send a book name to search.",
-            f"{m.get('menu_top_books', '🔥 Top Books')} — most popular books.",
-            f"{m.get('menu_video_downloader', '⬇️ Insta Youtub')} — video downloader section.",
-            f"{m.get('menu_text_to_voice', '🎙️ Text to Voice')} — convert text into audio.",
+            f"{m.get('menu_favorites', '⭐ Favorites')} — your saved books.",
+            f"{m.get('menu_myprofile', '👤 My Profile')} — stats and coins.",
         ]
         other_lines = [
-            "⌨️ /upload — upload command (admin).",
+            f"{m.get('menu_text_to_voice', '🎙️ Text to Voice')} — convert text into audio.",
             f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — create a PDF from text.",
             f"{m.get('menu_pdf_editor', '🧰 PDF Editor')} — compress PDF, OCR, TXT/EPUB, and watermark.",
-            f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — convert voice/mp3, cut audio, and rename files.",
-            f"{m.get('menu_sticker_tools', '🧩 Sticker Tools')} — make stickers from photo/video.",
-            f"{m.get('menu_help', '❓ Help')} — this guide.",
-            "⌨️ /myprofile, /favorite, /request — available in command menu.",
+            f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — trim and convert audio.",
+            f"{m.get('menu_sticker_tools', '🧩 Sticker Tools')} — make stickers from media.",
+            f"{m.get('menu_top_users', '🏆 Top Users')} — most active users.",
+            f"{m.get('menu_contact_admin', '📞 Contact Admin')} — contact details and group.",
         ]
         note_lines = [
             "🌐 Use the Language section to change your language.",
-            "⌨️ Slash commands still work as a fallback, but the main UX is the menu.",
+            "💡 To find a book, just send its title as a normal message.",
         ]
         admin_line = "🛠 Admin Control is visible only to admins."
 
     blocks = [f"{title}\n{intro}"]
-    
-    # Use default structure
+
     blocks.extend([
             f"{main_title}\n" + "\n".join(main_lines),
             f"{other_title}\n" + "\n".join(other_lines),
@@ -156,9 +145,7 @@ def build_help_text(
             "/admin — Admin panel",
             "/upload — Upload books",
             "/broadcast — Send broadcast",
-            "/requests — Manage requests",
             "/smoke — System health check",
-            "/admin_menu — Menu customization",
         ]
         blocks.append(f"{admin_title}\n" + "\n".join(admin_commands))
         note_lines = [*note_lines, admin_line]
@@ -224,8 +211,8 @@ def main_menu_text_action(
         "menu_text_to_voice": "tts",
         "menu_pdf_maker": "pdf",
         "menu_pdf_editor": "pdf_editor",
-        "menu_request_book": "request",
         "menu_favorites": "favorites",
+        "menu_request_book": "request",
         "menu_other_functions": "other",
         "menu_myprofile": "myprofile",
         "menu_top_books": "top_books",
@@ -233,7 +220,6 @@ def main_menu_text_action(
         "menu_upload": "upload",
         "menu_audio_converter": "audio_converter",
         "menu_sticker_tools": "sticker_tools",
-        "menu_video_downloader": "video_downloader",
         "menu_contact_admin": "contact_admin",
         "menu_help": "help",
         "menu_back": "back",

@@ -157,6 +157,91 @@ def _apply_schema_migrations(cur) -> None:
                 "ALTER TABLE books DROP COLUMN IF EXISTS storage_updated_at;",
             ],
         ),
+        (
+            13,
+            "users: add rename permission flag",
+            [
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS rename_allowed BOOLEAN NOT NULL DEFAULT FALSE;",
+            ],
+        ),
+        (
+            14,
+            "groups: persist private-start prompt messages for editable follow-up",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS group_private_start_prompts (
+                    token TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    prompt_lang TEXT NOT NULL DEFAULT 'en',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    last_error TEXT,
+                    resolved_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_group_private_start_prompts_user_status ON group_private_start_prompts (user_id, status, created_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_group_private_start_prompts_chat_msg ON group_private_start_prompts (chat_id, message_id);",
+            ],
+        ),
+        (
+            17,
+            "bots: persist runtime key/value settings",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_bot_settings_updated_at ON bot_settings (updated_at DESC);",
+            ],
+        ),
+        (
+            18,
+            "audiobooks: persist local backup jobs for restart-safe downloads",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS audio_book_local_download_jobs (
+                    id TEXT PRIMARY KEY,
+                    audio_book_id TEXT NOT NULL REFERENCES audio_books(id) ON DELETE CASCADE,
+                    audio_book_part_id TEXT NOT NULL UNIQUE REFERENCES audio_book_parts(id) ON DELETE CASCADE,
+                    file_id TEXT NOT NULL,
+                    file_unique_id TEXT,
+                    file_name TEXT,
+                    media_kind TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 12,
+                    next_attempt_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    locked_at TIMESTAMP,
+                    worker_id TEXT,
+                    last_error TEXT,
+                    completed_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_audio_book_local_download_jobs_status_next ON audio_book_local_download_jobs (status, next_attempt_at, created_at);",
+                "CREATE INDEX IF NOT EXISTS idx_audio_book_local_download_jobs_audio_book_id ON audio_book_local_download_jobs (audio_book_id);",
+                "CREATE INDEX IF NOT EXISTS idx_audio_book_local_download_jobs_part_id ON audio_book_local_download_jobs (audio_book_part_id);",
+            ],
+        ),
+        (
+            19,
+            "audiobooks: add missing part metadata columns for older databases",
+            [
+                "ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS media_kind TEXT;",
+                "ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS path TEXT;",
+                "ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;",
+                "ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS channel_id BIGINT;",
+                "ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS channel_message_id BIGINT;",
+                "ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS display_order BIGINT;",
+            ],
+        ),
     ]
     for version, note, stmts in migrations:
         if version in applied:
@@ -283,6 +368,7 @@ def init_db():
                     last_name TEXT,
                     blocked BOOLEAN NOT NULL DEFAULT FALSE,
                     allowed BOOLEAN NOT NULL DEFAULT FALSE,
+                    rename_allowed BOOLEAN NOT NULL DEFAULT FALSE,
                     joined_date DATE,
                     left_date DATE,
                     language TEXT,
@@ -293,6 +379,7 @@ def init_db():
             )
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS group_language TEXT;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS delete_allowed BOOLEAN NOT NULL DEFAULT FALSE;")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS rename_allowed BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stopped BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS audio_allowed BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS coin_adjustment INTEGER NOT NULL DEFAULT 0;")
@@ -355,6 +442,34 @@ def init_db():
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_book_local_download_jobs_status_next ON book_local_download_jobs (status, next_attempt_at, created_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_book_local_download_jobs_book_id ON book_local_download_jobs (book_id);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS group_private_start_prompts (
+                    token TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    prompt_lang TEXT NOT NULL DEFAULT 'en',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    last_error TEXT,
+                    resolved_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_group_private_start_prompts_user_status ON group_private_start_prompts (user_id, status, created_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_group_private_start_prompts_chat_msg ON group_private_start_prompts (chat_id, message_id);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_settings_updated_at ON bot_settings (updated_at DESC);")
             cur.execute("DROP TABLE IF EXISTS movie_reactions;")
             cur.execute("DROP TABLE IF EXISTS movies;")
             cur.execute("DROP TABLE IF EXISTS name_meanings;")
@@ -563,6 +678,7 @@ def init_db():
                     audio_book_id TEXT NOT NULL REFERENCES audio_books(id) ON DELETE CASCADE,
                     part_index INTEGER NOT NULL,
                     title TEXT,
+                    media_kind TEXT,
                     file_id TEXT,
                     file_unique_id TEXT,
                     path TEXT,
@@ -580,8 +696,35 @@ def init_db():
                 ON audio_book_parts (audio_book_id, part_index);
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audio_book_local_download_jobs (
+                    id TEXT PRIMARY KEY,
+                    audio_book_id TEXT NOT NULL REFERENCES audio_books(id) ON DELETE CASCADE,
+                    audio_book_part_id TEXT NOT NULL UNIQUE REFERENCES audio_book_parts(id) ON DELETE CASCADE,
+                    file_id TEXT NOT NULL,
+                    file_unique_id TEXT,
+                    file_name TEXT,
+                    media_kind TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 12,
+                    next_attempt_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    locked_at TIMESTAMP,
+                    worker_id TEXT,
+                    last_error TEXT,
+                    completed_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_audio_book_local_download_jobs_status_next ON audio_book_local_download_jobs (status, next_attempt_at, created_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_audio_book_local_download_jobs_audio_book_id ON audio_book_local_download_jobs (audio_book_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_audio_book_local_download_jobs_part_id ON audio_book_local_download_jobs (audio_book_part_id);")
             # One-time index/constraint migrations
             _apply_schema_migrations(cur)
+            cur.execute("ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS media_kind TEXT;")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS removed_users (
@@ -768,20 +911,21 @@ def search_users_by_name(query: str, limit: int = 30):
 def upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None,
                 blocked: bool, allowed: bool, joined_date: date | None, left_date: date | None,
                 language: str | None, delete_allowed: bool = False, stopped: bool = False,
-                audio_allowed: bool = False,
+                audio_allowed: bool = False, rename_allowed: bool = False,
                 language_selected: bool | None = None, group_language: str | None = None):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO users (id, username, first_name, last_name, blocked, allowed, joined_date, left_date, language, delete_allowed, stopped, audio_allowed, language_selected, group_language)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO users (id, username, first_name, last_name, blocked, allowed, rename_allowed, joined_date, left_date, language, delete_allowed, stopped, audio_allowed, language_selected, group_language)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (id) DO UPDATE SET
                     username=EXCLUDED.username,
                     first_name=EXCLUDED.first_name,
                     last_name=EXCLUDED.last_name,
                     blocked=EXCLUDED.blocked,
                     allowed=EXCLUDED.allowed,
+                    rename_allowed=EXCLUDED.rename_allowed,
                     joined_date=EXCLUDED.joined_date,
                     left_date=EXCLUDED.left_date,
                     language=COALESCE(EXCLUDED.language, users.language),
@@ -798,6 +942,7 @@ def upsert_user(user_id: int, username: str | None, first_name: str | None, last
                     last_name,
                     blocked,
                     allowed,
+                    rename_allowed,
                     joined_date,
                     left_date,
                     language,
@@ -859,6 +1004,29 @@ def is_user_delete_allowed(user_id: int) -> bool:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT delete_allowed FROM users WHERE id=%s", (user_id,))
+            row = cur.fetchone()
+            return bool(row[0]) if row else False
+
+
+def set_user_rename_allowed(user_id: int, allowed: bool):
+    today = date.today()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (id, blocked, allowed, joined_date, rename_allowed, delete_allowed, stopped, audio_allowed)
+                VALUES (%s, FALSE, FALSE, %s, %s, FALSE, FALSE, FALSE)
+                ON CONFLICT (id) DO UPDATE SET
+                    rename_allowed = EXCLUDED.rename_allowed
+                """,
+                (user_id, today, allowed),
+            )
+
+
+def is_user_rename_allowed(user_id: int) -> bool:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT rename_allowed FROM users WHERE id=%s", (user_id,))
             row = cur.fetchone()
             return bool(row[0]) if row else False
 
@@ -2492,6 +2660,50 @@ def update_book_path(book_id: str, path: str):
             return cur.rowcount
 
 
+def update_book_names(book_id: str, book_name: str, display_name: str | None = None):
+    book_name = str(book_name or "").strip()
+    display_name = str(display_name or book_name or "").strip() or book_name
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE books SET book_name=%s, display_name=%s WHERE id=%s",
+                (book_name, display_name, book_id),
+            )
+            return cur.rowcount
+
+
+def update_book_rename_meta(
+    book_id: str,
+    book_name: str,
+    display_name: str | None = None,
+    path: str | None = None,
+    file_id: str | None = None,
+    file_unique_id: str | None = None,
+    indexed: bool = True,
+):
+    book_name = str(book_name or "").strip()
+    display_name = str(display_name or book_name or "").strip() or book_name
+    fields = ["book_name=%s", "display_name=%s", "indexed=%s"]
+    values = [book_name, display_name, indexed]
+    if path is not None:
+        fields.append("path=%s")
+        values.append(str(path))
+    if file_id is not None:
+        fields.append("file_id=%s")
+        values.append(str(file_id))
+    if file_unique_id is not None:
+        fields.append("file_unique_id=%s")
+        values.append(str(file_unique_id))
+    values.append(book_id)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE books SET {', '.join(fields)} WHERE id=%s",
+                values,
+            )
+            return cur.rowcount
+
+
 def enqueue_book_local_download_job(
     book_id: str,
     file_id: str,
@@ -2666,6 +2878,337 @@ def fail_book_local_download_job(job_id: str, error: str) -> int:
             return cur.rowcount
 
 
+def get_book_local_download_job_status_counts() -> dict[str, int]:
+    counts = {
+        "queued": 0,
+        "downloading": 0,
+        "done": 0,
+        "failed": 0,
+        "total": 0,
+    }
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(status, 'unknown') AS status, COUNT(*)::int
+                FROM book_local_download_jobs
+                GROUP BY COALESCE(status, 'unknown')
+                """
+            )
+            for status, count in (cur.fetchall() or []):
+                key = str(status or "").strip().lower()
+                try:
+                    value = int(count or 0)
+                except Exception:
+                    value = 0
+                if key in counts:
+                    counts[key] = value
+                counts["total"] += value
+    counts["pending"] = counts["queued"] + counts["downloading"]
+    return counts
+
+
+def enqueue_audio_book_part_local_download_job(
+    audio_book_id: str,
+    audio_book_part_id: str,
+    file_id: str,
+    file_name: str,
+    file_unique_id: str | None = None,
+    media_kind: str | None = None,
+) -> str | None:
+    audio_book_id = str(audio_book_id or "").strip()
+    audio_book_part_id = str(audio_book_part_id or "").strip()
+    file_id = str(file_id or "").strip()
+    file_name = str(file_name or "").strip()
+    file_unique_id = str(file_unique_id or "").strip() or None
+    media_kind = str(media_kind or "").strip().lower() or None
+    if not audio_book_id or not audio_book_part_id or not file_id or not file_name:
+        return None
+    job_id = uuid.uuid4().hex
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO audio_book_local_download_jobs (
+                    id, audio_book_id, audio_book_part_id, file_id, file_unique_id, file_name, media_kind,
+                    status, attempts, max_attempts, next_attempt_at,
+                    locked_at, worker_id, last_error, completed_at,
+                    created_at, updated_at
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'queued',0,12,NOW(),NULL,NULL,NULL,NULL,NOW(),NOW())
+                ON CONFLICT (audio_book_part_id) DO UPDATE SET
+                    audio_book_id=EXCLUDED.audio_book_id,
+                    file_id=EXCLUDED.file_id,
+                    file_unique_id=COALESCE(EXCLUDED.file_unique_id, audio_book_local_download_jobs.file_unique_id),
+                    file_name=EXCLUDED.file_name,
+                    media_kind=COALESCE(EXCLUDED.media_kind, audio_book_local_download_jobs.media_kind),
+                    status='queued',
+                    attempts=0,
+                    next_attempt_at=NOW(),
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=NULL,
+                    completed_at=NULL,
+                    updated_at=NOW()
+                RETURNING id
+                """,
+                (job_id, audio_book_id, audio_book_part_id, file_id, file_unique_id, file_name, media_kind),
+            )
+            row = cur.fetchone()
+            if not row:
+                return job_id
+            try:
+                return str(row[0])
+            except Exception:
+                return job_id
+
+
+def claim_audio_book_part_local_download_job(worker_id: str, stale_after_seconds: int = 1800) -> dict | None:
+    worker_id = str(worker_id or "").strip() or "worker"
+    stale_after_seconds = max(60, int(stale_after_seconds or 1800))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                WITH candidate AS (
+                    SELECT id
+                    FROM audio_book_local_download_jobs
+                    WHERE next_attempt_at <= NOW()
+                      AND (
+                          status = 'queued'
+                          OR (
+                              status = 'downloading'
+                              AND locked_at IS NOT NULL
+                              AND locked_at < NOW() - (%s * INTERVAL '1 second')
+                          )
+                      )
+                    ORDER BY next_attempt_at ASC, created_at ASC, id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE audio_book_local_download_jobs j
+                SET
+                    status='downloading',
+                    attempts=attempts + 1,
+                    locked_at=NOW(),
+                    worker_id=%s,
+                    updated_at=NOW()
+                FROM candidate
+                WHERE j.id = candidate.id
+                RETURNING j.*
+                """,
+                (stale_after_seconds, worker_id),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def complete_audio_book_part_local_download_job(job_id: str) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE audio_book_local_download_jobs
+                SET status='done',
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=NULL,
+                    completed_at=NOW(),
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (job_id,),
+            )
+            return cur.rowcount
+
+
+def retry_audio_book_part_local_download_job(job_id: str, error: str, retry_after_seconds: float = 60.0) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    retry_after_seconds = max(1.0, float(retry_after_seconds or 60.0))
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE audio_book_local_download_jobs
+                SET status='queued',
+                    next_attempt_at=NOW() + (%s * INTERVAL '1 second'),
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=%s,
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (retry_after_seconds, str(error or "")[:2000], job_id),
+            )
+            return cur.rowcount
+
+
+def fail_audio_book_part_local_download_job(job_id: str, error: str) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE audio_book_local_download_jobs
+                SET status='failed',
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=%s,
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (str(error or "")[:2000], job_id),
+            )
+            return cur.rowcount
+
+
+def get_audio_book_part_local_download_job_status_counts() -> dict[str, int]:
+    counts = {
+        "queued": 0,
+        "downloading": 0,
+        "done": 0,
+        "failed": 0,
+        "total": 0,
+    }
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(status, 'unknown') AS status, COUNT(*)::int
+                FROM audio_book_local_download_jobs
+                GROUP BY COALESCE(status, 'unknown')
+                """
+            )
+            for status, count in (cur.fetchall() or []):
+                key = str(status or "").strip().lower()
+                try:
+                    value = int(count or 0)
+                except Exception:
+                    value = 0
+                if key in counts:
+                    counts[key] = value
+                counts["total"] += value
+    counts["pending"] = counts["queued"] + counts["downloading"]
+    return counts
+
+
+def upsert_group_private_start_prompt(
+    token: str,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+    prompt_lang: str,
+    status: str = "pending",
+) -> str | None:
+    token = str(token or "").strip()
+    prompt_lang = str(prompt_lang or "en").strip() or "en"
+    status = str(status or "pending").strip().lower() or "pending"
+    try:
+        user_id = int(user_id)
+        chat_id = int(chat_id)
+        message_id = int(message_id)
+    except Exception:
+        return None
+    if not token or not user_id or not chat_id or not message_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO group_private_start_prompts (
+                    token, user_id, chat_id, message_id, prompt_lang, status, last_error, resolved_at, created_at, updated_at
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,NULL,NULL,NOW(),NOW())
+                ON CONFLICT (token) DO UPDATE SET
+                    user_id=EXCLUDED.user_id,
+                    chat_id=EXCLUDED.chat_id,
+                    message_id=EXCLUDED.message_id,
+                    prompt_lang=EXCLUDED.prompt_lang,
+                    status=EXCLUDED.status,
+                    last_error=NULL,
+                    resolved_at=NULL,
+                    updated_at=NOW()
+                RETURNING token
+                """,
+                (token, user_id, chat_id, message_id, prompt_lang, status),
+            )
+            row = cur.fetchone()
+            return str(row[0]) if row and row[0] is not None else token
+
+
+def get_group_private_start_prompt_by_token(token: str) -> dict | None:
+    token = str(token or "").strip()
+    if not token:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM group_private_start_prompts
+                WHERE token=%s
+                LIMIT 1
+                """,
+                (token,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def get_latest_pending_group_private_start_prompt(user_id: int) -> dict | None:
+    try:
+        user_id = int(user_id)
+    except Exception:
+        return None
+    if not user_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM group_private_start_prompts
+                WHERE user_id=%s AND status='pending'
+                ORDER BY created_at DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def set_group_private_start_prompt_status(token: str, status: str, error: str | None = None) -> int:
+    token = str(token or "").strip()
+    status = str(status or "").strip().lower() or "pending"
+    if not token:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE group_private_start_prompts
+                SET status=%s,
+                    last_error=%s,
+                    resolved_at=CASE
+                        WHEN %s IN ('resolved', 'done', 'completed') THEN COALESCE(resolved_at, NOW())
+                        ELSE resolved_at
+                    END,
+                    updated_at=NOW()
+                WHERE token=%s
+                """,
+                (status, str(error or "")[:2000] if error else None, status, token),
+            )
+            return cur.rowcount
+
+
 def update_book_indexed(book_id: str, indexed: bool):
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -2687,6 +3230,54 @@ def update_book_upload_meta(book_id: str, uploaded_by_user_id: int | None = None
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(f"UPDATE books SET {', '.join(fields)} WHERE id=%s", values)
+            return cur.rowcount
+
+
+def set_bot_setting(key: str, value: str) -> int:
+    key = str(key or "").strip()
+    value = str(value or "").strip()
+    if not key:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_settings (key, value, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = NOW()
+                """,
+                (key, value),
+            )
+            return cur.rowcount
+
+
+def get_bot_setting(key: str) -> str | None:
+    key = str(key or "").strip()
+    if not key:
+        return None
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_settings WHERE key=%s LIMIT 1", (key,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            try:
+                value = row[0]
+            except Exception:
+                value = None
+            text = str(value or "").strip()
+            return text or None
+
+
+def delete_bot_setting(key: str) -> int:
+    key = str(key or "").strip()
+    if not key:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM bot_settings WHERE key=%s", (key,))
             return cur.rowcount
 
 
@@ -2893,6 +3484,7 @@ def insert_audio_book_part(
     audio_book_id: str,
     part_index: int,
     title: str | None,
+    media_kind: str | None = None,
     file_id: str,
     file_unique_id: str | None,
     path: str | None,
@@ -2906,11 +3498,11 @@ def insert_audio_book_part(
             cur.execute(
                 """
                 INSERT INTO audio_book_parts (
-                    id, audio_book_id, part_index, title,
+                    id, audio_book_id, part_index, title, media_kind,
                     file_id, file_unique_id, path, duration_seconds,
                     channel_id, channel_message_id, display_order
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                     (SELECT display_order FROM audio_books WHERE id=%s) + %s
                 )
                 """,
@@ -2919,6 +3511,7 @@ def insert_audio_book_part(
                     audio_book_id,
                     int(part_index),
                     title,
+                    media_kind,
                     file_id,
                     file_unique_id,
                     path,
@@ -2982,16 +3575,41 @@ def get_audio_book_part(part_id: str) -> dict | None:
 
 def update_audio_book_part_media(
     part_id: str,
-    file_id: str,
+    file_id: str | None = None,
     file_unique_id: str | None = None,
+    path: str | None = None,
+    media_kind: str | None = None,
+    duration_seconds: int | None = None,
+    channel_id: int | None = None,
+    channel_message_id: int | None = None,
 ):
-    if not part_id or not file_id:
+    if not part_id:
         return 0
-    fields = ["file_id=%s"]
-    values: list = [str(file_id)]
-    if file_unique_id:
+    fields: list[str] = []
+    values: list[Any] = []
+    if file_id is not None:
+        fields.append("file_id=%s")
+        values.append(str(file_id))
+    if file_unique_id is not None:
         fields.append("file_unique_id=%s")
         values.append(str(file_unique_id))
+    if path is not None:
+        fields.append("path=%s")
+        values.append(str(path))
+    if media_kind is not None:
+        fields.append("media_kind=%s")
+        values.append(str(media_kind))
+    if duration_seconds is not None:
+        fields.append("duration_seconds=%s")
+        values.append(int(duration_seconds))
+    if channel_id is not None:
+        fields.append("channel_id=%s")
+        values.append(int(channel_id))
+    if channel_message_id is not None:
+        fields.append("channel_message_id=%s")
+        values.append(int(channel_message_id))
+    if not fields:
+        return 0
     values.append(str(part_id))
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -3450,88 +4068,213 @@ def set_upload_request_status(request_id: str, status: str, updated_at: str | No
 
 
 def get_storage_stats() -> dict:
-    """Get storage usage statistics from database."""
+    """Get storage usage statistics from local files and DB metadata."""
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            def _sum_local_file_sizes(table_name: str) -> tuple[int, int]:
+                cur.execute(f"SELECT path FROM {table_name} WHERE path IS NOT NULL AND path <> ''")
+                local_count = 0
+                total_size = 0
+                while True:
+                    rows = cur.fetchmany(2000)
+                    if not rows:
+                        break
+                    for row in rows:
+                        try:
+                            path = str(row[0] or "").strip()
+                        except Exception:
+                            path = ""
+                        if not path or not os.path.isfile(path):
+                            continue
+                        local_count += 1
+                        try:
+                            total_size += int(os.path.getsize(path))
+                        except Exception:
+                            continue
+                return local_count, total_size
+
+            cur.execute("SELECT COUNT(*) FROM books")
+            book_db_count = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM audio_book_parts")
+            audio_db_count = int((cur.fetchone() or [0])[0] or 0)
+
+            local_book_count, local_book_size = _sum_local_file_sizes("books")
+            local_audio_count, local_audio_size = _sum_local_file_sizes("audio_book_parts")
+
+            stats = {
+                "book_count": int(local_book_count),
+                "book_db_count": book_db_count,
+                "total_book_size": int(local_book_size),
+                "avg_book_size": int(local_book_size / local_book_count) if local_book_count > 0 else 0,
+                "audio_count": int(local_audio_count),
+                "audio_db_count": audio_db_count,
+                "total_audio_size": int(local_audio_size),
+                "avg_audio_size": int(local_audio_size / local_audio_count) if local_audio_count > 0 else 0,
+            }
+
+            stats["total_size"] = stats["total_book_size"] + stats["total_audio_size"]
+            stats["total_files"] = stats["book_count"] + stats["audio_count"]
+            return stats
+
+
+# Background Jobs
+
+def enqueue_background_job(job_type: str, user_id: int, data: dict) -> str | None:
+    job_type = str(job_type or "").strip()
+    user_id = int(user_id or 0)
+    if not job_type or not user_id:
+        return None
+    import json
+    data_json = json.dumps(data or {}, ensure_ascii=False)
+    job_id = uuid.uuid4().hex
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema='public' AND table_name='books' AND column_name='file_size'
+                INSERT INTO background_jobs (
+                    id, job_type, user_id, data_json,
+                    status, attempts, max_attempts, next_attempt_at,
+                    locked_at, worker_id, last_error, completed_at,
+                    created_at, updated_at
                 )
-                """
+                VALUES (%s,%s,%s,%s,'queued',0,3,NOW(),NULL,NULL,NULL,NULL,NOW(),NOW())
+                """,
+                (job_id, job_type, user_id, data_json),
             )
-            books_has_file_size = bool((cur.fetchone() or [False])[0])
+    return job_id
 
+
+def claim_background_job(worker_id: str, stale_after_seconds: int = 1800) -> dict | None:
+    worker_id = str(worker_id or "").strip() or "worker"
+    stale_after_seconds = max(60, int(stale_after_seconds or 1800))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema='public' AND table_name='audio_book_parts' AND column_name='file_size'
+                WITH candidate AS (
+                    SELECT id
+                    FROM background_jobs
+                    WHERE next_attempt_at <= NOW()
+                      AND (
+                          status = 'queued'
+                          OR (
+                              status = 'processing'
+                              AND locked_at IS NOT NULL
+                              AND locked_at < NOW() - (%s * INTERVAL '1 second')
+                          )
+                      )
+                    ORDER BY next_attempt_at ASC, created_at ASC, id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
                 )
+                UPDATE background_jobs j
+                SET
+                    status='processing',
+                    attempts=attempts + 1,
+                    locked_at=NOW(),
+                    worker_id=%s,
+                    updated_at=NOW()
+                FROM candidate
+                WHERE j.id = candidate.id
+                RETURNING j.*
+                """,
+                (stale_after_seconds, worker_id),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def complete_background_job(job_id: str) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE background_jobs
+                SET status='completed',
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=NULL,
+                    completed_at=NOW(),
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (job_id,),
+            )
+            return cur.rowcount
+
+
+def retry_background_job(job_id: str, error: str, retry_after_seconds: float = 60.0) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    retry_after_seconds = max(1.0, float(retry_after_seconds or 60.0))
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE background_jobs
+                SET status='queued',
+                    next_attempt_at=NOW() + (%s * INTERVAL '1 second'),
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=%s,
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (retry_after_seconds, str(error or "")[:2000], job_id),
+            )
+            return cur.rowcount
+
+
+def fail_background_job(job_id: str, error: str) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE background_jobs
+                SET status='failed',
+                    locked_at=NULL,
+                    worker_id=NULL,
+                    last_error=%s,
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (str(error or "")[:2000], job_id),
+            )
+            return cur.rowcount
+
+
+def get_background_job_status_counts() -> dict[str, int]:
+    counts = {
+        "queued": 0,
+        "processing": 0,
+        "completed": 0,
+        "failed": 0,
+        "total": 0,
+    }
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(status, 'unknown') AS status, COUNT(*)::int
+                FROM background_jobs
+                GROUP BY COALESCE(status, 'unknown')
                 """
             )
-            audio_parts_has_file_size = bool((cur.fetchone() or [False])[0])
-
-            # Book file sizes (fallback to 0 sizes if schema has no file_size column)
-            if books_has_file_size:
-                cur.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS book_count,
-                        COALESCE(SUM(CASE WHEN file_size IS NOT NULL AND file_size > 0 THEN file_size ELSE 0 END), 0) AS total_book_size,
-                        COALESCE(AVG(CASE WHEN file_size IS NOT NULL AND file_size > 0 THEN file_size ELSE NULL END), 0) AS avg_book_size
-                    FROM books
-                    """
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS book_count,
-                        0::BIGINT AS total_book_size,
-                        0::NUMERIC AS avg_book_size
-                    FROM books
-                    """
-                )
-            book_row = cur.fetchone()
-
-            # Audio file sizes (fallback to 0 sizes if schema has no file_size column)
-            if audio_parts_has_file_size:
-                cur.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS audio_count,
-                        COALESCE(SUM(CASE WHEN file_size IS NOT NULL AND file_size > 0 THEN file_size ELSE 0 END), 0) AS total_audio_size,
-                        COALESCE(AVG(CASE WHEN file_size IS NOT NULL AND file_size > 0 THEN file_size ELSE NULL END), 0) AS avg_audio_size
-                    FROM audio_book_parts
-                    """
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS audio_count,
-                        0::BIGINT AS total_audio_size,
-                        0::NUMERIC AS avg_audio_size
-                    FROM audio_book_parts
-                    """
-                )
-            audio_row = cur.fetchone()
-
-            stats = {
-                'book_count': int(book_row[0] or 0),
-                'total_book_size': int(book_row[1] or 0),
-                'avg_book_size': int(book_row[2] or 0),
-                'audio_count': int(audio_row[0] or 0),
-                'total_audio_size': int(audio_row[1] or 0),
-                'avg_audio_size': int(audio_row[2] or 0),
-            }
-
-            # Calculate totals
-            stats['total_size'] = stats['total_book_size'] + stats['total_audio_size']
-            stats['total_files'] = stats['book_count'] + stats['audio_count']
-
-            return stats
+            for status, count in (cur.fetchall() or []):
+                key = str(status or "").strip().lower()
+                try:
+                    value = int(count or 0)
+                except Exception:
+                    value = 0
+                if key in counts:
+                    counts[key] = value
+                counts["total"] += value
+    counts["pending"] = counts["queued"] + counts["processing"]
+    return counts

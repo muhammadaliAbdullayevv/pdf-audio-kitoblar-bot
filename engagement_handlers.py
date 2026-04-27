@@ -302,6 +302,7 @@ async def handle_user_action_callback(update: Update, context: ContextTypes.DEFA
     prev_stopped = bool(user.get("stopped"))
     prev_upload = bool(user.get("allowed"))
     prev_delete = bool(user.get("delete_allowed"))
+    prev_rename = bool(user.get("rename_allowed"))
     prev_audio = bool(user.get("audio_allowed"))
     if action == "block":
         await run_blocking(set_user_blocked, user_id, not bool(user.get("blocked")))
@@ -309,6 +310,8 @@ async def handle_user_action_callback(update: Update, context: ContextTypes.DEFA
         await run_blocking(set_user_allowed, user_id, not bool(user.get("allowed")))
     elif action == "del":
         await run_blocking(set_user_delete_allowed, user_id, not bool(user.get("delete_allowed")))
+    elif action == "rename":
+        await run_blocking(set_user_rename_allowed, user_id, not bool(user.get("rename_allowed")))
     elif action == "audio":
         await run_blocking(set_user_audio_allowed, user_id, not bool(user.get("audio_allowed")))
     elif action == "stop":
@@ -353,6 +356,15 @@ async def handle_user_action_callback(update: Update, context: ContextTypes.DEFA
         notice_lang = user.get("language") or "en"
         try:
             await context.bot.send_message(chat_id=user_id, text=MESSAGES[notice_lang]["delete_allowed_notice"])
+        except Exception:
+            pass
+    if action == "rename" and not prev_rename and bool(user.get("rename_allowed")):
+        notice_lang = user.get("language") or "en"
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=MESSAGES[notice_lang].get("rename_allowed_notice", "✏️ You can now rename books."),
+            )
         except Exception:
             pass
     if action == "audio" and not prev_audio and bool(user.get("audio_allowed")):
@@ -642,6 +654,8 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     ab_request_count = await run_blocking(count_pending_audiobook_requests, book_id)
                 except Exception:
                     ab_request_count = 0
+            can_rename_books_fn = globals().get("can_rename_books")
+            can_rename_book = bool(callable(can_rename_books_fn) and can_rename_books_fn(query.from_user.id) and not is_group_chat)
             await query.message.edit_caption(
                 caption=build_book_caption(book, downloads, fav_count, counts),
                 reply_markup=build_book_keyboard(
@@ -650,6 +664,7 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     is_fav_now,
                     user_reaction,
                     can_delete,
+                    can_rename_book,
                     lang,
                     has_audiobook=has_ab,
                     can_add_audiobook=can_add_ab,
@@ -750,6 +765,8 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     ab_request_count = await run_blocking(count_pending_audiobook_requests, book_id)
                 except Exception:
                     ab_request_count = 0
+            can_rename_books_fn = globals().get("can_rename_books")
+            can_rename_book = bool(callable(can_rename_books_fn) and can_rename_books_fn(query.from_user.id) and not is_group_chat)
             await query.message.edit_caption(
                 caption=build_book_caption(book, downloads, fav_count, counts),
                 reply_markup=build_book_keyboard(
@@ -758,6 +775,7 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     is_fav_now,
                     user_reaction,
                     can_delete,
+                    can_rename_book,
                     lang,
                     has_audiobook=has_ab,
                     can_add_audiobook=can_add_ab,
@@ -1443,6 +1461,12 @@ async def handle_summary_placeholder_callback(update: Update, context: ContextTy
     if limited:
         await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
         return
+    await safe_answer(
+        query,
+        MESSAGES[lang].get("summary_coming_soon", "🧠 AI book summarizer is coming soon."),
+        show_alert=True,
+    )
+    return
     data = query.data or ""
     parts = data.split(":")
     if len(parts) >= 2 and parts[1] == "cancel":
@@ -1483,59 +1507,32 @@ async def handle_summary_placeholder_callback(update: Update, context: ContextTy
         return
 
     user_id = query.from_user.id if query.from_user else None
-    job_key = f"{user_id or 0}:{book_id}:{lang}:{mode}"
-    jobs = context.application.bot_data.setdefault("summary_jobs", {})
-    existing = jobs.get(job_key)
-    if existing and not existing.done():
-        await safe_answer(query, MESSAGES[lang]["summary_already_running"], show_alert=True)
-        return
-
-    working_msg = None
+    chat_id = None
+    reply_to_message_id = None
     if query.message:
-        working_msg = await _send_with_retry(lambda: query.message.reply_text(MESSAGES[lang]["summary_working"]))
-    if query.message:
-        try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-    await safe_answer(query)
-
-    chat_id = query.message.chat_id if query.message else (query.from_user.id if query.from_user else None)
+        chat_id = query.message.chat_id
+        reply_to_message_id = query.message.message_id
+    elif user_id:
+        chat_id = user_id
     if not chat_id:
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
 
-    progress = None
-    if working_msg:
-        progress = {
-            "stage": "start",
-            "detail": "",
-            "started_at": time.time(),
-            "done": False,
-            "error": False,
-        }
-        asyncio.create_task(
-            _summary_progress_loop(
-                context,
-                working_msg.chat_id,
-                working_msg.message_id,
-                lang,
-                progress,
-            )
-        )
-
-    task = asyncio.create_task(
-        _run_book_summary_job(
-            context,
-            chat_id=chat_id,
-            reply_to_message_id=None,
-            book_id=book_id,
-            lang=lang,
-            mode=mode,
-            user_id=user_id,
-            progress=progress,
-        )
-    )
-    jobs[job_key] = task
+    # Enqueue background job
+    job_data = {
+        "book_id": book_id,
+        "lang": lang,
+        "mode": mode,
+        "chat_id": chat_id,
+        "reply_to_message_id": reply_to_message_id,
+    }
+    job_id = db_enqueue_background_job("book_summary", user_id, job_data)
+    if not job_id:
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
+    await safe_answer(query)
+    if query.message:
+        await _send_with_retry(lambda: query.message.reply_text(MESSAGES[lang]["summary_working"]))
 
 
 async def handle_delete_book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
