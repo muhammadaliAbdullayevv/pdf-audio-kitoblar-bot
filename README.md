@@ -14,17 +14,18 @@ Telegram bot backend for a digital library focused on:
 
 Active user-facing features:
 
-- Book search and delivery
-- Audiobook listening per book
-- Book requests when search misses
-- Favorites, reactions, top books, top users
+- Book search and delivery in private chat and inline mode
+- Audiobook listening per book with part navigation and listened-state tracking
+- Book requests when search misses (`/request`, `/requests`, and no-results actions)
+- Upload access requests for non-owner `/upload` usage
+- Favorites, reactions, top books, top users, and user profile stats
 - PDF Maker
-- AI PDF Translator
 - Text to Voice
 - Audio Editor
 - PDF Editor
-- Sticker Tools
-- YouTube / Instagram downloader
+- Sticker Tools with DB-backed background jobs
+- Contact Admin card
+- Local dashboard and owner/admin control tools
 
 Removed from the product:
 
@@ -39,6 +40,7 @@ Removed from the product:
 - Telegram bot runtime: `python-telegram-bot`
 - Primary storage: PostgreSQL
 - Search index: Elasticsearch (`books` only)
+- Background jobs: PostgreSQL queue (`background_jobs`)
 - Media processing: `ffmpeg`
 - TTS backends: `edge-tts`, optional `espeak-ng`
 - Downloader: `yt-dlp`
@@ -49,17 +51,18 @@ Removed from the product:
 Main menu:
 
 - `🔎 Search Books`
+- `⭐ Favorites`
+- `👤 My Profile`
 - `🔥 Top Books`
-- `🎙️ Text to Voice`
-- `⬇️ Insta Youtub`
 - `🛠️ Other Functions`
+- `🛠 Admin Control` (owner only)
 
 Other Functions:
 
+- `🎙️ Text to Voice`
 - `🤖 AI PDF Maker`
-- `🌐📄 AI PDF Translator`
-- `🎛️ Audio Editor`
 - `🧰 PDF Editor`
+- `🎛️ Audio Editor`
 - `🧩 Sticker Tools`
 - `🏆 Top Users`
 - `📞 Contact Admin`
@@ -67,30 +70,32 @@ Other Functions:
 
 ## Commands
 
-Visible private-chat user commands:
+Public Telegram command menu (synced for private/group chats):
 
 - `/start`
+- `/random`
+- `/upload`
 - `/language`
+- `/help`
+
+Implemented but not shown in the default public command menu:
+
 - `/myprofile`
 - `/favorite`
+- `/top`
+- `/top_users`
+- `/mystats`
 - `/request`
 - `/requests`
-
-Implemented but hidden from the default command menu:
-
-- `/help`
 - `/pdf_maker`
 - `/pdf_editor`
 - `/text_to_voice`
 - `/sticker_tools`
-- `/top`
-- `/top_users`
-- `/mystats`
 
 Owner/admin commands:
 
-- `/upload`
 - `/admin`
+- `/upload`
 - `/smoke`
 - `/db_dupes`
 - `/es_dupes`
@@ -103,12 +108,7 @@ Owner/admin commands:
 - `/audit`
 - `/prune`
 - `/missing`
-
-Group commands:
-
-- `/start`
-- `/language`
-- `/random`
+- `/chatid`
 
 ## Data Model
 
@@ -118,6 +118,7 @@ Core PostgreSQL tables:
 - `books`
 - `audio_books`
 - `audio_book_parts`
+- `audio_book_local_download_jobs`
 - `upload_receipts`
 - `book_requests`
 - `upload_requests`
@@ -126,7 +127,10 @@ Core PostgreSQL tables:
 - `user_favorite_awards`
 - `user_reaction_awards`
 - `user_recents`
+- `user_audiobook_progress`
+- `user_audiobook_part_history`
 - `book_summaries`
+- `background_jobs`
 - `analytics_daily`
 - `analytics_daily_users`
 - `analytics_counters`
@@ -183,5 +187,6 @@ Systemd deployment in this repo includes:
 ## Notes
 
 - Books are the only indexed search catalog now.
-- Legacy removed feature tables and counters are cleaned by schema migration.
+- Public command menus are synced dynamically per chat/language.
+- Sticker conversion and some heavy tasks run through the DB-backed background job queue.
 - Legacy removed feature tables and counters are cleaned by schema migration.

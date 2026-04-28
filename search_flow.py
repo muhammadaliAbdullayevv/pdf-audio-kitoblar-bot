@@ -954,6 +954,7 @@ async def _edit_progress_or_reply(
     fallback_message,
     text: str,
     reply_markup=None,
+    reply_to_message_id: int | None = None,
 ):
     if progress_message:
         for attempt in range(2):
@@ -969,7 +970,17 @@ async def _edit_progress_or_reply(
 
     for attempt in range(2):
         try:
-            await fallback_message.reply_text(text, reply_markup=reply_markup)
+            target_reply_to_message_id = reply_to_message_id
+            if target_reply_to_message_id is None:
+                try:
+                    target_reply_to_message_id = int(getattr(fallback_message, "message_id", 0) or 0) or None
+                except Exception:
+                    target_reply_to_message_id = None
+            await fallback_message.reply_text(
+                text,
+                reply_markup=reply_markup,
+                reply_to_message_id=target_reply_to_message_id,
+            )
             return
         except Exception as e:
             retry_after = getattr(e, "retry_after", None)
@@ -1836,6 +1847,192 @@ async def _handle_missing_audiobook_request(
     await safe_answer(query)
 
 
+def _audiobook_part_button_text(lang: str, part_index: int) -> str:
+    if lang == "uz":
+        return f"{part_index}-qism"
+    if lang == "ru":
+        return f"Часть {part_index}"
+    return f"Part {part_index}"
+
+
+def _format_audiobook_duration(total_seconds: int | None) -> str:
+    try:
+        seconds = max(0, int(total_seconds or 0))
+    except Exception:
+        seconds = 0
+    if seconds <= 0:
+        return "0m"
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    return f"{max(1, minutes)}m"
+
+
+def _resolve_audiobook_total_duration(audio_book: dict | None, parts: list[dict]) -> int:
+    try:
+        total_seconds = int((audio_book or {}).get("total_duration_seconds") or 0)
+    except Exception:
+        total_seconds = 0
+    if total_seconds > 0:
+        return total_seconds
+    resolved = 0
+    for part in parts or []:
+        try:
+            resolved += max(0, int(part.get("duration_seconds") or 0))
+        except Exception:
+            continue
+    return resolved
+
+
+def _build_audiobook_panel_text(
+    audio_book: dict,
+    parts: list[dict],
+    lang: str,
+    *,
+    listened_count: int = 0,
+) -> str:
+    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
+    title = str(audio_book.get("display_title") or audio_book.get("title") or "Audiobook").strip() or "Audiobook"
+    parts_count = len(parts)
+    duration_text = _format_audiobook_duration(_resolve_audiobook_total_duration(audio_book, parts))
+    template = msgs.get(
+        "audiobook_listen_panel",
+        "🎧 {title}\n🎵 {parts} parts • 🕒 {duration}\n👇 Start listening or choose a specific part.",
+    )
+    text = template.format(title=title, parts=parts_count, duration=duration_text)
+    if parts_count > 0:
+        text += "\n" + msgs.get(
+            "audiobook_progress_summary",
+            "✅ Listened: {listened}/{total}",
+        ).format(
+            listened=max(0, min(int(listened_count or 0), parts_count)),
+            total=parts_count,
+        )
+    return text
+
+
+def _build_audiobook_listen_keyboard(
+    book_id: str,
+    parts: list[dict],
+    lang: str,
+    page: int = 0,
+    *,
+    listened_part_ids: set[str] | None = None,
+) -> InlineKeyboardMarkup:
+    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
+    parts_per_page = 10
+    total_pages = max(1, (len(parts) + parts_per_page - 1) // parts_per_page)
+    page = max(0, min(page, total_pages - 1))
+    page_parts = parts[page * parts_per_page:(page + 1) * parts_per_page]
+    listened_part_ids = listened_part_ids or set()
+
+    rows: list[list[InlineKeyboardButton]] = []
+    first_part_id = str((parts[0] if parts else {}).get("id") or "").strip()
+    if first_part_id:
+        rows.append(
+            [InlineKeyboardButton(msgs.get("audiobook_start_button", "▶ Start"), callback_data=f"abplay:{first_part_id}")]
+        )
+
+    row: list[InlineKeyboardButton] = []
+    for part in page_parts:
+        part_id = str(part.get("id") or "").strip()
+        try:
+            part_index = int(part.get("part_index") or 0)
+        except Exception:
+            part_index = 0
+        if not part_id or part_index <= 0:
+            continue
+        label = _audiobook_part_button_text(lang, part_index)
+        if part_id in listened_part_ids:
+            label = f"✓ {label}"
+        row.append(
+            InlineKeyboardButton(
+                label,
+                callback_data=f"abplay:{part_id}",
+            )
+        )
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    if total_pages > 1:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    msgs.get("audiobook_prev_page", "◀ Prev"),
+                    callback_data=f"abpage:{book_id}:{'prev' if page > 0 else 'stay'}",
+                ),
+                InlineKeyboardButton(
+                    msgs.get("audiobook_page_indicator", "📄 {page}/{total}").format(page=page + 1, total=total_pages),
+                    callback_data=f"abpage:{book_id}:stay",
+                ),
+                InlineKeyboardButton(
+                    msgs.get("audiobook_next_page", "Next ▶"),
+                    callback_data=f"abpage:{book_id}:{'next' if page < total_pages - 1 else 'stay'}",
+                ),
+            ]
+        )
+
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_audiobook_part_controls(
+    *,
+    book_id: str,
+    parts: list[dict],
+    current_part_id: str,
+    lang: str,
+    can_manage_audio: bool = False,
+) -> InlineKeyboardMarkup | None:
+    msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
+    prev_part_id = ""
+    next_part_id = ""
+    current_index = -1
+    for idx, item in enumerate(parts):
+        if str(item.get("id") or "") == current_part_id:
+            current_index = idx
+            if idx > 0:
+                prev_part_id = str(parts[idx - 1].get("id") or "")
+            if idx < len(parts) - 1:
+                next_part_id = str(parts[idx + 1].get("id") or "")
+            break
+    if current_index < 0 and not can_manage_audio:
+        return None
+
+    rows: list[list[InlineKeyboardButton]] = []
+    nav_row: list[InlineKeyboardButton] = []
+    if prev_part_id:
+        nav_row.append(
+            InlineKeyboardButton(
+                msgs.get("audiobook_prev_part_button", "◀ Previous"),
+                callback_data=f"abplay:{prev_part_id}",
+            )
+        )
+    nav_row.append(
+        InlineKeyboardButton(
+            msgs.get("audiobook_parts_button", "📚 All Parts"),
+            callback_data=f"abook:{book_id}",
+        )
+    )
+    if next_part_id:
+        nav_row.append(
+            InlineKeyboardButton(
+                msgs.get("audiobook_next_part_button", "Next ▶"),
+                callback_data=f"abplay:{next_part_id}",
+            )
+        )
+    if nav_row:
+        rows.append(nav_row)
+
+    if can_manage_audio:
+        rows.append([InlineKeyboardButton("🗑️ Delete Audio", callback_data=f"apdel:{current_part_id}")])
+
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 async def handle_audiobook_listen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle user request to listen to an audiobook (show audio parts)."""
     logger.debug("handle_audiobook_listen_callback called")
@@ -1872,47 +2069,33 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
         await _handle_missing_audiobook_request(update, context, query, lang, book_id)
         return
 
-    # Pagination: show only first 10 parts initially
-    parts_per_page = 10
-    parts = all_parts[:parts_per_page]
+    user_id = int(query.from_user.id or 0) if query.from_user else 0
+    listened_part_ids: set[str] = set()
+    if user_id:
+        try:
+            listened_part_ids = set(
+                await run_blocking(list_user_audiobook_listened_part_ids, user_id, str(audio_book.get("id") or ""))
+            )
+        except Exception as e:
+            logger.debug("Failed to load listened audiobook parts for user=%s audiobook=%s: %s", user_id, audio_book.get("id"), e)
 
-    # Build keyboard with audio parts (3 per row)
-    keyboard = []
-    row = []
-    for i, part in enumerate(parts):
-        part_index = part.get("part_index", 0)
-
-        # Multilingual button text based on user language
-        if lang == "uz":
-            button_text = f"🎵 {part_index}-qism"
-        elif lang == "ru":
-            button_text = f"🎵 Часть {part_index}"
-        else:  # English default
-            button_text = f"🎵 Part {part_index}"
-
-        callback_data = f"abplay:{part.get('id')}"
-        row.append(InlineKeyboardButton(button_text, callback_data=callback_data))
-
-        # Add row when we have 3 buttons or it's the last part
-        if len(row) == 3 or i == len(parts) - 1:
-            keyboard.append(row)
-            row = []
-
-    # Add pagination if more than 10 parts
-    if len(all_parts) > 10:
-        # Navigation row with prev/next buttons and page info
-        total_pages = (len(all_parts) + parts_per_page - 1) // parts_per_page
-        nav_row = [
-            InlineKeyboardButton("⬅️ Prev", callback_data=f"abpage:{book_id}:prev"),
-            InlineKeyboardButton(f"1/{total_pages}", callback_data="noop"),
-            InlineKeyboardButton("➡️ Next", callback_data=f"abpage:{book_id}:next")
-        ]
-        keyboard.append(nav_row)
-
-    text = MESSAGES[lang].get("audiobook_listen_title", f"🎧 Audiobook: {len(all_parts)} parts")
+    context.user_data[f"abook_page_{book_id}"] = 0
+    text = _build_audiobook_panel_text(
+        audio_book,
+        all_parts,
+        lang,
+        listened_count=len(listened_part_ids),
+    )
+    keyboard = _build_audiobook_listen_keyboard(
+        book_id,
+        all_parts,
+        lang,
+        page=0,
+        listened_part_ids=listened_part_ids,
+    )
 
     try:
-        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text(text, reply_markup=keyboard)
     except Exception as e:
         logger.debug("Failed to send audiobook parts message: %s", e)
         await safe_answer(query)
@@ -1960,63 +2143,35 @@ async def handle_audiobook_page_callback(update: Update, context: ContextTypes.D
     if not all_parts:
         await safe_answer(query, MESSAGES[lang].get("audiobook_no_parts", "No audio parts found"), show_alert=True)
         return
-    
-    # Pagination: 10 parts per page
-    parts_per_page = 10
-    start_idx = current_page * parts_per_page
-    end_idx = start_idx + parts_per_page
-    parts = all_parts[start_idx:end_idx]
-    
-    # Build keyboard with pagination
-    keyboard = []
-    row = []
-    for i, part in enumerate(parts):
-        part_index = part.get("part_index", 0)
-        
-        # Multilingual button text based on user language
-        if lang == "uz":
-            button_text = f"🎵 {part_index}-qism"
-        elif lang == "ru":
-            button_text = f"🎵 Часть {part_index}"
-        else:  # English default
-            button_text = f"🎵 Part {part_index}"
-            
-        callback_data = f"abplay:{part.get('id')}"
-        row.append(InlineKeyboardButton(button_text, callback_data=callback_data))
-        
-        # Add row when we have 3 buttons or it's the last part on this page
-        if len(row) == 3 or i == len(parts) - 1:
-            keyboard.append(row)
-            row = []
-    
-    # Add pagination navigation
-    total_pages = (len(all_parts) + parts_per_page - 1) // parts_per_page
-    nav_row = []
-    
-    # Prev button (disabled if on first page)
-    if current_page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"abpage:{book_id}:prev"))
-    else:
-        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data="noop"))  # Disabled
-    
-    # Page info
-    page_info = f"{current_page + 1}/{total_pages}"
-    nav_row.append(InlineKeyboardButton(page_info, callback_data="noop"))
-    
-    # Next button (disabled if on last page)
-    if current_page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"abpage:{book_id}:next"))
-    else:
-        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data="noop"))  # Disabled
-    
-    keyboard.append(nav_row)
-    
-    text = MESSAGES[lang].get("audiobook_listen_title", f"🎧 Audiobook: {len(all_parts)} parts (Page {current_page + 1})")
+
+    user_id = int(query.from_user.id or 0) if query.from_user else 0
+    listened_part_ids: set[str] = set()
+    if user_id:
+        try:
+            listened_part_ids = set(
+                await run_blocking(list_user_audiobook_listened_part_ids, user_id, str(audio_book.get("id") or ""))
+            )
+        except Exception:
+            listened_part_ids = set()
+
+    text = _build_audiobook_panel_text(
+        audio_book,
+        all_parts,
+        lang,
+        listened_count=len(listened_part_ids),
+    )
+    keyboard = _build_audiobook_listen_keyboard(
+        book_id,
+        all_parts,
+        lang,
+        page=current_page,
+        listened_part_ids=listened_part_ids,
+    )
     
     try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=keyboard)
     except Exception:
-        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text(text, reply_markup=keyboard)
     
     await safe_answer(query)
 
@@ -2039,26 +2194,96 @@ async def handle_audiobook_part_play_callback(update: Update, context: ContextTy
         await safe_answer(query, MESSAGES[lang].get("audio_part_not_found", "Audio part not found"), show_alert=True)
         return
     
-    # Send the audio file with delete button for audio managers
-    keyboard = []
+    audio_book_id = str(part.get("audio_book_id") or "").strip()
+    audio_book = await run_blocking(get_audio_book_by_id, audio_book_id) if audio_book_id else None
+    if not audio_book:
+        await safe_answer(query, MESSAGES[lang].get("audiobook_not_found", "Audiobook not found"), show_alert=True)
+        return
+    all_parts = await run_blocking(list_audio_book_parts, audio_book_id)
+    if not all_parts:
+        await safe_answer(query, MESSAGES[lang].get("audiobook_no_parts", "No audio parts found"), show_alert=True)
+        return
+
+    # Send the audio file with richer navigation controls
     can_manage_audio = False
     if not _is_group_chat(getattr(update, "effective_chat", None)) and callable(globals().get("is_audio_allowed")):
         try:
             can_manage_audio = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
         except Exception:
             can_manage_audio = False
-    if can_manage_audio:
-        delete_button = InlineKeyboardButton("🗑️ Delete Audio", callback_data=f"apdel:{part_id}")
-        keyboard.append([delete_button])
-
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    book_id = str(audio_book.get("book_id") or "").strip()
+    reply_markup = _build_audiobook_part_controls(
+        book_id=book_id,
+        parts=all_parts,
+        current_part_id=part_id,
+        lang=lang,
+        can_manage_audio=can_manage_audio,
+    )
+    current_part_number = 1
+    for idx, item in enumerate(all_parts, start=1):
+        if str(item.get("id") or "") == part_id:
+            try:
+                current_part_number = int(item.get("part_index") or 0) or idx
+            except Exception:
+                current_part_number = idx
+            break
+    caption = MESSAGES[lang].get(
+        "audiobook_part_caption",
+        "🎧 {title}\n🎵 Part {current}/{total}",
+    ).format(
+        title=str(audio_book.get("display_title") or audio_book.get("title") or "Audiobook").strip() or "Audiobook",
+        current=current_part_number,
+        total=len(all_parts),
+    )
     sent = await _send_audiobook_part_to_chat(
         context,
         query.message.chat_id,
         part,
+        caption=caption,
         reply_markup=reply_markup,
     )
     if sent:
+        user_id = int(query.from_user.id or 0) if query.from_user else 0
+        if user_id:
+            _schedule_bg_task(
+                context,
+                _run_db_retry(
+                    record_user_audiobook_progress,
+                    user_id,
+                    audio_book_id,
+                    part_id,
+                    current_part_number,
+                    len(all_parts),
+                ),
+            )
+            listened_part_ids = set()
+            try:
+                listened_part_ids = set(
+                    await run_blocking(list_user_audiobook_listened_part_ids, user_id, audio_book_id)
+                )
+            except Exception:
+                listened_part_ids = set()
+            listened_part_ids.add(part_id)
+            current_page = int(context.user_data.get(f"abook_page_{book_id}", 0) or 0)
+            try:
+                await query.message.edit_text(
+                    _build_audiobook_panel_text(
+                        audio_book,
+                        all_parts,
+                        lang,
+                        listened_count=len(listened_part_ids),
+                    ),
+                    reply_markup=_build_audiobook_listen_keyboard(
+                        book_id,
+                        all_parts,
+                        lang,
+                        page=current_page,
+                        listened_part_ids=listened_part_ids,
+                    ),
+                )
+            except Exception:
+                pass
+        _schedule_bg_task(context, _run_db_retry(increment_audio_book_download, audio_book_id))
         await safe_answer(query)
         return
     await safe_answer(query, MESSAGES[lang].get("audio_send_failed", "Failed to send audio"), show_alert=True)
@@ -2632,7 +2857,8 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_salute_reaction_for_message(update, context)
         try:
             progress_message = await update.message.reply_text(
-                MESSAGES[lang].get("processing_search", "🔎 Searching... Please wait.")
+                MESSAGES[lang].get("processing_search", "🔎 Searching... Please wait."),
+                reply_to_message_id=update.message.message_id,
             )
         except Exception:
             progress_message = None
@@ -2819,6 +3045,7 @@ from db import (
     create_audio_book_for_book,
     insert_audio_book_part,
     list_audio_book_parts,
+    list_user_audiobook_listened_part_ids,
     get_audio_book_part,
     update_audio_book_part_media,
     get_audio_book_part_by_file_unique_id_and_audio_book,
@@ -2827,6 +3054,7 @@ from db import (
     delete_audio_books_by_book_id,
     increment_audio_book_download,
     increment_audio_book_searches,
+    record_user_audiobook_progress,
     shift_audio_book_parts_from,
     enqueue_audio_book_part_local_download_job,
     claim_audio_book_part_local_download_job,

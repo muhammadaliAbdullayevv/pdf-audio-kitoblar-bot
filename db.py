@@ -722,6 +722,40 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_audio_book_local_download_jobs_status_next ON audio_book_local_download_jobs (status, next_attempt_at, created_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_audio_book_local_download_jobs_audio_book_id ON audio_book_local_download_jobs (audio_book_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_audio_book_local_download_jobs_part_id ON audio_book_local_download_jobs (audio_book_part_id);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_audiobook_progress (
+                    user_id BIGINT NOT NULL,
+                    audio_book_id TEXT NOT NULL REFERENCES audio_books(id) ON DELETE CASCADE,
+                    audio_book_part_id TEXT REFERENCES audio_book_parts(id) ON DELETE SET NULL,
+                    part_index INTEGER NOT NULL DEFAULT 0,
+                    completed BOOLEAN NOT NULL DEFAULT FALSE,
+                    last_listened_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (user_id, audio_book_id)
+                );
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_audiobook_progress_audio ON user_audiobook_progress (audio_book_id, last_listened_at DESC);"
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_audiobook_part_history (
+                    user_id BIGINT NOT NULL,
+                    audio_book_id TEXT NOT NULL REFERENCES audio_books(id) ON DELETE CASCADE,
+                    audio_book_part_id TEXT NOT NULL REFERENCES audio_book_parts(id) ON DELETE CASCADE,
+                    part_index INTEGER NOT NULL DEFAULT 0,
+                    listen_count INTEGER NOT NULL DEFAULT 0,
+                    last_listened_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (user_id, audio_book_part_id)
+                );
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_audiobook_part_history_user_audio ON user_audiobook_part_history (user_id, audio_book_id, last_listened_at DESC);"
+            )
             # One-time index/constraint migrations
             _apply_schema_migrations(cur)
             cur.execute("ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS media_kind TEXT;")
@@ -2182,6 +2216,103 @@ def increment_audio_book_searches(audio_book_ids: list[str]):
                 "UPDATE audio_books SET searches = COALESCE(searches,0) + 1 WHERE id = ANY(%s)",
                 (audio_book_ids,),
             )
+
+
+def record_user_audiobook_progress(
+    user_id: int,
+    audio_book_id: str,
+    audio_book_part_id: str,
+    part_index: int,
+    total_parts: int | None = None,
+) -> int:
+    if not user_id or not audio_book_id or not audio_book_part_id:
+        return 0
+    completed = bool(total_parts and int(part_index or 0) >= int(total_parts or 0))
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO user_audiobook_progress (
+                    user_id, audio_book_id, audio_book_part_id,
+                    part_index, completed, last_listened_at, created_at
+                )
+                VALUES (%s,%s,%s,%s,%s,NOW(),NOW())
+                ON CONFLICT (user_id, audio_book_id)
+                DO UPDATE SET
+                    audio_book_part_id = EXCLUDED.audio_book_part_id,
+                    part_index = EXCLUDED.part_index,
+                    completed = CASE
+                        WHEN EXCLUDED.completed THEN TRUE
+                        ELSE user_audiobook_progress.completed
+                    END,
+                    last_listened_at = NOW()
+                """,
+                (
+                    int(user_id),
+                    str(audio_book_id),
+                    str(audio_book_part_id),
+                    int(part_index or 0),
+                    completed,
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO user_audiobook_part_history (
+                    user_id, audio_book_id, audio_book_part_id,
+                    part_index, listen_count, last_listened_at, created_at
+                )
+                VALUES (%s,%s,%s,%s,1,NOW(),NOW())
+                ON CONFLICT (user_id, audio_book_part_id)
+                DO UPDATE SET
+                    audio_book_id = EXCLUDED.audio_book_id,
+                    part_index = EXCLUDED.part_index,
+                    listen_count = user_audiobook_part_history.listen_count + 1,
+                    last_listened_at = NOW()
+                """,
+                (
+                    int(user_id),
+                    str(audio_book_id),
+                    str(audio_book_part_id),
+                    int(part_index or 0),
+                ),
+            )
+            return cur.rowcount
+
+
+def get_user_audiobook_progress(user_id: int, audio_book_id: str) -> dict | None:
+    if not user_id or not audio_book_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM user_audiobook_progress
+                WHERE user_id=%s AND audio_book_id=%s
+                LIMIT 1
+                """,
+                (int(user_id), str(audio_book_id)),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def list_user_audiobook_listened_part_ids(user_id: int, audio_book_id: str) -> list[str]:
+    if not user_id or not audio_book_id:
+        return []
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT audio_book_part_id
+                FROM user_audiobook_part_history
+                WHERE user_id=%s AND audio_book_id=%s
+                ORDER BY part_index ASC, last_listened_at DESC
+                """,
+                (int(user_id), str(audio_book_id)),
+            )
+            rows = cur.fetchall() or []
+            return [str(row[0] or "").strip() for row in rows if row and str(row[0] or "").strip()]
 
 
 def set_book_reaction(user_id: int, book_id: str, reaction: str):

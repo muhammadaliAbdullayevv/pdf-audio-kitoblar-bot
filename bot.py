@@ -4856,7 +4856,17 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     query = update.inline_query.query.strip()
     lang = ensure_user_language(update, context)
+    msgs = MESSAGES.get(lang, MESSAGES["en"])
     results = []
+    inline_promo = "📚 Ko'proq kitoblar uchun:"
+    inline_promo_handle = "@pdf_audio_kitoblar_bot"
+    inline_action_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(msgs.get("inline_more_books_button", "📚 Ko'proq kitoblar"), url="https://t.me/pdf_audio_kitoblar_bot")]]
+    )
+
+    def _inline_format_label(book_path: str | None) -> str:
+        ext = os.path.splitext(str(book_path or "").strip())[1].strip().lstrip(".").upper()
+        return ext or "BOOK"
 
     if not query:
         await update.inline_query.answer([], cache_time=0)
@@ -4877,33 +4887,42 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = get_result_title(book)
             path = book.get("path")
             file_id = book.get("file_id")
+            display_title = f"📖 {title}"
+            safe_title = html.escape(title)
+            inline_caption = f"📖 {safe_title}\n<blockquote>{inline_promo}</blockquote>\n{inline_promo_handle}"
+            format_label = _inline_format_label(path)
 
             if file_id:
                 result = InlineQueryResultCachedDocument(
                     id=book_id,
-                    title=title,
+                    title=display_title,
                     document_file_id=file_id,
-                    caption=f"📖 {title}"
+                    description=msgs.get("inline_cached_description", "⚡ Ready to send • {format}").format(format=format_label),
+                    caption=inline_caption,
+                    reply_markup=inline_action_markup,
+                    parse_mode="HTML",
                 )
             elif path and os.path.exists(path):
-                message = f"📖 *{title}*\n📂 Path:\n`{path}`"
+                message = f"📖 {safe_title}\n<blockquote>{inline_promo}</blockquote>\n{inline_promo_handle}"
                 result = InlineQueryResultArticle(
                     id=book_id,
-                    title=title,
+                    title=display_title,
                     input_message_content=InputTextMessageContent(
-                        message, parse_mode="Markdown"
+                        message, parse_mode="HTML"
                     ),
-                    description=MESSAGES[lang]["inline_book_upload_description"]
+                    reply_markup=inline_action_markup,
+                    description=msgs.get("inline_local_description", "📚 Available in the bot library • {format}").format(format=format_label),
                 )
             else:
                 result = InlineQueryResultArticle(
                     id=book_id,
-                    title=title,
+                    title=display_title,
                     input_message_content=InputTextMessageContent(
-                        f"📖 *{title}*",
-                        parse_mode="Markdown"
+                        f"📖 {safe_title}\n<blockquote>{inline_promo}</blockquote>\n{inline_promo_handle}",
+                        parse_mode="HTML"
                     ),
-                    description=MESSAGES[lang]["inline_book_info_only"]
+                    reply_markup=inline_action_markup,
+                    description=msgs.get("inline_info_description", "ℹ️ Info card • {format}").format(format=format_label),
                 )
 
             results.append(result)
