@@ -22,7 +22,6 @@ Telegram bot backend for a digital library focused on:
 
 
 ###Search results 
-<img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/341b0382-5141-43e2-af4b-262609b15414" />
 <img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/e18974b1-ebbd-44bb-8089-3224b7703323" />
 
 
