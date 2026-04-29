@@ -6,6 +6,10 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, date
 from typing import Any, Iterable
+try:
+    from dotenv import dotenv_values
+except Exception:
+    dotenv_values = None  # type: ignore
 
 try:
     import psycopg2
@@ -18,6 +22,19 @@ except ImportError:
     execute_values = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENV_PATH = os.path.join(_BASE_DIR, ".env")
+_PROJECT_DOTENV = dotenv_values(_ENV_PATH) if callable(dotenv_values) and os.path.exists(_ENV_PATH) else {}
+
+
+def _env_project_first(name: str, default: str = "") -> str:
+    value = _PROJECT_DOTENV.get(name, None) if isinstance(_PROJECT_DOTENV, dict) else None
+    if value is not None:
+        text = str(value).strip()
+        if text:
+            return text
+    return str(os.getenv(name, default) or "").strip()
 
 
 def _ensure_schema_migrations(cur) -> None:
@@ -266,11 +283,12 @@ except Exception:
 
 def _dsn():
     return {
-        "dbname": os.getenv("DB_NAME", ""),
-        "user": os.getenv("DB_USER", ""),
-        "password": os.getenv("DB_PASS", ""),
-        "host": os.getenv("DB_HOST", "localhost"),
-        "port": int(os.getenv("DB_PORT", "5432")),
+        "dbname": _env_project_first("DB_NAME", ""),
+        "user": _env_project_first("DB_USER", ""),
+        "password": _env_project_first("DB_PASS", ""),
+        "host": _env_project_first("DB_HOST", "localhost"),
+        "port": int(_env_project_first("DB_PORT", "5432") or "5432"),
+        "application_name": _env_project_first("PGAPPNAME", "pdf_audio_kitoblar_bot"),
     }
 
 

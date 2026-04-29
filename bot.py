@@ -1033,7 +1033,7 @@ atexit.register(_shutdown_heavy_executor)
 def _acquire_single_instance_lock() -> bool:
     """Ensure only one bot process handles updates at a time."""
     global _BOT_INSTANCE_LOCK_FH
-    lock_path = os.getenv("BOT_INSTANCE_LOCK_FILE", "/tmp/smartaitoolsbot.instance.lock")
+    lock_path = os.getenv("BOT_INSTANCE_LOCK_FILE", "/tmp/pdf_audio_kitoblar_bot.instance.lock")
     try:
         fh = open(lock_path, "w")
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1617,7 +1617,7 @@ SEARCH_COOLDOWN_SEC = 0
 DOWNLOAD_COOLDOWN_SEC = 0
 MAX_RECENTS = 5
 MAX_FAVORITES = 50
-MAX_SEARCH_RESULTS = 20
+MAX_SEARCH_RESULTS = 10
 REQUESTS_PAGE_SIZE = 10
 USER_SEARCH_LIMIT = 30
 LOCAL_SEND_RETRIES = 3
@@ -2599,9 +2599,7 @@ async def post_init(application):
     asyncio.create_task(_bg_sync_unindexed_books())
     asyncio.create_task(_bg_process_jobs())
     try:
-        starter = getattr(_upload_flow, "start_upload_local_backup_worker", None)
-        if callable(starter):
-            starter(application)
+        application.job_queue.run_once(_bg_ensure_upload_local_backup_worker, when=1)
         application.job_queue.run_repeating(_bg_ensure_upload_local_backup_worker, interval=60, first=60)
     except Exception as e:
         logger.error(f"Failed to start local backup worker: {e}")
@@ -4858,8 +4856,6 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = ensure_user_language(update, context)
     msgs = MESSAGES.get(lang, MESSAGES["en"])
     results = []
-    inline_promo = "📚 Ko'proq kitoblar uchun:"
-    inline_promo_handle = "@pdf_audio_kitoblar_bot"
     inline_action_markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton(msgs.get("inline_more_books_button", "📚 Ko'proq kitoblar"), url="https://t.me/pdf_audio_kitoblar_bot")]]
     )
@@ -4889,7 +4885,7 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_id = book.get("file_id")
             display_title = f"📖 {title}"
             safe_title = html.escape(title)
-            inline_caption = f"📖 {safe_title}\n<blockquote>{inline_promo}</blockquote>\n{inline_promo_handle}"
+            inline_caption = f"📖 {safe_title}"
             format_label = _inline_format_label(path)
 
             if file_id:
@@ -4903,7 +4899,7 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
             elif path and os.path.exists(path):
-                message = f"📖 {safe_title}\n<blockquote>{inline_promo}</blockquote>\n{inline_promo_handle}"
+                message = f"📖 {safe_title}"
                 result = InlineQueryResultArticle(
                     id=book_id,
                     title=display_title,
@@ -4918,7 +4914,7 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     id=book_id,
                     title=display_title,
                     input_message_content=InputTextMessageContent(
-                        f"📖 {safe_title}\n<blockquote>{inline_promo}</blockquote>\n{inline_promo_handle}",
+                        f"📖 {safe_title}",
                         parse_mode="HTML"
                     ),
                     reply_markup=inline_action_markup,

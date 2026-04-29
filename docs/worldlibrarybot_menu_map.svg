@@ -43,7 +43,7 @@
     <circle cx="1220" cy="1280" r="260" fill="#8f7cff"/>
   </g>
 
-  <text x="70" y="70" class="title">Smart AI Tools Bot Menu Map</text>
+  <text x="70" y="70" class="title">pdf_audio_kitoblar_bot Menu Map</text>
   <text x="70" y="98" class="subtitle">Dynamic reply-keyboard hierarchy (main menu + all submenus) based on current code</text>
 
   <!-- Language picker -->

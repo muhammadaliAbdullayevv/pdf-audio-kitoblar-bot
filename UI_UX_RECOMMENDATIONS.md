@@ -1,4 +1,4 @@
-# SmartAIToolsBot UI/UX Comprehensive Analysis & Recommendations
+# pdf_audio_kitoblar_bot UI/UX Comprehensive Analysis & Recommendations
 
 ## Executive Summary
 
@@ -768,7 +768,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_new:
         # Show curated onboarding (show 3 key features)
         await update.message.reply_text(
-            "🎉 **Welcome to SmartAIToolsBot!**\n\n"
+            "🎉 **Welcome to pdf_audio_kitoblar_bot!**\n\n"
             "Here's what you can do:\n"
             "1️⃣ 🔎 **Search books** - Type any book name\n"
             "2️⃣ 🎙️ **Convert text to audio** - Great for learning\n"

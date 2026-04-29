@@ -35,7 +35,7 @@ except Exception as e:
 write_log("\n📋 Checking systemd logs...")
 try:
     result = subprocess.run(
-        ["sudo", "journalctl", "-u", "SmartAIToolsBot-bot.service", "--no-pager", "-n", "30"],
+        ["sudo", "journalctl", "-u", "pdf_audio_kitoblar_bot-bot.service", "--no-pager", "-n", "30"],
         capture_output=True,
         text=True,
         timeout=10
@@ -54,7 +54,7 @@ except Exception as e:
 write_log("\n📋 Checking bot status...")
 try:
     result = subprocess.run(
-        ["sudo", "systemctl", "status", "SmartAIToolsBot-bot.service"],
+        ["sudo", "systemctl", "status", "pdf_audio_kitoblar_bot-bot.service"],
         capture_output=True,
         text=True,
         timeout=5

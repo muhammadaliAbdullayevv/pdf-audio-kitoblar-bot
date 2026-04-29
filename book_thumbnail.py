@@ -28,7 +28,6 @@ def _candidate_paths() -> list[Path]:
 
     candidates.extend(
         [
-            Path("/home/muhammadaliabdullayev/Downloads/main logo.jpg"),
             root / "assets" / "book_thumbnail.jpg",
             root / "assets" / "book_thumbnail.jpeg",
             root / "assets" / "book_thumbnail.png",

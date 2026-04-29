@@ -1043,9 +1043,9 @@ def _fetch_infra_metrics() -> dict[str, Any]:
 
     system_uptime_s = _read_proc_uptime()
     services = [
-        _service_runtime_snapshot("SmartAIToolsBot.service", system_uptime_s),
-        _service_runtime_snapshot("SmartAIToolsBot-bot.service", system_uptime_s),
-        _service_runtime_snapshot("SmartAIToolsBot-dashboard.service", system_uptime_s),
+        _service_runtime_snapshot("pdf_audio_kitoblar_bot.service", system_uptime_s),
+        _service_runtime_snapshot("pdf_audio_kitoblar_bot-bot.service", system_uptime_s),
+        _service_runtime_snapshot("pdf_audio_kitoblar_bot-dashboard.service", system_uptime_s),
     ]
 
     return {
@@ -1744,7 +1744,7 @@ def build_dashboard_payload(range_key: str = "week", days_override: int | None =
             if not isinstance(svc, dict):
                 continue
             unit = str(svc.get("unit", ""))
-            if unit.endswith("SmartAIToolsBot-bot.service"):
+            if unit.endswith("pdf_audio_kitoblar_bot-bot.service"):
                 bot_runtime = {
                     "last_restart_epoch": _safe_int(svc.get("active_enter_epoch", 0), 0),
                     "last_restart_iso": str(svc.get("active_enter_iso", "") or ""),

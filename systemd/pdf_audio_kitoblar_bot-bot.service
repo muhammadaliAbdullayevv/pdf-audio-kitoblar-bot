@@ -1,0 +1,23 @@
+[Unit]
+Description=pdf_audio_kitoblar_bot - Main Bot Application
+Wants=network-online.target pdf_audio_kitoblar_bot.service
+After=network-online.target pdf_audio_kitoblar_bot.service
+
+[Service]
+Type=simple
+# Template unit for public repo use.
+# Replace the generic user/group/path values to match your host before installing.
+User=pdfbot
+Group=pdfbot
+WorkingDirectory=/opt/pdf_audio_kitoblar_bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/pdf_audio_kitoblar_bot.env
+ExecStart=/opt/pdf_audio_kitoblar_bot/.venv/bin/python /opt/pdf_audio_kitoblar_bot/bot.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -103,7 +103,7 @@ for file in files_to_check:
 # Test 4: Check bot service status
 print("\n🤖 Checking bot service status:")
 try:
-    result = subprocess.run(["systemctl", "is-active", "SmartAIToolsBot-bot.service"], 
+    result = subprocess.run(["systemctl", "is-active", "pdf_audio_kitoblar_bot-bot.service"], 
                           capture_output=True, text=True, timeout=5)
     if result.returncode == 0:
         status = result.stdout.strip()

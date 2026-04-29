@@ -1,4 +1,4 @@
-# SmartAIToolsBot
+# pdf_audio_kitoblar_bot
 
 Telegram bot backend for a digital library focused on:
 
@@ -183,6 +183,10 @@ Systemd deployment in this repo includes:
 - main bot service
 - dashboard service
 - stack target
+
+The `systemd/` files are deployment templates. Before installing them, replace the
+example user, group, project directory, virtualenv path, and sudoers account values
+to match your own server.
 
 ## Notes
 

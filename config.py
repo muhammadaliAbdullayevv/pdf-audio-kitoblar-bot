@@ -106,9 +106,9 @@ def validate_runtime_config() -> list[str]:
         errors.append("TELEGRAM_OWNER_ID must be a positive integer")
 
     for key in ("DB_NAME", "DB_USER", "DB_PASS", "DB_HOST"):
-        if not str(os.getenv(key, "") or "").strip():
+        if not _env_project_first(key, ""):
             errors.append(f"{key} is required")
-    db_port_raw = str(os.getenv("DB_PORT", "5432") or "").strip()
+    db_port_raw = _env_project_first("DB_PORT", "5432")
     if not db_port_raw:
         errors.append("DB_PORT is required")
     else:

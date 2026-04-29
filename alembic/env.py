@@ -6,6 +6,10 @@ from urllib.parse import quote_plus
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+try:
+    from dotenv import dotenv_values
+except Exception:
+    dotenv_values = None  # type: ignore
 
 config = context.config
 
@@ -17,18 +21,30 @@ if config.config_file_name is not None:
         pass
 
 target_metadata = None
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ENV_PATH = os.path.join(_BASE_DIR, ".env")
+_PROJECT_DOTENV = dotenv_values(_ENV_PATH) if callable(dotenv_values) and os.path.exists(_ENV_PATH) else {}
+
+
+def _env_project_first(name: str, default: str = "") -> str:
+    value = _PROJECT_DOTENV.get(name, None) if isinstance(_PROJECT_DOTENV, dict) else None
+    if value is not None:
+        text = str(value).strip()
+        if text:
+            return text
+    return str(os.getenv(name, default) or "").strip()
 
 
 def _database_url_from_env() -> str:
-    direct = str(os.getenv("DATABASE_URL", "") or "").strip()
+    direct = _env_project_first("DATABASE_URL", "")
     if direct:
         return direct
 
-    db_name = str(os.getenv("DB_NAME", "") or "").strip()
-    db_user = str(os.getenv("DB_USER", "") or "").strip()
-    db_pass = str(os.getenv("DB_PASS", "") or "").strip()
-    db_host = str(os.getenv("DB_HOST", "") or "").strip()
-    db_port = str(os.getenv("DB_PORT", "5432") or "5432").strip()
+    db_name = _env_project_first("DB_NAME", "")
+    db_user = _env_project_first("DB_USER", "")
+    db_pass = _env_project_first("DB_PASS", "")
+    db_host = _env_project_first("DB_HOST", "")
+    db_port = _env_project_first("DB_PORT", "5432")
     if not (db_name and db_user and db_host):
         return ""
     return (

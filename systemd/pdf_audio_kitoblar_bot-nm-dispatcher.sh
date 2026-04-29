@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NetworkManager dispatcher hook for controlling SmartAIToolsBot services
+# NetworkManager dispatcher hook for controlling pdf_audio_kitoblar_bot services
 # based on Wi-Fi connectivity changes.
 # Behavior:
 # - Wi-Fi disconnected: stop services once
 # - Wi-Fi reconnected (after disconnect): restart services once
 # - Repeated events in same state: no action
 
-BOT_API_SERVICE="SmartAIToolsBot.service"
-BOT_SERVICE="SmartAIToolsBot-bot.service"
-STATE_FILE="/run/smartaitoolsbot-dispatcher.state"
-LOCK_FILE="/run/smartaitoolsbot-dispatcher.lock"
-LOGGER_TAG="smartaitoolsbot-dispatcher"
+BOT_API_SERVICE="pdf_audio_kitoblar_bot.service"
+BOT_SERVICE="pdf_audio_kitoblar_bot-bot.service"
+STATE_FILE="/run/pdf_audio_kitoblar_bot-dispatcher.state"
+LOCK_FILE="/run/pdf_audio_kitoblar_bot-dispatcher.lock"
+LOGGER_TAG="pdf_audio_kitoblar_bot-dispatcher"
 
 log() {
   /usr/bin/logger -t "${LOGGER_TAG}" "$*"

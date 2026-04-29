@@ -15,6 +15,7 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import ContextTypes
 from book_thumbnail import get_book_thumbnail_input
+from language import get_language_keyboard
 
 try:
     from telegram import ReactionTypeEmoji
@@ -505,6 +506,54 @@ def _is_group_chat(update_or_chat) -> bool:
         msg = getattr(cb, "message", None) or getattr(update_or_chat, "effective_message", None)
         chat_type = str(getattr(getattr(msg, "chat", None), "type", "") or "").lower()
     return chat_type in {"group", "supergroup"}
+
+
+def _detect_picker_lang(code: str | None) -> str:
+    text = str(code or "").strip().lower()
+    if text.startswith("uz"):
+        return "uz"
+    if text.startswith("ru"):
+        return "ru"
+    return "en"
+
+
+def _user_language_selected(user_record: dict[str, Any] | None) -> bool:
+    if not isinstance(user_record, dict):
+        return False
+    return bool(user_record.get("language_selected")) and bool(str(user_record.get("language") or "").strip())
+
+
+async def _reply_private_language_picker_again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if _is_group_chat(getattr(update, "effective_chat", None)):
+        return False
+    user = getattr(update, "effective_user", None)
+    if not user:
+        return False
+
+    user_record: dict[str, Any] | None = None
+    get_user_fn = globals().get("get_user")
+    if callable(get_user_fn):
+        try:
+            fetched = get_user_fn(user.id)
+            user_record = fetched if isinstance(fetched, dict) else None
+        except Exception as e:
+            logger.warning("language selection check failed for user %s: %s", user.id, e)
+
+    if _user_language_selected(user_record):
+        return False
+
+    context.user_data.pop("main_menu_section", None)
+    context.user_data["awaiting_book_search"] = False
+    context.user_data.pop("search_mode", None)
+    context.user_data.pop("language", None)
+
+    prompt_lang = _detect_picker_lang(getattr(user, "language_code", None))
+    await safe_reply(
+        update,
+        MESSAGES[prompt_lang]["choose_language"],
+        reply_markup=get_language_keyboard(),
+    )
+    return True
 
 
 def prune_search_cache(cache: dict, max_items: int = 5, max_age_sec: int = 1800):
@@ -2505,6 +2554,9 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
             except Exception:
                 pass
+
+        if await _reply_private_language_picker_again(update, context):
+            return
 
         menu_action = _main_menu_text_action(update.message.text.strip())
         if menu_action:

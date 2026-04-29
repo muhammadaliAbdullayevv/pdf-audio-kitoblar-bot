@@ -1,0 +1,24 @@
+[Unit]
+Description=pdf_audio_kitoblar_bot - Local Telegram Bot API Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Template unit for public repo use.
+# Replace the generic user/group/path values to match your host before installing.
+User=pdfbot
+Group=pdfbot
+WorkingDirectory=/opt/pdf_audio_kitoblar_bot
+EnvironmentFile=/etc/pdf_audio_kitoblar_bot.env
+Environment=BOTAPI_DATA_DIR=/var/lib/pdf_audio_kitoblar_bot/bot-api
+ExecStartPre=/usr/bin/mkdir -p /var/lib/pdf_audio_kitoblar_bot/bot-api
+ExecStart=/usr/local/bin/telegram-bot-api --api-id=${TELEGRAM_API_ID} --api-hash=${TELEGRAM_API_HASH} --local --http-port=8081 --dir=${BOTAPI_DATA_DIR}
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

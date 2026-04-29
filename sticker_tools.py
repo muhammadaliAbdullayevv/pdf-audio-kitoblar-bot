@@ -464,7 +464,7 @@ def _sticker_prepare_rembg_runtime() -> None:
     os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 
     # Keep model cache in a writable project-local folder.
-    model_dir = os.path.join(tempfile.gettempdir(), "smartaitoolsbot_u2net")
+    model_dir = os.path.join(tempfile.gettempdir(), "pdf_audio_kitoblar_bot_u2net")
     os.environ.setdefault("U2NET_HOME", model_dir)
     try:
         os.makedirs(os.environ["U2NET_HOME"], exist_ok=True)

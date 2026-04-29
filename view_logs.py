@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bot Log Viewer - Real-time log monitoring script
-Usage: python3 view_logs.py [--tail=50] [--follow] [--service=SmartAIToolsBot-bot]
+Usage: python3 view_logs.py [--tail=50] [--follow] [--service=pdf_audio_kitoblar_bot-bot]
 """
 
 import subprocess
@@ -10,7 +10,7 @@ import argparse
 import time
 from datetime import datetime
 
-DEFAULT_SERVICE = "SmartAIToolsBot-bot"
+DEFAULT_SERVICE = "pdf_audio_kitoblar_bot-bot"
 
 
 def _unit_name(service: str) -> str:
@@ -108,7 +108,7 @@ def show_service_status(service=DEFAULT_SERVICE):
         print(f"❌ Error getting status: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="View SmartAIToolsBot logs")
+    parser = argparse.ArgumentParser(description="View pdf_audio_kitoblar_bot logs")
     parser.add_argument("--tail", type=int, default=50, help="Number of lines to show (default: 50)")
     parser.add_argument("--follow", action="store_true", help="Follow logs in real-time")
     parser.add_argument("--errors", action="store_true", help="Show only recent errors")
