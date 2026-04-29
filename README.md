@@ -13,7 +13,7 @@ Telegram bot backend for a digital library focused on:
 
 ## Screenshots
 
-###start menu
+### start menu
 <img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/048ccb76-45c4-4e8f-823b-024f25d068cb" />
 <img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/d87ab4e4-8ef7-474e-8645-040e48a41373" />
 <img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/161dd8af-b52d-4530-9eeb-85e286b115d8" />
@@ -21,19 +21,19 @@ Telegram bot backend for a digital library focused on:
 
 
 
-###Search results 
+### Book Delivery Example 
 <img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/e18974b1-ebbd-44bb-8089-3224b7703323" />
 
 
 
-###other functions section 
+### other functions section 
 <img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/0400cba7-6df3-435e-98b5-3a9c860cb543" />
 ##pdf editing feature 
 <img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/c9051d29-6836-4c0a-9f94-fa59959b5c7d" />
 
 
 
-###admin control panel 
+### Admin Control Panel
 <img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/14e3be35-c68f-4082-954a-6b0baec91f85" />
 
 
