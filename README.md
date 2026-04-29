@@ -168,6 +168,15 @@ Common optional:
 - `TELEGRAM_BOT_API_BASE_FILE_URL`
 - `TELEGRAM_BOT_API_LOCAL_MODE`
 
+Create your local runtime config from the example file:
+
+```bash
+cp .env.example .env
+```
+
+Then fill in your real bot token, owner ID, database credentials, and any optional
+service endpoints you use.
+
 ## Startup
 
 Run the bot locally:
@@ -179,10 +188,11 @@ python bot.py
 
 Systemd deployment in this repo includes:
 
-- local Telegram Bot API service
-- main bot service
-- dashboard service
-- stack target
+- `systemd/pdf_audio_kitoblar_bot.service`
+- `systemd/pdf_audio_kitoblar_bot-bot.service`
+- `systemd/pdf_audio_kitoblar_bot-dashboard.service`
+- `systemd/pdf_audio_kitoblar_bot-stack.target`
+- `systemd/pdf_audio_kitoblar_bot-hotkey.sudoers` (example only)
 
 The `systemd/` files are deployment templates. Before installing them, replace the
 example user, group, project directory, virtualenv path, and sudoers account values
@@ -190,6 +200,8 @@ to match your own server.
 
 ## Notes
 
+- This repository does not track `.env`, live credentials, runtime logs, or local media storage.
+- Dashboard fallback values are demo/sample data for local UI development only.
 - Books are the only indexed search catalog now.
 - Public command menus are synced dynamically per chat/language.
 - Sticker conversion and some heavy tasks run through the DB-backed background job queue.
