@@ -1,25 +1,48 @@
 # 📚 pdf_audio_kitoblar_bot
 
-Telegram bot backend for a digital library focused on:
+A multilingual Telegram digital library platform for discovering, delivering, and
+managing PDF books and audiobooks.
 
-- PDF books
-- audiobooks
-- PDF tools
-- text-to-voice
-- media utilities
-- admin operations
-- local dashboard
+This project is designed as a real-world Telegram product rather than a small demo bot.
+It combines book search, file delivery, audiobook navigation, media utilities, admin
+operations, and a local dashboard into one production-oriented system built with
+Python, PostgreSQL, Elasticsearch, and background job processing.
 
-The codebase is a production-style Telegram bot with a large integration entrypoint
-(`bot.py`) and extracted feature modules for search, uploads, engagement, admin
-runtime, and dashboard operations.
+## Why This Project Matters
 
-## Documentation Map
+Many digital library bots stop at simple file lookup. This project goes further:
 
-- `README.md` — product overview, setup, commands, and deployment notes
-- `docs/ARCHITECTURE.md` — repository layout, runtime flow, and module guide
-- `docs/worldlibrarybot_menu_map.svg` — visual menu map
-- `UI_UX_RECOMMENDATIONS.md` — backlog-style UX analysis and improvement ideas
+- it provides a Telegram-native experience for searching and receiving books
+- it supports both PDF books and audiobook flows
+- it includes multilingual UX for Uzbek, English, and Russian users
+- it is built with operational tooling, persistence, and recovery paths, not just chat commands
+- it treats the bot as a real service with administration, monitoring, and deployment templates
+
+For a portfolio or admissions reader, the value of this repository is not only the
+feature list, but the fact that it solves a practical product problem with a full
+backend system behind it.
+
+## Project Highlights
+
+- Multilingual Telegram UX with dedicated flows for private chats and group chats
+- Ranked search pipeline with Elasticsearch acceleration and database fallbacks
+- PDF book delivery with Telegram `file_id` reuse and local backup handling
+- Audiobook browsing with part navigation and per-user progress tracking
+- Integrated tool suite: Text-to-Speech, PDF tools, audio tools, and sticker tools
+- Admin control panel, request handling, duplicate cleanup, and runtime diagnostics
+- Local dashboard for operational visibility
+- DB-backed background jobs for heavier and restart-safe tasks
+
+## What This Repository Demonstrates
+
+This codebase demonstrates engineering work across multiple layers:
+
+- **Backend architecture:** modular Telegram bot runtime with separated feature flows
+- **Data engineering:** PostgreSQL-backed catalog, user state, analytics, and queues
+- **Search systems:** Elasticsearch integration with ranking and fallback behavior
+- **Asynchronous processing:** background workers and task orchestration
+- **Product design:** multilingual chat UX, onboarding, and delivery flows
+- **Operations:** deployment templates, smoke checks, diagnostics, and admin tooling
 
 ## Screenshots
 
@@ -51,28 +74,16 @@ runtime, and dashboard operations.
   <img src="https://github.com/user-attachments/assets/379b4afd-98d3-4b2a-9a81-90c53d2e5dad" width="300"/>
 </p>
 
-## Quick Start
+## Technical Overview
 
-Prerequisites:
-
-- Python 3.12 recommended
-- PostgreSQL required
-- `ffmpeg` required for audio / sticker / media utilities
-- Elasticsearch optional
-- Local Telegram Bot API optional
-
-Install and run locally:
-
-```bash
-python3.12 -m venv venv312
-source venv312/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-python bot.py
-```
-
-Then fill in your real bot token, owner ID, database credentials, and any optional
-service endpoints you use.
+- **Runtime:** `python-telegram-bot`
+- **Primary storage:** PostgreSQL
+- **Search engine:** Elasticsearch (`books` catalog)
+- **Background work:** PostgreSQL-backed `background_jobs` + async workers
+- **Media processing:** `ffmpeg`
+- **TTS backends:** `edge-tts`, optional `espeak-ng`
+- **Downloader:** `yt-dlp`
+- **Dashboard:** local web UI with Python backend
 
 ## Current Feature Scope
 
@@ -101,23 +112,34 @@ Removed from the product:
 - Legacy AI chat / translator / grammar / email / quiz / music tools
 - Separate AI Tools menu
 
-## Architecture
+## Main User Flows
 
-- Telegram bot runtime: `python-telegram-bot`
-- Primary storage: PostgreSQL
-- Search index: Elasticsearch (`books` only)
-- Background jobs: PostgreSQL queue (`background_jobs`)
-- Media processing: `ffmpeg`
-- TTS backends: `edge-tts`, optional `espeak-ng`
-- Downloader: `yt-dlp`
-- Dashboard: local web UI + Python backend
+### Library Features
+
+- Search and receive books directly in Telegram
+- Browse and listen to audiobooks by parts
+- Save favorites and review top books / top users
+- Request missing content when a search has no result
+
+### Utility Features
+
+- Convert text to speech
+- Create or edit PDFs
+- Convert/edit audio
+- Use sticker tools with background processing
+
+### Administration
+
+- Moderate and manage uploads
+- Review operational status inside Telegram
+- Monitor duplicates and missing files
+- Use a local dashboard for metrics and diagnostics
 
 ## Repository Layout
 
 Main runtime and feature modules:
 
-- `bot.py` — composition root, startup, shared helpers, send/delivery logic, and
-  background job worker loop
+- `bot.py` — composition root, startup, shared helpers, send/delivery logic, and background job worker loop
 - `handler_registry.py` — centralized `python-telegram-bot` handler registration
 - `search_flow.py` — text search, result rendering, selection flow, and audiobook UI
 - `upload_flow.py` — `/upload`, storage-channel refresh, and local backup workers
@@ -136,31 +158,16 @@ Operational and support files:
 - `test_*.py` — smoke/regression scripts
 - `check_*.py`, `debug_*.py`, `*_diagnosis.py` — operational diagnostics and repair helpers
 
-## Main Menus
+## Documentation Map
 
-Main menu:
-
-- `🔎 Search Books`
-- `⭐ Favorites`
-- `👤 My Profile`
-- `🔥 Top Books`
-- `🛠️ Other Functions`
-- `🛠 Admin Control` (owner only)
-
-Other Functions:
-
-- `🎙️ Text to Voice`
-- `🤖 AI PDF Maker`
-- `🧰 PDF Editor`
-- `🎛️ Audio Editor`
-- `🧩 Sticker Tools`
-- `🏆 Top Users`
-- `📞 Contact Admin`
-- `❓ Help`
+- `README.md` — project overview, setup, commands, and deployment notes
+- `docs/ARCHITECTURE.md` — repository layout, runtime flow, and module guide
+- `docs/worldlibrarybot_menu_map.svg` — visual menu map
+- `UI_UX_RECOMMENDATIONS.md` — UX analysis and future improvement ideas
 
 ## Commands
 
-Public Telegram command menu (synced for private/group chats):
+Public Telegram command menu:
 
 - `/start`
 - `/random`
@@ -229,6 +236,29 @@ Elasticsearch indexes:
 
 - `books`
 
+## Quick Start
+
+Prerequisites:
+
+- Python 3.12 recommended
+- PostgreSQL required
+- `ffmpeg` required for audio and media utilities
+- Elasticsearch optional
+- Local Telegram Bot API optional
+
+Install and run locally:
+
+```bash
+python3.12 -m venv venv312
+source venv312/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python bot.py
+```
+
+Then fill in your real bot token, owner ID, database credentials, and any optional
+service endpoints you use.
+
 ## Environment
 
 Required:
@@ -258,7 +288,7 @@ Common optional:
 - `TELEGRAM_BOT_API_BASE_FILE_URL`
 - `TELEGRAM_BOT_API_LOCAL_MODE`
 
-## Startup
+## Startup and Deployment
 
 Run the bot locally:
 
@@ -267,7 +297,7 @@ source venv312/bin/activate
 python bot.py
 ```
 
-Systemd deployment in this repo includes:
+Systemd deployment templates in this repo:
 
 - `systemd/pdf_audio_kitoblar_bot.service`
 - `systemd/pdf_audio_kitoblar_bot-bot.service`
@@ -275,9 +305,9 @@ Systemd deployment in this repo includes:
 - `systemd/pdf_audio_kitoblar_bot-stack.target`
 - `systemd/pdf_audio_kitoblar_bot-hotkey.sudoers` (example only)
 
-The `systemd/` files are deployment templates. Before installing them, replace the
-example user, group, project directory, virtualenv path, and sudoers account values
-to match your own server.
+The `systemd/` files are templates. Before installing them, replace the example
+user, group, project directory, virtualenv path, and sudoers account values to
+match your own server.
 
 ## Verification
 
@@ -292,17 +322,16 @@ python test_upload_system.py
 
 Notes:
 
-- `test_bot_start.py` is the fastest broad import/startup smoke check.
-- `test_imports.py` writes a simple import report to `import_test_results.txt`.
-- These are smoke-style checks, not a full pytest suite.
+- `test_bot_start.py` is the fastest broad import/startup smoke check
+- `test_imports.py` writes a simple import report to `import_test_results.txt`
+- these are smoke-style checks, not a full pytest suite
 
 ## Notes
 
-- This repository does not track `.env`, live credentials, runtime logs, or local media storage.
-- Dashboard fallback values are demo/sample data for local UI development only.
-- Books are the only indexed search catalog now.
-- Public command menus are synced dynamically per chat/language.
-- Sticker conversion and some heavy tasks run through the DB-backed background job queue.
-- Legacy removed feature tables and counters are cleaned by schema migration.
-- Group chat usage has a separate onboarding path: users must start the bot once in
-  private chat, then choose a group reply language.
+- This repository does not track `.env`, live credentials, runtime logs, or local media storage
+- Dashboard fallback values are demo/sample data for local UI development only
+- Books are the only indexed search catalog now
+- Public command menus are synced dynamically per chat/language
+- Sticker conversion and some heavy tasks run through the DB-backed background job queue
+- Legacy removed feature tables and counters are cleaned by schema migration
+- Group chat usage has a separate onboarding path: users must start the bot once in private chat, then choose a group reply language
