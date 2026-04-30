@@ -8,16 +8,29 @@ Telegram bot backend for a digital library focused on:
 - text-to-voice
 - media utilities
 - admin operations
+Muhammad Abdullayev
+Plus
+￼
+￼
+
 - local dashboard
 
 
 ## Screenshots
 
 ### start menu
-<img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/048ccb76-45c4-4e8f-823b-024f25d068cb" />
-<img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/d87ab4e4-8ef7-474e-8645-040e48a41373" />
-<img width="472" height="1054" alt="image" src="https://github.com/user-attachments/assets/161dd8af-b52d-4530-9eeb-85e286b115d8" />
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/048ccb76-45c4-4e8f-823b-024f25d068cb"" width="300"/>
+</p>
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/d87ab4e4-8ef7-474e-8645-040e48a41373" width="300"/>
+</p>
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/161dd8af-b52d-4530-9eeb-85e286b115d8" width="300"/>
+</p>
 
 
 
