@@ -58,6 +58,12 @@ A powerful Telegram bot for managing and delivering **PDF books and audiobooks**
   <img src="https://github.com/user-attachments/assets/14e3be35-c68f-4082-954a-6b0baec91f85" width="300"/>
 </p>
 
+
+## Owner-admin only media control 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/379b4afd-98d3-4b2a-9a81-90c53d2e5dad" width="300"/>
+</p>
+
 ---
 
 ## 🏗 Architecture
