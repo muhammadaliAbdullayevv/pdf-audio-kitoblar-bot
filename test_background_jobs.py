@@ -92,23 +92,41 @@ def main() -> None:
     db.complete_background_job(stale_id, {"ok": True})
 
     # user limits
+    old_pending = None
+    old_running = None
+    if isinstance(getattr(db, "_PROJECT_DOTENV", None), dict):
+        old_pending = db._PROJECT_DOTENV.get("MAX_PENDING_JOBS_PER_USER")
+        old_running = db._PROJECT_DOTENV.get("MAX_RUNNING_JOBS_PER_USER")
+        db._PROJECT_DOTENV["MAX_PENDING_JOBS_PER_USER"] = "1"
+        db._PROJECT_DOTENV["MAX_RUNNING_JOBS_PER_USER"] = "1"
     os.environ["MAX_PENDING_JOBS_PER_USER"] = "1"
     os.environ["MAX_RUNNING_JOBS_PER_USER"] = "1"
     limit_user = 910000002
-    first = db.create_background_job("TEST_LIMIT_PENDING", limit_user, {"v": 1}, idempotency_key=f"test:limitp:{uuid.uuid4().hex}")
-    _assert(bool(first.get("ok")), "first pending job should be accepted")
-    second = db.create_background_job("TEST_LIMIT_PENDING", limit_user, {"v": 2}, idempotency_key=f"test:limitp2:{uuid.uuid4().hex}")
-    _assert(second.get("reason") == "pending_limit", "second pending job should hit pending limit")
-    first_id = str(first.get("job_id") or "")
-    claimed_limit = db.claim_background_job(
-        f"test-worker-{uuid.uuid4().hex[:6]}",
-        stale_after_seconds=1800,
-        allowed_job_types=["TEST_LIMIT_PENDING", "TEST_LIMIT_RUNNING"],
-    )
-    _assert(claimed_limit is not None and str(claimed_limit.get("id")) == first_id, "limit test job should claim")
-    third = db.create_background_job("TEST_LIMIT_RUNNING", limit_user, {"v": 3}, idempotency_key=f"test:limitr:{uuid.uuid4().hex}")
-    _assert(third.get("reason") == "running_limit", "running limit should be enforced")
-    db.complete_background_job(first_id, {"ok": True})
+    try:
+        first = db.create_background_job("TEST_LIMIT_PENDING", limit_user, {"v": 1}, idempotency_key=f"test:limitp:{uuid.uuid4().hex}")
+        _assert(bool(first.get("ok")), "first pending job should be accepted")
+        second = db.create_background_job("TEST_LIMIT_PENDING", limit_user, {"v": 2}, idempotency_key=f"test:limitp2:{uuid.uuid4().hex}")
+        _assert(second.get("reason") == "pending_limit", "second pending job should hit pending limit")
+        first_id = str(first.get("job_id") or "")
+        claimed_limit = db.claim_background_job(
+            f"test-worker-{uuid.uuid4().hex[:6]}",
+            stale_after_seconds=1800,
+            allowed_job_types=["TEST_LIMIT_PENDING", "TEST_LIMIT_RUNNING"],
+        )
+        _assert(claimed_limit is not None and str(claimed_limit.get("id")) == first_id, "limit test job should claim")
+        third = db.create_background_job("TEST_LIMIT_RUNNING", limit_user, {"v": 3}, idempotency_key=f"test:limitr:{uuid.uuid4().hex}")
+        _assert(third.get("reason") == "running_limit", "running limit should be enforced")
+        db.complete_background_job(first_id, {"ok": True})
+    finally:
+        if isinstance(getattr(db, "_PROJECT_DOTENV", None), dict):
+            if old_pending is None:
+                db._PROJECT_DOTENV.pop("MAX_PENDING_JOBS_PER_USER", None)
+            else:
+                db._PROJECT_DOTENV["MAX_PENDING_JOBS_PER_USER"] = old_pending
+            if old_running is None:
+                db._PROJECT_DOTENV.pop("MAX_RUNNING_JOBS_PER_USER", None)
+            else:
+                db._PROJECT_DOTENV["MAX_RUNNING_JOBS_PER_USER"] = old_running
 
     # feature flag / ES fallback sanity
     os.environ["ENABLE_ELASTICSEARCH"] = "0"
