@@ -4,9 +4,9 @@ A multilingual Telegram digital library platform for discovering, delivering, an
 managing PDF books and audiobooks.
 
 This project is designed as a real-world Telegram product rather than a small demo bot.
-It combines book search, file delivery, audiobook navigation, media utilities, admin
-operations, and a local dashboard into one production-oriented system built with
-Python, PostgreSQL, Elasticsearch, and background job processing.
+It combines book search, file delivery, audiobook navigation, media utilities, and
+admin operations into one production-oriented system built with Python,
+PostgreSQL, Elasticsearch, and background job processing.
 
 ## Why This Project Matters
 
@@ -30,7 +30,6 @@ backend system behind it.
 - Audiobook browsing with part navigation and per-user progress tracking
 - Integrated tool suite: Text-to-Speech, PDF tools, audio tools, and sticker tools
 - Admin control panel, request handling, duplicate cleanup, and runtime diagnostics
-- Local dashboard for operational visibility
 - DB-backed background jobs for heavier and restart-safe tasks
 
 ## What This Repository Demonstrates
@@ -83,8 +82,6 @@ This codebase demonstrates engineering work across multiple layers:
 - **Media processing:** `ffmpeg`
 - **TTS backends:** `edge-tts`, optional `espeak-ng`
 - **Downloader:** `yt-dlp`
-- **Dashboard:** local web UI with Python backend
-
 ## Current Feature Scope
 
 Active user-facing features:
@@ -102,7 +99,7 @@ Active user-facing features:
 - PDF Editor
 - Sticker Tools with DB-backed background jobs
 - Contact Admin card
-- Local dashboard and owner/admin control tools
+- Owner/admin control tools
 
 Removed from the product:
 
@@ -112,28 +109,9 @@ Removed from the product:
 - Legacy AI chat / translator / grammar / email / quiz / music tools
 - Separate AI Tools menu
 
-## Main User Flows
-
-### Library Features
-
-- Search and receive books directly in Telegram
-- Browse and listen to audiobooks by parts
-- Save favorites and review top books / top users
-- Request missing content when a search has no result
-
-### Utility Features
-
-- Convert text to speech
-- Create or edit PDFs
-- Convert/edit audio
-- Use sticker tools with background processing
-
-### Administration
-
 - Moderate and manage uploads
 - Review operational status inside Telegram
 - Monitor duplicates and missing files
-- Use a local dashboard for metrics and diagnostics
 
 ## Repository Layout
 
@@ -147,7 +125,6 @@ Main runtime and feature modules:
 - `user_interactions.py` — request lifecycle and related callback handling
 - `admin_runtime.py` — owner/admin control panel and maintenance flows
 - `db.py` — PostgreSQL pool, runtime schema bootstrap, and query helpers
-- `dashboard_server.py` + `dashboard_ui/` — local admin dashboard backend/frontend
 - `command_sync.py` — per-language Telegram command synchronization
 - `language.py`, `menus.py`, `menu_ui.py` — multilingual copy and menu definitions
 
@@ -301,7 +278,6 @@ Systemd deployment templates in this repo:
 
 - `systemd/pdf_audio_kitoblar_bot.service`
 - `systemd/pdf_audio_kitoblar_bot-bot.service`
-- `systemd/pdf_audio_kitoblar_bot-dashboard.service`
 - `systemd/pdf_audio_kitoblar_bot-stack.target`
 - `systemd/pdf_audio_kitoblar_bot-hotkey.sudoers` (example only)
 
@@ -329,7 +305,6 @@ Notes:
 ## Notes
 
 - This repository does not track `.env`, live credentials, runtime logs, or local media storage
-- Dashboard fallback values are demo/sample data for local UI development only
 - Books are the only indexed search catalog now
 - Public command menus are synced dynamically per chat/language
 - Sticker conversion and some heavy tasks run through the DB-backed background job queue

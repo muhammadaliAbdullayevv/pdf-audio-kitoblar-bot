@@ -107,3 +107,7 @@ def get_book_thumbnail_input() -> InputFile | None:
         return None
     data, filename = payload
     return InputFile(data, filename=filename)
+
+
+def get_book_thumbnail_payload() -> tuple[bytes, str] | None:
+    return _build_thumbnail_payload()

@@ -209,9 +209,18 @@ def _audio_conv_default_name(source_name: str | None, source_kind: str) -> str:
 
 def _audio_conv_max_bytes() -> int:
     try:
-        max_mb = max(1, int(os.getenv("AUDIO_CONVERTER_MAX_MB", "64") or "64"))
+        max_mb = max(
+            1,
+            int(
+                os.getenv(
+                    "AUDIO_CONVERTER_MAX_MB",
+                    os.getenv("MAX_AUDIO_SIZE_MB", "100"),
+                )
+                or os.getenv("MAX_AUDIO_SIZE_MB", "100")
+            ),
+        )
     except Exception:
-        max_mb = 64
+        max_mb = 100
     return max_mb * 1024 * 1024
 
 
@@ -941,11 +950,22 @@ async def _audio_conv_handle_text_input(update: Update, context: ContextTypes.DE
             "end_s": end_s,
             "lang": lang,
         }
-        job_id = db_enqueue_background_job("audio_convert", user_id, job_data)
-        if not job_id:
-            await update.message.reply_text(t["failed"])
+        job_meta = db_enqueue_background_job(
+            "audio_convert",
+            user_id,
+            job_data,
+            chat_id=update.effective_chat.id if update.effective_chat else None,
+            message_id=update.message.message_id if update.message else None,
+            return_meta=True,
+        )
+        if not job_meta or not job_meta.get("ok"):
+            reason = str((job_meta or {}).get("reason") or "")
+            if reason in {"pending_limit", "running_limit"}:
+                await update.message.reply_text(MESSAGES[lang]["job_limit_wait"])
+            else:
+                await update.message.reply_text(t["failed"])
             return True
-        await update.message.reply_text("✅ Audio cutting queued! You'll receive the file soon.")
+        await update.message.reply_text(MESSAGES[lang]["job_queued"])
         return True
 
     if phase == "awaiting_cover":
@@ -1052,11 +1072,22 @@ async def handle_audio_converter_callback(update: Update, context: ContextTypes.
             "output_mode": "mp3",
             "lang": lang,
         }
-        job_id = db_enqueue_background_job("audio_convert", user_id, job_data)
-        if not job_id:
-            await _send_with_retry(lambda: query.message.reply_text(t["failed"]))
+        job_meta = db_enqueue_background_job(
+            "audio_convert",
+            user_id,
+            job_data,
+            chat_id=query.message.chat_id if query.message else None,
+            message_id=query.message.message_id if query.message else None,
+            return_meta=True,
+        )
+        if not job_meta or not job_meta.get("ok"):
+            reason = str((job_meta or {}).get("reason") or "")
+            if reason in {"pending_limit", "running_limit"}:
+                await _send_with_retry(lambda: query.message.reply_text(MESSAGES[lang]["job_limit_wait"]))
+            else:
+                await _send_with_retry(lambda: query.message.reply_text(t["failed"]))
             return
-        await _send_with_retry(lambda: query.message.reply_text("✅ Audio conversion to MP3 queued! You'll receive the file soon."))
+        await _send_with_retry(lambda: query.message.reply_text(MESSAGES[lang]["job_queued"]))
         return
 
     if action == "atool:to_voice":
@@ -1071,11 +1102,22 @@ async def handle_audio_converter_callback(update: Update, context: ContextTypes.
             "output_mode": "voice",
             "lang": lang,
         }
-        job_id = db_enqueue_background_job("audio_convert", user_id, job_data)
-        if not job_id:
-            await _send_with_retry(lambda: query.message.reply_text(t["failed"]))
+        job_meta = db_enqueue_background_job(
+            "audio_convert",
+            user_id,
+            job_data,
+            chat_id=query.message.chat_id if query.message else None,
+            message_id=query.message.message_id if query.message else None,
+            return_meta=True,
+        )
+        if not job_meta or not job_meta.get("ok"):
+            reason = str((job_meta or {}).get("reason") or "")
+            if reason in {"pending_limit", "running_limit"}:
+                await _send_with_retry(lambda: query.message.reply_text(MESSAGES[lang]["job_limit_wait"]))
+            else:
+                await _send_with_retry(lambda: query.message.reply_text(t["failed"]))
             return
-        await _send_with_retry(lambda: query.message.reply_text("✅ Audio conversion to Voice queued! You'll receive the file soon."))
+        await _send_with_retry(lambda: query.message.reply_text(MESSAGES[lang]["job_queued"]))
         return
 
     if action == "atool:cut_mp3":

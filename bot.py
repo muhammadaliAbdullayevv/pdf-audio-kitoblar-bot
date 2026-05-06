@@ -152,6 +152,7 @@ from db import (
     get_audio_book_stats as db_get_audio_book_stats,
     get_storage_stats as db_get_storage_stats,
     get_book_local_download_job_status_counts as db_get_book_local_download_job_status_counts,
+    get_audio_book_part_local_download_job_status_counts as db_get_audio_book_part_local_download_job_status_counts,
     increment_book_download as db_increment_book_download,
     increment_book_searches as db_increment_book_searches,
     set_book_reaction as db_set_book_reaction,
@@ -171,6 +172,7 @@ from db import (
     retry_book_local_download_job as db_retry_book_local_download_job,
     fail_book_local_download_job as db_fail_book_local_download_job,
     get_audio_book_for_book,
+    list_audio_books_by_book_id,
     get_audio_book_by_id,
     list_audio_book_parts,
     get_audio_book_part,
@@ -201,11 +203,17 @@ from db import (
     update_upload_receipt as db_update_upload_receipt,
     update_book_upload_meta as db_update_book_upload_meta,
     enqueue_background_job as db_enqueue_background_job,
+    create_background_job as db_create_background_job,
+    deserialize_background_job_payload as db_deserialize_background_job_payload,
     claim_background_job as db_claim_background_job,
     complete_background_job as db_complete_background_job,
+    update_background_job_progress as db_update_background_job_progress,
     retry_background_job as db_retry_background_job,
     fail_background_job as db_fail_background_job,
+    recover_stale_background_jobs as db_recover_stale_background_jobs,
     get_background_job_status_counts as db_get_background_job_status_counts,
+    get_background_job_status_counts_by_type as db_get_background_job_status_counts_by_type,
+    get_background_job_admin_summary as db_get_background_job_admin_summary,
     upsert_book_summary as db_upsert_book_summary,
     search_users_by_name as db_search_users_by_name,
     is_user_delete_allowed as db_is_user_delete_allowed,
@@ -241,6 +249,14 @@ import audio_converter as _audio_converter
 import sticker_tools as _sticker_tools
 import search_flow as _search_flow
 import tts_tools as _tts_tools
+from jobs import (
+    job_dir as _job_workspace_dir,
+    job_temp_environment as _job_temp_environment,
+    mark_job_failed as _mark_job_failed_workspace,
+    clear_job_failed_marker as _clear_job_failed_workspace,
+    prune_job_dirs as _prune_job_dirs,
+)
+from workers.handlers import process_background_job as _process_background_job_payload
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +344,9 @@ _BRIDGE_DB_SYMBOLS = (
     db_retry_book_local_download_job,
     db_fail_book_local_download_job,
     db_get_book_local_download_job_status_counts,
+    db_get_audio_book_part_local_download_job_status_counts,
     get_audio_book_for_book,
+    list_audio_books_by_book_id,
     get_audio_book_by_id,
     list_audio_book_parts,
     get_audio_book_part,
@@ -364,6 +382,7 @@ _BRIDGE_DB_SYMBOLS = (
     db_retry_background_job,
     db_fail_background_job,
     db_get_background_job_status_counts,
+    db_get_background_job_status_counts_by_type,
     db_upsert_book_summary,
     db_search_users_by_name,
     db_is_user_delete_allowed,
@@ -438,6 +457,7 @@ _SEARCH_FLOW_DEP_KEYS = (
     "find_book_by_id",
     "get_display_name",
     "get_audio_book_by_id",
+    "list_audio_books_by_book_id",
     "get_es",
     "get_result_title",
     "get_user",
@@ -782,6 +802,11 @@ _ADMIN_RUNTIME_OPTIONAL_DEP_KEYS = (
     "db_insert_admin_task_run",
     "db_list_admin_task_runs",
     "db_list_books",
+    "db_get_audio_book_part_local_download_job_status_counts",
+    "db_get_background_job_admin_summary",
+    "db_get_background_job_status_counts",
+    "db_get_background_job_status_counts_by_type",
+    "db_get_book_local_download_job_status_counts",
     "db_search_users_by_name",
     "db_update_book_path",
     "db_update_admin_task_run",
@@ -1533,6 +1558,34 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
+def _parse_background_job_type_limits(raw: str | None) -> dict[str, int]:
+    limits = {
+        "book_summary": 1,
+        "sticker_convert": 1,
+        "tts_generate": 2,
+        "audio_convert": 2,
+        "pdf_maker": 2,
+        "pdf_editor": 2,
+    }
+    text = str(raw or "").strip()
+    if not text:
+        return limits
+    for chunk in text.split(","):
+        piece = str(chunk or "").strip()
+        if not piece or ":" not in piece:
+            continue
+        job_type, value = piece.split(":", 1)
+        key = str(job_type or "").strip()
+        if not key:
+            continue
+        try:
+            parsed = max(0, int(str(value or "").strip()))
+        except Exception:
+            continue
+        limits[key] = parsed
+    return limits
+
+
 def _normalize_bot_api_base_url(raw: str) -> str:
     value = str(raw or "").strip().rstrip("/")
     if not value:
@@ -1602,6 +1655,15 @@ ES_URL = os.getenv("ES_URL", "")
 ES_CA_CERT = os.getenv("ES_CA_CERT", "")
 ES_USER = os.getenv("ES_USER", "")
 ES_PASS = os.getenv("ES_PASS", "")
+ENABLE_ELASTICSEARCH = _env_bool("ENABLE_ELASTICSEARCH", True)
+ENABLE_PDF_TOOLS = _env_bool("ENABLE_PDF_TOOLS", True)
+ENABLE_AUDIO_TOOLS = _env_bool("ENABLE_AUDIO_TOOLS", True)
+ENABLE_TTS = _env_bool("ENABLE_TTS", True)
+ENABLE_STICKER_TOOLS = _env_bool("ENABLE_STICKER_TOOLS", True)
+try:
+    ES_TIMEOUT_SECONDS = max(1, int(os.getenv("ES_TIMEOUT_SECONDS", "3") or "3"))
+except Exception:
+    ES_TIMEOUT_SECONDS = 3
 _ES_CLIENT = None
 BOOK_LOVERS_GROUP_URL = (os.getenv("BOOK_LOVERS_GROUP_URL", "") or "").strip()
 _BOOK_LOVERS_GROUP_HANDLE_RAW = (os.getenv("BOOK_LOVERS_GROUP_HANDLE", "") or "").strip()
@@ -1652,6 +1714,48 @@ try:
     HEAVY_THREAD_POOL_WORKERS = max(1, int(os.getenv("HEAVY_THREAD_POOL_WORKERS", "20")))
 except Exception:
     HEAVY_THREAD_POOL_WORKERS = 20
+try:
+    BACKGROUND_JOB_WORKER_COUNT = max(1, int(os.getenv("BACKGROUND_JOB_WORKER_COUNT", "3")))
+except Exception:
+    BACKGROUND_JOB_WORKER_COUNT = 3
+try:
+    BACKGROUND_JOB_STALE_AFTER_SECONDS = max(60, int(os.getenv("BACKGROUND_JOB_STALE_AFTER_SECONDS", "1800")))
+except Exception:
+    BACKGROUND_JOB_STALE_AFTER_SECONDS = 1800
+try:
+    JOB_LOCK_TIMEOUT_MINUTES = max(1, int(os.getenv("JOB_LOCK_TIMEOUT_MINUTES", "30") or "30"))
+except Exception:
+    JOB_LOCK_TIMEOUT_MINUTES = 30
+try:
+    BACKGROUND_JOB_IDLE_SECONDS = max(0.5, float(os.getenv("BACKGROUND_JOB_IDLE_SECONDS", "3.0")))
+except Exception:
+    BACKGROUND_JOB_IDLE_SECONDS = 3.0
+try:
+    BOT_CONCURRENT_UPDATES = max(1, int(os.getenv("BOT_CONCURRENT_UPDATES", "16") or "16"))
+except Exception:
+    BOT_CONCURRENT_UPDATES = 16
+try:
+    BOT_CONNECTION_POOL_SIZE = max(4, int(os.getenv("BOT_CONNECTION_POOL_SIZE", "32") or "32"))
+except Exception:
+    BOT_CONNECTION_POOL_SIZE = 32
+try:
+    BOT_POOL_TIMEOUT = max(5, int(os.getenv("BOT_POOL_TIMEOUT", "30") or "30"))
+except Exception:
+    BOT_POOL_TIMEOUT = 30
+try:
+    TEMP_JOB_TTL_HOURS = max(1, int(os.getenv("TEMP_JOB_TTL_HOURS", "24") or "24"))
+except Exception:
+    TEMP_JOB_TTL_HOURS = 24
+try:
+    FAILED_JOB_TTL_HOURS = max(1, int(os.getenv("FAILED_JOB_TTL_HOURS", "48") or "48"))
+except Exception:
+    FAILED_JOB_TTL_HOURS = 48
+BACKGROUND_JOB_TYPE_LIMITS = _parse_background_job_type_limits(
+    os.getenv(
+        "BACKGROUND_JOB_TYPE_LIMITS",
+        "book_summary:1,sticker_convert:1,tts_generate:2,audio_convert:2,pdf_maker:2,pdf_editor:2",
+    )
+)
 try:
     DB_RETRY_ATTEMPTS = max(0, int(os.getenv("DB_RETRY_ATTEMPTS", "2")))
 except Exception:
@@ -2571,7 +2675,20 @@ async def post_init(application):
 
     async def _bg_sync_unindexed_books():
         try:
-            await run_blocking(sync_unindexed_books)
+            if not ENABLE_ELASTICSEARCH:
+                return
+            meta = await run_blocking(
+                db_create_background_job,
+                "SEARCH_REINDEX_ALL",
+                int(OWNER_ID or 1),
+                {"lang": "uz", "source": "startup"},
+                priority=80,
+                max_attempts=2,
+                idempotency_key="startup-search-reindex-all",
+                ignore_limits=True,
+            )
+            if meta and meta.get("ok"):
+                logger.info("Queued SEARCH_REINDEX_ALL startup job: %s", meta.get("job_id"))
         except Exception as e:
             logger.error(f"Failed to sync unindexed books to Elasticsearch: {e}", exc_info=True)
 
@@ -2583,11 +2700,35 @@ async def post_init(application):
         except Exception as e:
             logger.error(f"Failed to ensure local backup worker: {e}")
 
-    async def _bg_process_jobs():
+    async def _bg_ensure_audiobook_local_backup_worker(context):
         try:
-            await _process_background_jobs(application)
+            starter = getattr(_search_flow, "start_audiobook_local_backup_worker", None)
+            if callable(starter):
+                starter(application)
         except Exception as e:
-            logger.error(f"Background job processor failed: {e}")
+            logger.error(f"Failed to ensure audiobook local backup worker: {e}")
+
+    async def _bg_ensure_background_job_workers(context):
+        try:
+            start_background_job_workers(application)
+        except Exception as e:
+            logger.error(f"Failed to ensure background job workers: {e}")
+
+    async def _bg_recover_stale_background_jobs(context):
+        try:
+            recovered = await run_blocking(db_recover_stale_background_jobs, JOB_LOCK_TIMEOUT_MINUTES)
+            if recovered and (recovered.get("recovered") or recovered.get("failed")):
+                logger.info("Recovered stale background jobs: %s", recovered)
+        except Exception as e:
+            logger.error("Failed to recover stale background jobs: %s", e, exc_info=True)
+
+    async def _bg_cleanup_job_dirs(context):
+        try:
+            cleaned = await asyncio.to_thread(_prune_job_dirs, TEMP_JOB_TTL_HOURS, FAILED_JOB_TTL_HOURS)
+            if cleaned and (cleaned.get("deleted") or cleaned.get("failed_deleted")):
+                logger.info("Cleaned job temp dirs: %s", cleaned)
+        except Exception as e:
+            logger.error("Failed to clean job temp dirs: %s", e, exc_info=True)
 
     asyncio.create_task(_bg_set_commands())
     try:
@@ -2597,22 +2738,44 @@ async def post_init(application):
         logger.error(f"Failed to schedule prune_blocked_users: {e}")
     asyncio.create_task(_bg_backfill_awards())
     asyncio.create_task(_bg_sync_unindexed_books())
-    asyncio.create_task(_bg_process_jobs())
     try:
         application.job_queue.run_once(_bg_ensure_upload_local_backup_worker, when=1)
         application.job_queue.run_repeating(_bg_ensure_upload_local_backup_worker, interval=60, first=60)
     except Exception as e:
         logger.error(f"Failed to start local backup worker: {e}")
+    try:
+        application.job_queue.run_once(_bg_ensure_audiobook_local_backup_worker, when=1)
+        application.job_queue.run_repeating(_bg_ensure_audiobook_local_backup_worker, interval=60, first=60)
+    except Exception as e:
+        logger.error(f"Failed to start audiobook local backup worker: {e}")
+    try:
+        application.job_queue.run_once(_bg_ensure_background_job_workers, when=1)
+        application.job_queue.run_repeating(_bg_ensure_background_job_workers, interval=60, first=60)
+    except Exception as e:
+        logger.error(f"Failed to start background job workers: {e}")
+    try:
+        application.job_queue.run_once(_bg_recover_stale_background_jobs, when=3)
+        application.job_queue.run_repeating(_bg_recover_stale_background_jobs, interval=10 * 60, first=10 * 60)
+    except Exception as e:
+        logger.error("Failed to schedule stale background job recovery: %s", e)
+    try:
+        application.job_queue.run_once(_bg_cleanup_job_dirs, when=60)
+        application.job_queue.run_repeating(_bg_cleanup_job_dirs, interval=60 * 60, first=60 * 60)
+    except Exception as e:
+        logger.error("Failed to schedule job temp cleanup: %s", e)
 
 
 def get_es():
     global _ES_CLIENT
     if _ES_CLIENT is not None:
         return _ES_CLIENT
+    if not ENABLE_ELASTICSEARCH:
+        logger.info("Elasticsearch feature flag disabled; DB fallback search only.")
+        return None
     if not ES_URL:
         logger.debug("ES_URL not set; Elasticsearch disabled.")
         return None
-    kwargs = {}
+    kwargs = {"request_timeout": ES_TIMEOUT_SECONDS}
     if ES_CA_CERT:
         kwargs["ca_certs"] = ES_CA_CERT
     if ES_USER and ES_PASS:
@@ -2628,6 +2791,8 @@ def get_es():
 def es_available(force_refresh: bool = False):
     """Return cached ES availability to avoid per-request blocking health checks."""
     try:
+        if not ENABLE_ELASTICSEARCH:
+            return False
         now = time.monotonic()
         checked_at = float(_ES_HEALTH_CACHE.get("checked_at", 0.0) or 0.0)
         cached_ok = _ES_HEALTH_CACHE.get("ok", None)
@@ -2703,7 +2868,7 @@ def index_book(book_name, file_id=None, path=None, book_id=None, display_name=No
         logger.debug(f"Indexed/updated in ES: {book_name} (id={book_id})")
         return book_id
     except Exception as e:
-        logger.error(f"Failed to index in ES: {e}")
+        logger.error("Failed to index in ES for book_id=%s: %s", book_id, e)
         return None
 
 
@@ -2792,7 +2957,7 @@ def search_es(query, size: int = MAX_SEARCH_RESULTS):
         logger.debug(f"ES search '{query}' -> {len(hits)} hits")
         return hits
     except Exception as e:
-        logger.error(f"ES search failed: {e}")
+        logger.warning("ES search failed for query=%r: %s", query, e)
         return []
 
 
@@ -4087,14 +4252,23 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     context.user_data["awaiting_book_search"] = False
     context.user_data.pop("search_mode", None)
     if action == "tts":
+        if not ENABLE_TTS:
+            await update.message.reply_text(m.get("feature_temporarily_disabled", "Bu funksiya vaqtincha o‘chirilgan."))
+            return True
         context.user_data["main_menu_section"] = "main"
         await _tts_start_session_from_message(update.message, update, context, lang)
         return True
     if action == "pdf":
+        if not ENABLE_PDF_TOOLS:
+            await update.message.reply_text(m.get("feature_temporarily_disabled", "Bu funksiya vaqtincha o‘chirilgan."))
+            return True
         context.user_data["main_menu_section"] = "other"
         await _pdf_maker_start_session_from_message(update.message, update, context, lang)
         return True
     if action == "pdf_editor":
+        if not ENABLE_PDF_TOOLS:
+            await update.message.reply_text(m.get("feature_temporarily_disabled", "Bu funksiya vaqtincha o‘chirilgan."))
+            return True
         context.user_data["main_menu_section"] = "other"
         await _pdfed_start_session_from_message(update.message, update, context, lang)
         return True
@@ -4141,10 +4315,16 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         await upload_command(update, context)
         return True
     if action == "audio_converter":
+        if not ENABLE_AUDIO_TOOLS:
+            await update.message.reply_text(m.get("feature_temporarily_disabled", "Bu funksiya vaqtincha o‘chirilgan."))
+            return True
         context.user_data["main_menu_section"] = "other"
         await _audio_conv_start_session_from_message(update.message, update, context, lang)
         return True
     if action == "sticker_tools":
+        if not ENABLE_STICKER_TOOLS:
+            await update.message.reply_text(m.get("feature_temporarily_disabled", "Bu funksiya vaqtincha o‘chirilgan."))
+            return True
         context.user_data["main_menu_section"] = "other"
         await _sticker_start_session_from_message(update.message, update, context, lang)
         return True
@@ -4718,6 +4898,7 @@ handle_audiobook_part_delete_callback = _search_flow.handle_audiobook_part_delet
 handle_audiobook_delete_callback = _search_flow.handle_audiobook_delete_callback
 handle_audiobook_delete_by_book_callback = _search_flow.handle_audiobook_delete_by_book_callback
 handle_audiobook_listen_callback = _search_flow.handle_audiobook_listen_callback
+handle_audiobook_play_all_callback = _search_flow.handle_audiobook_play_all_callback
 handle_audiobook_page_callback = _search_flow.handle_audiobook_page_callback
 handle_audiobook_part_play_callback = _search_flow.handle_audiobook_part_play_callback
 handle_audiobook_add_callback = _search_flow.handle_audiobook_add_callback
@@ -5449,7 +5630,7 @@ _pdf_maker_theme_for_selected_style = _pdf_maker_mod._pdf_maker_theme_for_select
 _reply_pdf_document = _pdf_maker_mod._reply_pdf_document
 _pdf_maker_send_text_as_pdf = _pdf_maker_mod._pdf_maker_send_text_as_pdf
 _pdf_maker_handle_text_input = _pdf_maker_mod._pdf_maker_handle_text_input
-pdf_maker_command = _pdf_maker_mod.pdf_maker_command
+_raw_pdf_maker_command = _pdf_maker_mod.pdf_maker_command
 _pdf_maker_start_session_from_message = _pdf_maker_mod._pdf_maker_start_session_from_message
 handle_pdf_maker_callback = _pdf_maker_mod.handle_pdf_maker_callback
 
@@ -5461,7 +5642,7 @@ _pdfed_get_session = _pdf_editor._pdf_editor_get_session
 _pdfed_start_session_from_message = _pdf_editor._pdf_editor_start_session_from_message
 _pdfed_handle_text_input = _pdf_editor._pdf_editor_handle_text_input
 _pdfed_handle_media_input = _pdf_editor._pdf_editor_handle_media_input
-pdf_editor_command = _pdf_editor.pdf_editor_command
+_raw_pdf_editor_command = _pdf_editor.pdf_editor_command
 handle_pdf_editor_callback = _pdf_editor.handle_pdf_editor_callback
 
 
@@ -5504,7 +5685,7 @@ _tts_send_result = _tts_tools._tts_send_result
 _tts_generate_and_send = _tts_tools._tts_generate_and_send
 _tts_handle_text_input = _tts_tools._tts_handle_text_input
 _tts_handle_media_input = _tts_tools._tts_handle_media_input
-text_to_voice_command = _tts_tools.text_to_voice_command
+_raw_text_to_voice_command = _tts_tools.text_to_voice_command
 _tts_start_session_from_message = _tts_tools._tts_start_session_from_message
 handle_tts_callback = _tts_tools.handle_tts_callback
 
@@ -5527,7 +5708,39 @@ _sticker_start_session_from_message = _sticker_tools._sticker_start_session_from
 _sticker_handle_text_input = _sticker_tools._sticker_handle_text_input
 _sticker_handle_media_input = _sticker_tools._sticker_handle_media_input
 handle_sticker_tools_callback = _sticker_tools.handle_sticker_tools_callback
-sticker_tools_command = _sticker_tools.sticker_tools_command
+_raw_sticker_tools_command = _sticker_tools.sticker_tools_command
+
+
+async def pdf_maker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ENABLE_PDF_TOOLS:
+        lang = ensure_user_language(update, context)
+        await safe_reply(update, MESSAGES[lang]["feature_temporarily_disabled"])
+        return
+    await _raw_pdf_maker_command(update, context)
+
+
+async def pdf_editor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ENABLE_PDF_TOOLS:
+        lang = ensure_user_language(update, context)
+        await safe_reply(update, MESSAGES[lang]["feature_temporarily_disabled"])
+        return
+    await _raw_pdf_editor_command(update, context)
+
+
+async def text_to_voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ENABLE_TTS:
+        lang = ensure_user_language(update, context)
+        await safe_reply(update, MESSAGES[lang]["feature_temporarily_disabled"])
+        return
+    await _raw_text_to_voice_command(update, context)
+
+
+async def sticker_tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ENABLE_STICKER_TOOLS:
+        lang = ensure_user_language(update, context)
+        await safe_reply(update, MESSAGES[lang]["feature_temporarily_disabled"])
+        return
+    await _raw_sticker_tools_command(update, context)
 
 # Refresh search_flow dependencies after late-bound feature bridges.
 _search_flow.configure(_build_search_flow_deps())
@@ -5570,73 +5783,217 @@ user_search_command = _admin_runtime.user_search_command
 _search_flow.configure(_build_search_flow_deps())
 
 
-async def _process_background_jobs(app: Application) -> None:
+_BACKGROUND_JOB_WORKERS_KEY = "background_job_workers"
+_BACKGROUND_JOB_WORKER_TARGET_KEY = "background_job_worker_target"
+_BACKGROUND_JOB_TYPE_INFLIGHT_KEY = "background_job_type_inflight"
+_BACKGROUND_JOB_TYPE_LIMITS_KEY = "background_job_type_limits"
+_BACKGROUND_JOB_RUNTIME_LOCK_KEY = "background_job_runtime_lock"
+
+
+def _get_background_job_runtime_state(app: Application) -> tuple[asyncio.Lock, dict[str, int], dict[str, int]]:
+    data = app.bot_data
+    lock = data.get(_BACKGROUND_JOB_RUNTIME_LOCK_KEY)
+    if lock is None:
+        lock = asyncio.Lock()
+        data[_BACKGROUND_JOB_RUNTIME_LOCK_KEY] = lock
+    inflight = data.get(_BACKGROUND_JOB_TYPE_INFLIGHT_KEY)
+    if not isinstance(inflight, dict):
+        inflight = {}
+        data[_BACKGROUND_JOB_TYPE_INFLIGHT_KEY] = inflight
+    limits = data.get(_BACKGROUND_JOB_TYPE_LIMITS_KEY)
+    if not isinstance(limits, dict):
+        limits = dict(BACKGROUND_JOB_TYPE_LIMITS)
+        data[_BACKGROUND_JOB_TYPE_LIMITS_KEY] = limits
+    return lock, inflight, limits
+
+
+async def _claim_background_job_for_worker(app: Application, worker_id: str) -> dict | None:
+    lock, inflight, limits = _get_background_job_runtime_state(app)
+    async with lock:
+        excluded_types = [
+            job_type
+            for job_type, limit in limits.items()
+            if int(limit or 0) > 0 and int(inflight.get(job_type, 0) or 0) >= int(limit or 0)
+        ]
+        job = await run_blocking(
+            db_claim_background_job,
+            worker_id,
+            BACKGROUND_JOB_STALE_AFTER_SECONDS,
+            None,
+            excluded_types,
+        )
+        if job:
+            job_type = str(job.get("job_type") or "").strip() or "unknown"
+            inflight[job_type] = int(inflight.get(job_type, 0) or 0) + 1
+        return job
+
+
+async def _finish_background_job_for_worker(app: Application, job_type: str) -> None:
+    lock, inflight, _limits = _get_background_job_runtime_state(app)
+    async with lock:
+        key = str(job_type or "").strip() or "unknown"
+        current = int(inflight.get(key, 0) or 0) - 1
+        if current > 0:
+            inflight[key] = current
+        else:
+            inflight.pop(key, None)
+
+
+def start_background_job_workers(app: Application) -> None:
+    data = app.bot_data
+    data[_BACKGROUND_JOB_WORKER_TARGET_KEY] = BACKGROUND_JOB_WORKER_COUNT
+    data[_BACKGROUND_JOB_TYPE_LIMITS_KEY] = dict(BACKGROUND_JOB_TYPE_LIMITS)
+    workers = data.get(_BACKGROUND_JOB_WORKERS_KEY)
+    live_workers = []
+    if isinstance(workers, list):
+        live_workers = [task for task in workers if task is not None and not task.done()]
+        data[_BACKGROUND_JOB_WORKERS_KEY] = live_workers
+    elif workers and not getattr(workers, "done", lambda: True)():
+        live_workers = [workers]
+        data[_BACKGROUND_JOB_WORKERS_KEY] = live_workers
+    missing_workers = max(0, BACKGROUND_JOB_WORKER_COUNT - len(live_workers))
+    if missing_workers <= 0:
+        return
+    start_index = len(live_workers)
+    created_workers = live_workers + [
+        app.create_task(_process_background_jobs(app, worker_index=start_index + index + 1))
+        for index in range(missing_workers)
+    ]
+    data[_BACKGROUND_JOB_WORKERS_KEY] = created_workers
+    logger.info(
+        "Started %s background job worker(s) with type limits=%s",
+        missing_workers,
+        BACKGROUND_JOB_TYPE_LIMITS,
+    )
+
+
+async def _process_background_jobs(app: Application, worker_index: int = 1) -> None:
     """Background task to process queued jobs."""
-    worker_id = f"worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-    logger.info(f"Starting background job processor: {worker_id}")
-    while True:
-        try:
-            job = db_claim_background_job(worker_id)
-            if not job:
-                await asyncio.sleep(10)  # No jobs, wait
-                continue
-
-            job_id = job["id"]
-            job_type = job["job_type"]
-            user_id = job["user_id"]
-            data = json.loads(job.get("data_json", "{}"))
-
-            logger.info(f"Processing job {job_id}: {job_type} for user {user_id}")
-
-            success = False
-            result_data = None
-            error_msg = None
-
+    worker_id = f"bg-worker:{os.getpid()}:{worker_index}:{uuid.uuid4().hex[:6]}"
+    logger.info("Starting background job processor: %s", worker_id)
+    try:
+        while True:
+            job = None
+            job_type = ""
+            job_id = ""
+            started_mono = 0.0
             try:
-                if job_type == "pdf_maker":
-                    result_data = await _process_pdf_maker_job(data)
-                elif job_type == "pdf_editor":
-                    result_data = await _process_pdf_editor_job(data)
-                elif job_type == "tts_generate":
-                    result_data = await _process_tts_job(data)
-                elif job_type == "audio_convert":
-                    result_data = await _process_audio_convert_job(data, app)
-                elif job_type == "sticker_convert":
-                    result_data = await _process_sticker_convert_job(data, app)
-                elif job_type == "book_summary":
-                    result_data = await _process_book_summary_job(data, app)
-                else:
-                    error_msg = f"Unknown job type: {job_type}"
-                    logger.error(error_msg)
+                job = await _claim_background_job_for_worker(app, worker_id)
+                if not job:
+                    await asyncio.sleep(BACKGROUND_JOB_IDLE_SECONDS)
+                    continue
 
-                if result_data:
-                    success = True
-                    # Send result to user
-                    await _send_job_result(app, user_id, job_type, result_data)
-                else:
-                    error_msg = error_msg or "Job processing failed"
+                job_id = str(job.get("id") or "").strip()
+                job_type = str(job.get("job_type") or "").strip()
+                user_id = int(job.get("user_id") or 0)
+                chat_id = int(job.get("chat_id") or user_id or 0)
+                payload_raw = job.get("payload_json")
+                if payload_raw is None:
+                    payload_raw = job.get("data_json", "{}")
+                data = db_deserialize_background_job_payload(payload_raw)
+                if not isinstance(data, dict):
+                    data = {}
 
+                started_mono = time.monotonic()
+                logger.info(
+                    "job claimed: job_id=%s job_type=%s user_id=%s chat_id=%s worker=%s attempts=%s/%s",
+                    job_id,
+                    job_type,
+                    user_id,
+                    chat_id,
+                    worker_id,
+                    int(job.get("attempts", 0) or 0),
+                    int(job.get("max_attempts", 0) or 0),
+                )
+                _job_workspace_dir(job_id)
+                await run_blocking(db_update_background_job_progress, job_id, 5, {"stage": "started"})
+
+                success = False
+                result_data = None
+                error_msg = None
+
+                try:
+                    with _job_temp_environment(job_id):
+                        result_data = await _process_background_job_payload(job_type, data, app)
+
+                    if result_data:
+                        success = True
+                        await run_blocking(db_update_background_job_progress, job_id, 90, {"stage": "sending_result"})
+                        await _send_job_result(app, job, data, job_type, result_data)
+                    else:
+                        error_msg = error_msg or "Job processing failed"
+
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(
+                        "job failed during processing: job_id=%s job_type=%s user_id=%s chat_id=%s error=%s",
+                        job_id,
+                        job_type,
+                        user_id,
+                        chat_id,
+                        error_msg,
+                        exc_info=True,
+                    )
+
+                if success:
+                    await run_blocking(db_complete_background_job, job_id, result_data if isinstance(result_data, dict) else None)
+                    _clear_job_failed_workspace(job_id)
+                    logger.info(
+                        "job done: job_id=%s job_type=%s user_id=%s chat_id=%s duration=%.2fs",
+                        job_id,
+                        job_type,
+                        user_id,
+                        chat_id,
+                        max(0.0, time.monotonic() - started_mono),
+                    )
+                else:
+                    attempts = int(job.get("attempts", 0) or 0)
+                    max_attempts = int(job.get("max_attempts", 3) or 3)
+                    if attempts >= max_attempts:
+                        await run_blocking(db_fail_background_job, job_id, error_msg or "Max attempts reached")
+                        _mark_job_failed_workspace(job_id)
+                        logger.error(
+                            "job failed permanently: job_id=%s job_type=%s user_id=%s chat_id=%s attempts=%s duration=%.2fs error=%s",
+                            job_id,
+                            job_type,
+                            user_id,
+                            chat_id,
+                            attempts,
+                            max(0.0, time.monotonic() - started_mono),
+                            error_msg,
+                        )
+                        await _send_job_failure(app, job, data, job_type, error_msg or "Processing failed")
+                    else:
+                        await run_blocking(db_retry_background_job, job_id, error_msg or "Processing failed")
+                        _mark_job_failed_workspace(job_id)
+                        logger.warning(
+                            "job retry scheduled: job_id=%s job_type=%s user_id=%s chat_id=%s attempts=%s/%s error=%s",
+                            job_id,
+                            job_type,
+                            user_id,
+                            chat_id,
+                            attempts,
+                            max_attempts,
+                            error_msg,
+                        )
+
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Job {job_id} failed: {error_msg}", exc_info=True)
-
-            if success:
-                db_complete_background_job(job_id)
-                logger.info(f"Job {job_id} completed successfully")
+                logger.error("Background job processor error (%s): %s", worker_id, e, exc_info=True)
+                await asyncio.sleep(15.0)
+            finally:
+                if job_type:
+                    await _finish_background_job_for_worker(app, job_type)
+    finally:
+        current_task = _safe_asyncio_current_task()
+        workers = app.bot_data.get(_BACKGROUND_JOB_WORKERS_KEY)
+        if current_task is not None and isinstance(workers, list):
+            remaining = [task for task in workers if task is not current_task and not task.done()]
+            if remaining:
+                app.bot_data[_BACKGROUND_JOB_WORKERS_KEY] = remaining
             else:
-                attempts = job.get("attempts", 0)
-                if attempts >= job.get("max_attempts", 3):
-                    db_fail_background_job(job_id, error_msg or "Max attempts reached")
-                    logger.error(f"Job {job_id} failed permanently after {attempts} attempts")
-                    # Notify user of failure
-                    await _send_job_failure(app, user_id, job_type, error_msg or "Processing failed")
-                else:
-                    db_retry_background_job(job_id, error_msg or "Processing failed")
-                    logger.warning(f"Job {job_id} retrying (attempt {attempts})")
-
-        except Exception as e:
-            logger.error(f"Background job processor error: {e}", exc_info=True)
-            await asyncio.sleep(30)  # Back off on errors
+                app.bot_data.pop(_BACKGROUND_JOB_WORKERS_KEY, None)
 
 
 async def _process_pdf_maker_job(data: dict) -> dict | None:
@@ -6002,57 +6359,209 @@ async def _process_book_summary_job(data: dict, app: Application) -> dict | None
         return {"text": m["summary_error"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
 
 
-async def _send_job_result(app: Application, user_id: int, job_type: str, result: dict) -> None:
-    """Send job result to user."""
+async def _process_video_download_job(data: dict, app: Application) -> dict | None:
+    url = str(data.get("url") or "").strip()
+    quality = str(data.get("quality") or "").strip()
+    title = str(data.get("title") or "Video").strip() or "Video"
+    lang = str(data.get("lang") or "uz")
+    chat_id = int(data.get("chat_id") or data.get("user_id") or 0)
+    reply_to_message_id = int(data.get("reply_to_message_id") or 0) or None
+    platform = str(data.get("platform") or "generic")
+    if not url or not quality or not chat_id:
+        return None
+
+    import video_downloader as _video_downloader_mod
+
     try:
+        result = await _video_downloader_mod._video_dl_download_with_progress(
+            url,
+            quality,
+            lang=lang,
+            status_msg=None,
+        )
+        file_path = str((result or {}).get("file_path") or "").strip()
+        if not file_path or not os.path.exists(file_path):
+            raise RuntimeError("download-output-missing")
+        try:
+            await run_blocking(db_increment_counter, "video_downloads", 1)
+            await run_blocking(db_increment_counter, "video_dl_jobs_total", 1)
+            await run_blocking(db_increment_counter, "video_dl_success_total", 1)
+            await run_blocking(db_increment_counter, f"video_dl_success_platform_{platform}", 1)
+        except Exception:
+            logger.exception("video downloader worker counters update failed")
+        caption_key = "caption_audio" if result.get("kind") == "audio" else "caption_video"
+        t = _video_downloader_mod._video_dl_texts(lang)
+        return {
+            "chat_id": chat_id,
+            "reply_to_message_id": reply_to_message_id,
+            "file_path": file_path,
+            "filename": str((result or {}).get("filename") or os.path.basename(file_path)),
+            "caption": f"{t[caption_key]}\n📌 {title[:180]}",
+            "title": title[:64],
+            "kind": str(result.get("kind") or "document"),
+            "cleanup_dir": str((result or {}).get("temp_dir") or ""),
+        }
+    except Exception as e:
+        try:
+            await run_blocking(db_increment_counter, "video_dl_jobs_total", 1)
+            await run_blocking(db_increment_counter, "video_dl_fail_total", 1)
+            await run_blocking(db_increment_counter, f"video_dl_fail_platform_{platform}", 1)
+        except Exception:
+            logger.exception("video downloader worker fail counters update failed")
+        raise RuntimeError(str(e)) from e
+
+
+async def _process_search_index_book_job(data: dict) -> dict | None:
+    doc = dict(data.get("doc") or {})
+    book_id = str(data.get("book_id") or doc.get("id") or "").strip()
+    receipt_id = str(data.get("receipt_id") or "").strip() or None
+    if not book_id:
+        return {"text": "index skipped: missing book id"}
+
+    ok = False
+    err = None
+    try:
+        indexed_id = await run_blocking(
+            index_book,
+            doc.get("book_name"),
+            doc.get("file_id"),
+            doc.get("path"),
+            book_id,
+            doc.get("display_name") or doc.get("book_name"),
+            doc.get("file_unique_id"),
+        )
+        ok = bool(indexed_id)
+        if ok:
+            await run_blocking(update_book_indexed, book_id, True)
+        else:
+            err = "indexing failed"
+    except Exception as e:
+        err = str(e)
+        logger.warning("Background ES index failed for book_id=%s: %s", book_id, e, exc_info=True)
+
+    if receipt_id:
+        try:
+            await run_blocking(
+                db_update_upload_receipt,
+                receipt_id,
+                status="indexed" if ok else "index_failed",
+                book_id=book_id,
+                saved_to_db=True,
+                saved_to_es=ok,
+                error=err,
+            )
+        except Exception:
+            logger.exception("Failed to update upload receipt after background ES index: %s", receipt_id)
+
+    if ok:
+        return {"text": "indexed", "suppress_send": True}
+    raise RuntimeError(err or "indexing failed")
+
+
+async def _process_search_reindex_all_job(data: dict) -> dict | None:
+    await run_blocking(sync_unindexed_books)
+    return {"text": "reindex complete", "suppress_send": True}
+
+
+async def _send_job_result(app: Application, job: dict, payload: dict, job_type: str, result: dict) -> None:
+    """Send job result to user."""
+    user_id = int(job.get("user_id") or 0)
+    try:
+        if result.get("suppress_send"):
+            return
         multiple = result.get("multiple")
         if multiple:
             for item in multiple:
-                await _send_single_result(app, user_id, item)
+                await _send_single_result(app, job, payload, item)
         else:
-            await _send_single_result(app, user_id, result)
+            await _send_single_result(app, job, payload, result)
     except Exception as e:
         logger.error(f"Failed to send job result to user {user_id}: {e}")
 
 
-async def _send_single_result(app: Application, user_id: int, result: dict) -> None:
+async def _send_single_result(app: Application, job: dict, payload: dict, result: dict) -> None:
     """Send a single result item."""
+    user_id = int(job.get("user_id") or 0)
     sticker_bytes = result.get("sticker_bytes")
     sticker_ext = result.get("sticker_ext")
     file_bytes = result.get("file_bytes")
+    file_path = str(result.get("file_path") or "").strip()
     file_content = result.get("file_content")
     filename = result.get("filename")
     caption = result.get("caption", "Result")
     text = result.get("text")
-    chat_id = result.get("chat_id", user_id)
-    reply_to_message_id = result.get("reply_to_message_id")
+    chat_id = result.get("chat_id") or payload.get("chat_id") or job.get("chat_id") or user_id
+    reply_to_message_id = result.get("reply_to_message_id") or payload.get("message_id") or job.get("message_id")
     output_key = result.get("output_key")
+    media_kind = str(result.get("kind") or "").strip().lower()
+    cleanup_dir = str(result.get("cleanup_dir") or "").strip()
 
-    if sticker_bytes and sticker_ext:
-        bio = io.BytesIO(sticker_bytes)
-        bio.name = f"sticker{sticker_ext}"
-        await app.bot.send_sticker(chat_id=chat_id, sticker=bio, reply_to_message_id=reply_to_message_id)
-    elif file_bytes and filename:
-        bio = io.BytesIO(file_bytes)
-        bio.name = filename
-        if output_key == "voice":
-            await app.bot.send_voice(chat_id=chat_id, voice=bio, caption=caption, reply_to_message_id=reply_to_message_id)
-        else:
-            await app.bot.send_document(chat_id=chat_id, document=bio, caption=caption, reply_to_message_id=reply_to_message_id)
-    elif file_content and filename:
-        bio = io.BytesIO(file_content.encode('utf-8'))
-        bio.name = filename
-        await app.bot.send_document(chat_id=chat_id, document=bio, caption=caption, reply_to_message_id=reply_to_message_id)
-    elif text:
-        await app.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
-    else:
-        await app.bot.send_message(chat_id=chat_id, text=f"✅ {caption}", reply_to_message_id=reply_to_message_id)
-
-
-async def _send_job_failure(app: Application, user_id: int, job_type: str, error: str) -> None:
-    """Send job failure notification to user."""
     try:
-        await app.bot.send_message(chat_id=user_id, text=f"❌ {job_type.replace('_', ' ').title()} failed: {error}")
+        if sticker_bytes and sticker_ext:
+            bio = io.BytesIO(sticker_bytes)
+            bio.name = f"sticker{sticker_ext}"
+            await app.bot.send_sticker(chat_id=chat_id, sticker=bio, reply_to_message_id=reply_to_message_id)
+        elif file_path and os.path.exists(file_path):
+            if media_kind == "audio":
+                with open(file_path, "rb") as audio_f:
+                    await app.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=audio_f,
+                        caption=caption,
+                        title=str(result.get("title") or Path(file_path).stem)[:64],
+                        filename=filename or os.path.basename(file_path),
+                        reply_to_message_id=reply_to_message_id,
+                    )
+            elif media_kind == "video":
+                with open(file_path, "rb") as video_f:
+                    await app.bot.send_video(
+                        chat_id=chat_id,
+                        video=video_f,
+                        caption=caption,
+                        supports_streaming=True,
+                        filename=filename or os.path.basename(file_path),
+                        reply_to_message_id=reply_to_message_id,
+                    )
+            else:
+                with open(file_path, "rb") as file_f:
+                    await app.bot.send_document(
+                        chat_id=chat_id,
+                        document=file_f,
+                        caption=caption,
+                        filename=filename or os.path.basename(file_path),
+                        reply_to_message_id=reply_to_message_id,
+                    )
+        elif file_bytes and filename:
+            bio = io.BytesIO(file_bytes)
+            bio.name = filename
+            if output_key == "voice":
+                await app.bot.send_voice(chat_id=chat_id, voice=bio, caption=caption, reply_to_message_id=reply_to_message_id)
+            else:
+                await app.bot.send_document(chat_id=chat_id, document=bio, caption=caption, reply_to_message_id=reply_to_message_id)
+        elif file_content and filename:
+            bio = io.BytesIO(file_content.encode('utf-8'))
+            bio.name = filename
+            await app.bot.send_document(chat_id=chat_id, document=bio, caption=caption, reply_to_message_id=reply_to_message_id)
+        elif text:
+            await app.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
+        else:
+            await app.bot.send_message(chat_id=chat_id, text=f"✅ {caption}", reply_to_message_id=reply_to_message_id)
+    finally:
+        if cleanup_dir:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+
+async def _send_job_failure(app: Application, job: dict, payload: dict, job_type: str, error: str) -> None:
+    """Send job failure notification to user."""
+    user_id = int(job.get("user_id") or 0)
+    chat_id = int(job.get("chat_id") or payload.get("chat_id") or user_id or 0)
+    lang = str(payload.get("lang") or payload.get("lang_ui") or "uz")
+    fail_text = MESSAGES.get(lang, MESSAGES["en"]).get(
+        "background_job_failed",
+        "❌ Vazifani bajarib bo‘lmadi. Keyinroq qayta urinib ko‘ring.",
+    )
+    try:
+        await app.bot.send_message(chat_id=chat_id or user_id, text=fail_text)
     except Exception as e:
         logger.error(f"Failed to send job failure to user {user_id}: {e}")
 
@@ -6144,7 +6653,9 @@ def main():
             .connect_timeout(20)
             .read_timeout(60)
             .write_timeout(1200)
-            .pool_timeout(60)
+            .pool_timeout(BOT_POOL_TIMEOUT)
+            .connection_pool_size(BOT_CONNECTION_POOL_SIZE)
+            .concurrent_updates(BOT_CONCURRENT_UPDATES)
         )
 
         bot_api_base_url = _normalize_bot_api_base_url(os.getenv("TELEGRAM_BOT_API_BASE_URL", ""))

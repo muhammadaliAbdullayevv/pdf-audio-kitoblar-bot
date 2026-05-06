@@ -38,6 +38,7 @@ _CONFIG_REQUIRED_KEYS = (
     "db_update_upload_receipt",
     "db_insert_book",
     "db_update_book_upload_meta",
+    "db_enqueue_background_job",
     "db_enqueue_book_local_download_job",
     "db_claim_book_local_download_job",
     "db_complete_book_local_download_job",
@@ -75,6 +76,16 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _normalize_upload_title_apostrophes(text: str) -> str:
+    value = str(text or "")
+    if not value:
+        return ""
+    value = re.sub(r"[ʼ’'`´‘]", "ʻ", value)
+    value = re.sub(r"\b([oOgG])ʻ\s+([^\W\d_])", r"\1ʻ\2", value, flags=re.UNICODE)
+    value = re.sub(r"\b([oOgG])\s+([^\W\d_])", r"\1ʻ\2", value, flags=re.UNICODE)
+    return value
+
+
 _UPLOAD_MODE_KEY = "upload_mode_state"
 _UPLOAD_MODE_BOOK = "book"
 _UPLOAD_LOCAL_DIR = Path(os.getenv("UPLOAD_LOCAL_DIR", str(Path(__file__).resolve().parent / "downloads" / "localbooks")))
@@ -90,6 +101,7 @@ _UPLOAD_LOCAL_GET_FILE_READ_TIMEOUT_SEC = max(60.0, _env_float("UPLOAD_LOCAL_GET
 _UPLOAD_LOCAL_DOWNLOAD_READ_TIMEOUT_SEC = max(120.0, _env_float("UPLOAD_LOCAL_DOWNLOAD_READ_TIMEOUT_SEC", 600.0))
 _UPLOAD_LOCAL_CONNECT_TIMEOUT_SEC = max(10.0, _env_float("UPLOAD_LOCAL_CONNECT_TIMEOUT_SEC", 45.0))
 _UPLOAD_LOCAL_POOL_TIMEOUT_SEC = max(10.0, _env_float("UPLOAD_LOCAL_POOL_TIMEOUT_SEC", 45.0))
+_UPLOAD_LOCAL_SEND_MIN_INTERVAL_SEC = max(0.0, _env_float("UPLOAD_LOCAL_SEND_MIN_INTERVAL_SEC", 0.75))
 _UPLOAD_LOCAL_REFRESH_FILE_ID = _env_bool("UPLOAD_LOCAL_REFRESH_FILE_ID", True)
 _UPLOAD_LOCAL_WATERMARK_PDF = _env_bool("UPLOAD_LOCAL_WATERMARK_PDF", True)
 _UPLOAD_LOCAL_WATERMARK_TEXT = (
@@ -97,6 +109,8 @@ _UPLOAD_LOCAL_WATERMARK_TEXT = (
     or "Pdf va audio kitoblar"
 )
 _UPLOAD_LOCAL_WORKER_KEY = "upload_local_backup_workers"
+_BOOK_STORAGE_SEND_GUARD_LOCKS: dict[int, asyncio.Lock] = {}
+_BOOK_STORAGE_SEND_GUARD_STATE: dict[int, dict[str, float]] = {}
 
 
 def configure(deps: dict[str, Any]) -> None:
@@ -206,6 +220,14 @@ def _book_upload_file_extension(file_name: str) -> str:
     return ext.lower().strip()
 
 
+def _upload_saved_display_filename(display_title: str | None, file_name: str | None, default_stem: str = "book") -> str:
+    ext = _book_upload_file_extension(str(file_name or "").strip())
+    if not ext:
+        ext = ".pdf"
+    title = str(display_title or "").strip() or default_stem
+    return f"{title}{ext}"
+
+
 def _book_upload_is_allowed_file(file_name: str) -> bool:
     return _book_upload_file_extension(file_name) in _BOOK_UPLOAD_ALLOWED_EXTENSIONS
 
@@ -278,6 +300,19 @@ def _safe_asyncio_current_task():
         return asyncio.current_task()
     except RuntimeError:
         return None
+
+
+def _get_book_storage_send_guard(channel_id: int):
+    lock = _BOOK_STORAGE_SEND_GUARD_LOCKS.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _BOOK_STORAGE_SEND_GUARD_LOCKS[channel_id] = lock
+    state = _BOOK_STORAGE_SEND_GUARD_STATE.get(channel_id)
+    if not isinstance(state, dict):
+        state = {"next_allowed_at": 0.0}
+        _BOOK_STORAGE_SEND_GUARD_STATE[channel_id] = state
+    state.setdefault("next_allowed_at", 0.0)
+    return lock, state
 
 
 async def _send_status_with_retry(status_msg, text: str, reply_only: bool = False) -> None:
@@ -558,6 +593,17 @@ async def _save_uploaded_book_local(bot, book: dict[str, Any], file_id: str, fil
             result["error"] = "missing file_id or book_id"
             return result
 
+        db_get_book_by_id_fn = globals().get("db_get_book_by_id")
+        if callable(db_get_book_by_id_fn):
+            try:
+                saved_book = await run_blocking(db_get_book_by_id_fn, book_id)
+                if saved_book:
+                    merged_book = dict(saved_book)
+                    merged_book.update(book or {})
+                    book = merged_book
+            except Exception as e:
+                logger.debug("Failed to load saved book row for local backup %s: %s", book_id, e)
+
         _UPLOAD_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
         target_path = _upload_local_target_path(book, file_name)
         if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
@@ -710,30 +756,41 @@ async def _refresh_uploaded_book_file_id(
         return result
 
     try:
-        if telegram_filename:
-            async def _send_named_document():
-                with open(local_path, "rb") as fh:
-                    return await bot.send_document(
+        lock, state = _get_book_storage_send_guard(int(storage_channel_id))
+        async with lock:
+            if _UPLOAD_LOCAL_SEND_MIN_INTERVAL_SEC > 0:
+                now = asyncio.get_running_loop().time()
+                wait_s = max(0.0, float(state.get("next_allowed_at", 0.0) or 0.0) - now)
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+
+            if telegram_filename:
+                async def _send_named_document():
+                    with open(local_path, "rb") as fh:
+                        return await bot.send_document(
+                            chat_id=storage_channel_id,
+                            document=InputFile(fh, filename=str(telegram_filename)),
+                            thumbnail=get_book_thumbnail_input() if use_thumbnail else None,
+                            disable_notification=True,
+                        )
+
+                sent = await _upload_local_retry(
+                    _send_named_document,
+                    desc=f"refresh file_id {book_id}",
+                )
+            else:
+                sent = await _upload_local_retry(
+                    lambda: bot.send_document(
                         chat_id=storage_channel_id,
-                        document=InputFile(fh, filename=str(telegram_filename)),
+                        document=str(local_path),
                         thumbnail=get_book_thumbnail_input() if use_thumbnail else None,
                         disable_notification=True,
-                    )
+                    ),
+                    desc=f"refresh file_id {book_id}",
+                )
 
-            sent = await _upload_local_retry(
-                _send_named_document,
-                desc=f"refresh file_id {book_id}",
-            )
-        else:
-            sent = await _upload_local_retry(
-                lambda: bot.send_document(
-                    chat_id=storage_channel_id,
-                    document=str(local_path),
-                    thumbnail=get_book_thumbnail_input() if use_thumbnail else None,
-                    disable_notification=True,
-                ),
-                desc=f"refresh file_id {book_id}",
-            )
+            if _UPLOAD_LOCAL_SEND_MIN_INTERVAL_SEC > 0:
+                state["next_allowed_at"] = asyncio.get_running_loop().time() + _UPLOAD_LOCAL_SEND_MIN_INTERVAL_SEC
         document = getattr(sent, "document", None)
         file_id = str(getattr(document, "file_id", "") or "").strip()
         if not file_id:
@@ -804,20 +861,25 @@ def start_upload_local_backup_worker(app) -> None:
         _UPLOAD_LOCAL_WORKER_COUNT,
     )
     data = app.bot_data
+    data["upload_local_backup_worker_target"] = _UPLOAD_LOCAL_WORKER_COUNT
     workers = data.get(_UPLOAD_LOCAL_WORKER_KEY)
+    live_workers = []
     if isinstance(workers, list):
         live_workers = [task for task in workers if task is not None and not task.done()]
-        if live_workers:
-            data[_UPLOAD_LOCAL_WORKER_KEY] = live_workers
-            return
+        data[_UPLOAD_LOCAL_WORKER_KEY] = live_workers
     elif workers and not getattr(workers, "done", lambda: True)():
+        live_workers = [workers]
+        data[_UPLOAD_LOCAL_WORKER_KEY] = live_workers
+    missing_workers = max(0, _UPLOAD_LOCAL_WORKER_COUNT - len(live_workers))
+    if missing_workers <= 0:
         return
-    created_workers = [
-        app.create_task(_upload_local_backup_worker(app, worker_index=index + 1))
-        for index in range(_UPLOAD_LOCAL_WORKER_COUNT)
+    start_index = len(live_workers)
+    created_workers = live_workers + [
+        app.create_task(_upload_local_backup_worker(app, worker_index=start_index + index + 1))
+        for index in range(missing_workers)
     ]
     data[_UPLOAD_LOCAL_WORKER_KEY] = created_workers
-    logger.info("Started %s local backup worker(s)", len(created_workers))
+    logger.info("Started %s local backup worker(s)", missing_workers)
 
 
 async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
@@ -1076,6 +1138,7 @@ async def _process_upload(
         skip_request_notify = _env_bool("UPLOAD_SKIP_REQUEST_NOTIFY", False)
         no_status_edits = _env_bool("UPLOAD_NO_STATUS_EDITS", False)
         book_name, _ = os.path.splitext(file_name)
+        book_name = _normalize_upload_title_apostrophes(book_name)
         cleaned_name = clean_query(book_name)
         if _book_has_adult_markers(file_name, book_name, cleaned_name, caption_text):
             logger.info("Book upload skipped by adult filter: file_name=%s", file_name)
@@ -1220,6 +1283,11 @@ async def _process_upload(
                 logger.exception("Failed to update upload receipt after DB save")
         receipt_saved_to_db = True
         receipt_book_id = new_book["id"]
+        saved_display_file_name = _upload_saved_display_filename(
+            new_book.get("display_name") or new_book.get("book_name"),
+            file_name,
+            default_stem=normalized_title or "book",
+        )
         try:
             await _enqueue_upload_local_backup(context.application, new_book, file_id, file_name)
         except Exception as e:
@@ -1227,59 +1295,45 @@ async def _process_upload(
         # User-facing confirmation: send only once when DB save succeeds.
         await _send_status_with_retry(
             status_msg,
-            f"{MESSAGES[lang]['saved']} {file_name}",
+            f"{MESSAGES[lang]['saved']} {saved_display_file_name}",
             reply_only=no_status_edits,
         )
 
-        async def _index_uploaded_book():
-            nonlocal receipt_saved_to_es
-            try:
-                if receipt_id:
-                    try:
-                        await run_blocking(db_update_upload_receipt, receipt_id, status="indexing", error=None)
-                    except Exception:
-                        logger.exception("Failed to update upload receipt status=indexing")
-                run_blocking_heavy_fn = globals().get("run_blocking_heavy")
-                if callable(run_blocking_heavy_fn):
-                    await run_blocking_heavy_fn(
-                        index_book,
-                        new_book["book_name"],
-                        new_book["file_id"],
-                        new_book["path"],
-                        new_book["id"],
-                        new_book.get("display_name"),
-                        new_book.get("file_unique_id"),
-                        "false",
-                    )
-                else:
-                    await run_blocking(
-                        index_book,
-                        new_book["book_name"],
-                        new_book["file_id"],
-                        new_book["path"],
-                        new_book["id"],
-                        new_book.get("display_name"),
-                        new_book.get("file_unique_id"),
-                        "false",
-                    )
-                new_book["indexed"] = True
-                await run_blocking(update_book_indexed, new_book["id"], True)
-                receipt_saved_to_es = True
-                if receipt_id:
-                    try:
-                        await run_blocking(
-                            db_update_upload_receipt,
-                            receipt_id,
-                            status="indexed",
-                            book_id=new_book["id"],
-                            saved_to_db=True,
-                            saved_to_es=True,
-                            error=None,
-                        )
-                    except Exception:
-                        logger.exception("Failed to update upload receipt after ES index")
-            except Exception as e:
-                logger.error(f"Background index failed: {e}", exc_info=True)
+        # respond fast, index in background via DB-backed worker
+        logger.info(f"Preparing confirmation message for {file_name}")
+        if es_available():
+            if receipt_id:
+                try:
+                    await run_blocking(db_update_upload_receipt, receipt_id, status="indexing", error=None)
+                except Exception:
+                    logger.exception("Failed to update upload receipt status=indexing")
+            enqueue_meta = db_enqueue_background_job(
+                "SEARCH_INDEX_BOOK",
+                int(uploader_user_id or 0) or int(context.bot.id if getattr(context, "bot", None) else 0) or 1,
+                {
+                    "doc": {
+                        "id": new_book["id"],
+                        "book_name": new_book["book_name"],
+                        "display_name": new_book.get("display_name"),
+                        "file_id": new_book.get("file_id"),
+                        "file_unique_id": new_book.get("file_unique_id"),
+                        "path": new_book.get("path"),
+                        "indexed": True,
+                    },
+                    "book_id": new_book["id"],
+                    "receipt_id": receipt_id,
+                    "lang": lang,
+                },
+                chat_id=int(update.effective_chat.id) if update.effective_chat else None,
+                message_id=int(status_msg.message_id) if status_msg else None,
+                priority=30,
+                max_attempts=5,
+                idempotency_key=f"search-index-book:{new_book['id']}",
+                ignore_limits=True,
+                return_meta=True,
+            )
+            if not enqueue_meta or not enqueue_meta.get("ok"):
+                logger.warning("Failed to enqueue SEARCH_INDEX_BOOK for %s, leaving DB save intact", new_book["id"])
                 if receipt_id:
                     try:
                         await run_blocking(
@@ -1289,43 +1343,10 @@ async def _process_upload(
                             book_id=new_book["id"],
                             saved_to_db=True,
                             saved_to_es=False,
-                            error=str(e)[:1000],
+                            error="index queue unavailable",
                         )
                     except Exception:
-                        logger.exception("Failed to update upload receipt after index failure")
-
-        # respond fast, index in background
-        logger.info(f"Preparing confirmation message for {file_name}")
-        if es_available():
-            if receipt_id:
-                try:
-                    await run_blocking(db_update_upload_receipt, receipt_id, status="indexing", error=None)
-                except Exception:
-                    logger.exception("Failed to update upload receipt status=indexing")
-            enqueue_fn = globals().get("enqueue_bulk_index_job")
-            if callable(enqueue_fn):
-                await enqueue_fn(
-                    context.application,
-                    {
-                        "doc": {
-                            "id": new_book["id"],
-                            "book_name": new_book["book_name"],
-                            "display_name": new_book.get("display_name"),
-                            "file_id": new_book.get("file_id"),
-                            "file_unique_id": new_book.get("file_unique_id"),
-                            "path": new_book.get("path"),
-                            "indexed": True,
-                        },
-                        "book_id": new_book["id"],
-                        "receipt_id": receipt_id,
-                        "status_msg": status_msg,
-                        "lang": lang,
-                        "file_name": file_name,
-                        "no_status_edits": no_status_edits,
-                    },
-                )
-            else:
-                context.application.create_task(_index_uploaded_book())
+                        logger.exception("Failed to update upload receipt after index queue failure")
         else:
             if receipt_id:
                 try:

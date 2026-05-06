@@ -334,8 +334,6 @@ function renderCatalogGrowthChart(data) {
   });
 }
 
-// Call in setData():
-renderCatalogGrowthChart(dashboardData.catalog_growth);
 ```
 
 #### 3.4 Add Search/Filter for Tables
@@ -396,42 +394,6 @@ function setServiceChip(id, svcData) {
   `;
   node.title = status.description;
 }
-```
-
-#### 3.6 Add Data Freshness Indicator
-**Issue**: Users don't know how fresh the data is
-```javascript
-// In setRangeMeta() or new function:
-function setDataFreshness() {
-  const lastUpdated = dashboardData.generated_at;
-  const now = new Date();
-  const diffSeconds = Math.floor((now - new Date(lastUpdated)) / 1000);
-  
-  let freshness = "just now";
-  if (diffSeconds > 60) freshness = `${Math.floor(diffSeconds / 60)}m ago`;
-  if (diffSeconds > 3600) freshness = `${Math.floor(diffSeconds / 3600)}h ago`;
-  
-  const color = diffSeconds < 300 ? "ok" : diffSeconds < 3600 ? "warn" : "err";
-  document.getElementById("data-freshness").innerHTML = 
-    `<span class="status-chip status-chip--${color}">⏱️ Updated ${freshness}</span>`;
-}
-```
-
-#### 3.7 Add Critical Alerts Section
-**Issue**: Important issues buried in data
-```html
-<!-- Add at top of dashboard before KPI grid -->
-<section class="alerts-section" data-views="overview,catalog,reliability">
-  <div class="alert alert--warn" id="alert-unindexed-books" style="display:none;">
-    <strong>⚠️ Action Needed:</strong> <span id="alert-unindexed-count"></span> books are not indexed. 
-    <button onclick="handleShowUnindexed()">View & Fix →</button>
-  </div>
-  
-  <div class="alert alert--err" id="alert-pending-uploads" style="display:none;">
-    <strong>🛑 Pending:</strong> <span id="alert-pending-count"></span> upload requests waiting. 
-    <button onclick="handleShowUploads()">Review →</button>
-  </div>
-</section>
 ```
 
 ---
@@ -681,14 +643,6 @@ node.innerHTML = `
 <span aria-label="Add to favorites">⭐</span>
 <button aria-label="Search books">🔎 Search</button>
 
-<!-- For dashboard status -->
-<div id="svc-db" class="status-chip status-chip--ok">
-  <span class="dot"></span>
-  <span>PostgreSQL Healthy</span>
-  <span class="sr-only">
-    Database is operational with good response times
-  </span>
-</div>
 ```
 
 #### 5.3 Add CSS for Focus/Keyboard Navigation
@@ -874,13 +828,13 @@ MESSAGES["en"]["pdf_maker_help"] = (
 |-----------|-------|--------|----------|--------|
 | **Menu Structure** | Confusing "Other Functions" label | Users can't find tools | High | Low |
 | **Admin Menu** | 4+ levels deep | Admins frustrated with navigation | Medium | Medium |
-| **Dashboard Mobile** | Not responsive on phones | Mobile users locked out | High | Medium |
+| **Admin Mobile** | Admin controls are not responsive on phones | Mobile users locked out | High | Medium |
 | **Error Messages** | Generic "Error" text | Users don't know what failed | High | Low |
 | **Status Indicators** | "ES Degraded" unclear | Operators can't diagnose issues | Medium | Low |
 | **Search Guidance** | No help for search syntax | Users give up searching | High | Low |
 | **Accessibility** | No alt text, poor contrast | Screen reader users excluded | High | Medium |
 | **Progress Messages** | "Processing..." no context | Users think it's frozen | Medium | Low |
-| **Dashboard Charts** | Data exists but not visualized | Trends invisible | Medium | Medium |
+| **Operational Charts** | Data exists but not visualized | Trends invisible | Medium | Medium |
 | **Mobile Navigation** | Sidebar breaks on phones | Phone users can't navigate | High | Medium |
 | **Confirmation Messages** | Missing success feedback | Users unsure if action worked | Medium | Low |
 | **Request Status** | "Seen" vs "Done" unclear | Users confused about workflow | Medium | Low |
@@ -897,14 +851,14 @@ MESSAGES["en"]["pdf_maker_help"] = (
 5. ✅ Add success confirmation messages
 
 ### Phase 2 (Medium Effort, High Impact) - 4-6 hours
-1. ✅ Fix dashboard mobile responsiveness
+1. ✅ Improve admin mobile responsiveness
 2. ✅ Add breadcrumbs to menus
 3. ✅ Flatten admin menu hierarchy
 4. ✅ Fix color contrast issues
 5. ✅ Add search help text
 
 ### Phase 3 (Medium-High Effort, Medium Impact) - 6-10 hours
-1. ✅ Add interactive charts to dashboard
+1. ✅ Add interactive charts where useful
 2. ✅ Add table search/filter functionality
 3. ✅ Implement accessibility improvements
 4. ✅ Add smart onboarding for new users

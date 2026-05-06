@@ -204,9 +204,18 @@ def _pdf_editor_sanitize_name(name: str, fallback: str = "pdf") -> str:
 
 def _pdf_editor_max_bytes() -> int:
     try:
-        mb = max(1, int(os.getenv("PDF_EDITOR_MAX_MB", "80") or "80"))
+        mb = max(
+            1,
+            int(
+                os.getenv(
+                    "PDF_EDITOR_MAX_MB",
+                    os.getenv("MAX_PDF_SIZE_MB", "50"),
+                )
+                or os.getenv("MAX_PDF_SIZE_MB", "50")
+            ),
+        )
     except Exception:
-        mb = 80
+        mb = 50
     return mb * 1024 * 1024
 
 
@@ -769,12 +778,24 @@ async def _pdf_editor_op_compress(update: Update, context: ContextTypes.DEFAULT_
         "src_name": str(src.get("name") or "pdf"),
         "lang": lang,
     }
-    job_id = db_enqueue_background_job("pdf_editor", user_id, job_data)
-    if not job_id:
-        await _pdf_editor_target_message(update).reply_text(t["failed"])
+    target = _pdf_editor_target_message(update)
+    job_meta = db_enqueue_background_job(
+        "pdf_editor",
+        user_id,
+        job_data,
+        chat_id=target.chat_id if target else None,
+        message_id=target.message_id if target else None,
+        return_meta=True,
+    )
+    if not job_meta or not job_meta.get("ok"):
+        reason = str((job_meta or {}).get("reason") or "")
+        if reason in {"pending_limit", "running_limit"}:
+            await target.reply_text(MESSAGES[lang]["job_limit_wait"])
+        else:
+            await target.reply_text(t["failed"])
         return False
 
-    await _pdf_editor_target_message(update).reply_text("✅ PDF compression queued! You'll receive the result soon.")
+    await target.reply_text(MESSAGES[lang]["job_queued"])
     return True
 
 
@@ -796,12 +817,24 @@ async def _pdf_editor_op_to_txt(update: Update, context: ContextTypes.DEFAULT_TY
         "src_name": str(src.get("name") or "pdf"),
         "lang": lang,
     }
-    job_id = db_enqueue_background_job("pdf_editor", user_id, job_data)
-    if not job_id:
-        await _pdf_editor_target_message(update).reply_text(t["failed"])
+    target = _pdf_editor_target_message(update)
+    job_meta = db_enqueue_background_job(
+        "pdf_editor",
+        user_id,
+        job_data,
+        chat_id=target.chat_id if target else None,
+        message_id=target.message_id if target else None,
+        return_meta=True,
+    )
+    if not job_meta or not job_meta.get("ok"):
+        reason = str((job_meta or {}).get("reason") or "")
+        if reason in {"pending_limit", "running_limit"}:
+            await target.reply_text(MESSAGES[lang]["job_limit_wait"])
+        else:
+            await target.reply_text(t["failed"])
         return False
 
-    await _pdf_editor_target_message(update).reply_text("✅ PDF to TXT conversion queued! You'll receive the result soon.")
+    await target.reply_text(MESSAGES[lang]["job_queued"])
     return True
 
 
@@ -823,12 +856,24 @@ async def _pdf_editor_op_to_epub(update: Update, context: ContextTypes.DEFAULT_T
         "src_name": str(src.get("name") or "book"),
         "lang": lang,
     }
-    job_id = db_enqueue_background_job("pdf_editor", user_id, job_data)
-    if not job_id:
-        await _pdf_editor_target_message(update).reply_text(t["failed"])
+    target = _pdf_editor_target_message(update)
+    job_meta = db_enqueue_background_job(
+        "pdf_editor",
+        user_id,
+        job_data,
+        chat_id=target.chat_id if target else None,
+        message_id=target.message_id if target else None,
+        return_meta=True,
+    )
+    if not job_meta or not job_meta.get("ok"):
+        reason = str((job_meta or {}).get("reason") or "")
+        if reason in {"pending_limit", "running_limit"}:
+            await target.reply_text(MESSAGES[lang]["job_limit_wait"])
+        else:
+            await target.reply_text(t["failed"])
         return False
 
-    await _pdf_editor_target_message(update).reply_text("✅ PDF to EPUB conversion queued! You'll receive the result soon.")
+    await target.reply_text(MESSAGES[lang]["job_queued"])
     return True
 
 
@@ -850,12 +895,24 @@ async def _pdf_editor_op_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE,
         "src_name": str(src.get("name") or "pdf"),
         "lang": lang,
     }
-    job_id = db_enqueue_background_job("pdf_editor", user_id, job_data)
-    if not job_id:
-        await _pdf_editor_target_message(update).reply_text(t["failed"])
+    target = _pdf_editor_target_message(update)
+    job_meta = db_enqueue_background_job(
+        "pdf_editor",
+        user_id,
+        job_data,
+        chat_id=target.chat_id if target else None,
+        message_id=target.message_id if target else None,
+        return_meta=True,
+    )
+    if not job_meta or not job_meta.get("ok"):
+        reason = str((job_meta or {}).get("reason") or "")
+        if reason in {"pending_limit", "running_limit"}:
+            await target.reply_text(MESSAGES[lang]["job_limit_wait"])
+        else:
+            await target.reply_text(t["failed"])
         return False
 
-    await _pdf_editor_target_message(update).reply_text("✅ PDF OCR processing queued! You'll receive the result soon.")
+    await target.reply_text(MESSAGES[lang]["job_queued"])
     return True
 
 

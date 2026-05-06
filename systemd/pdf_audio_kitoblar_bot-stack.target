@@ -1,7 +1,7 @@
 [Unit]
-Description=pdf_audio_kitoblar_bot - Full Stack (Local Bot API + Main Bot + Dashboard)
-Wants=pdf_audio_kitoblar_bot.service pdf_audio_kitoblar_bot-bot.service pdf_audio_kitoblar_bot-dashboard.service
-After=pdf_audio_kitoblar_bot.service pdf_audio_kitoblar_bot-bot.service pdf_audio_kitoblar_bot-dashboard.service
+Description=pdf_audio_kitoblar_bot - Full Stack (Bot API + Bot + Workers)
+Wants=pdf_audio_kitoblar_bot.service pdf_audio_kitoblar_bot-bot.service pdf_audio_kitoblar_bot-worker.service pdf_audio_kitoblar_bot-cleanup.service
+After=pdf_audio_kitoblar_bot.service pdf_audio_kitoblar_bot-bot.service pdf_audio_kitoblar_bot-worker.service pdf_audio_kitoblar_bot-cleanup.service
 
 [Install]
 WantedBy=multi-user.target

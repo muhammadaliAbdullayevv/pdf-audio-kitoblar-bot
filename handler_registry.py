@@ -46,6 +46,7 @@ REQUIRED_DEP_KEYS = (
     "handle_requests_view_callback",
     "handle_request_cancel_callback",
     "handle_audiobook_listen_callback",
+    "handle_audiobook_play_all_callback",
     "handle_audiobook_page_callback",
     "handle_audiobook_part_play_callback",
     "handle_reaction_callback",
@@ -136,6 +137,7 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["handle_requests_view_callback"], pattern="^reqview:"))
     app.add_handler(CallbackQueryHandler(d["handle_request_cancel_callback"], pattern="^reqcancel:"))
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_listen_callback"], pattern="^abook:"))
+    app.add_handler(CallbackQueryHandler(d["handle_audiobook_play_all_callback"], pattern="^abplayall:"))
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_page_callback"], pattern="^abpage:"))
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_part_play_callback"], pattern="^abplay:"))
     app.add_handler(CallbackQueryHandler(d["handle_reaction_callback"], pattern="^react:"))

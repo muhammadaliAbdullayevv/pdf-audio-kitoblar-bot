@@ -14,7 +14,8 @@ from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import ContextTypes
-from book_thumbnail import get_book_thumbnail_input
+from audio_converter import _audio_conv_apply_cover_blocking, _audio_conv_transform_blocking
+from book_thumbnail import get_book_thumbnail_input, get_book_thumbnail_payload
 from language import get_language_keyboard
 
 try:
@@ -85,6 +86,70 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _search_cache_namespace() -> str:
     return str(globals().get("SEARCH_CACHE_NS", os.getenv("SEARCH_CACHE_NS", "v1")) or "v1")
+
+
+_AUDIOBOOK_LOCAL_DIR = Path(
+    os.getenv(
+        "AUDIOBOOK_LOCAL_DIR",
+        str(Path(__file__).resolve().parent / "downloads" / "localaudiobooks"),
+    )
+)
+_AUDIOBOOK_AUTO_DOWNLOAD_LOCAL = _env_bool(
+    "AUDIOBOOK_AUTO_DOWNLOAD_LOCAL",
+    _env_bool("UPLOAD_AUTO_DOWNLOAD_LOCAL", True),
+)
+_AUDIOBOOK_LOCAL_REFRESH_FILE_ID = _env_bool("AUDIOBOOK_LOCAL_REFRESH_FILE_ID", True)
+_AUDIOBOOK_LOCAL_WORKER_COUNT = max(
+    1,
+    _env_int("AUDIOBOOK_LOCAL_WORKER_COUNT", _env_int("UPLOAD_LOCAL_WORKER_COUNT", 2)),
+)
+_AUDIOBOOK_LOCAL_DOWNLOAD_RETRIES = max(
+    1,
+    _env_int("AUDIOBOOK_LOCAL_DOWNLOAD_RETRIES", _env_int("UPLOAD_LOCAL_DOWNLOAD_RETRIES", 6)),
+)
+_AUDIOBOOK_LOCAL_RETRY_BASE_DELAY_SEC = max(
+    0.5,
+    _env_float("AUDIOBOOK_LOCAL_RETRY_BASE_DELAY_SEC", _env_float("UPLOAD_LOCAL_RETRY_BASE_DELAY_SEC", 2.0)),
+)
+_AUDIOBOOK_LOCAL_RETRY_MIN_DELAY_SEC = max(
+    1.0,
+    _env_float("AUDIOBOOK_LOCAL_RETRY_MIN_DELAY_SEC", _env_float("UPLOAD_LOCAL_RETRY_MIN_DELAY_SEC", 10.0)),
+)
+_AUDIOBOOK_LOCAL_WORKER_POLL_SECONDS = max(
+    0.5,
+    _env_float("AUDIOBOOK_LOCAL_WORKER_POLL_SECONDS", _env_float("UPLOAD_LOCAL_WORKER_POLL_SECONDS", 1.0)),
+)
+_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS = max(
+    0.0,
+    _env_float("AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS", _env_float("UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS", 0.1)),
+)
+_AUDIOBOOK_LOCAL_JOB_STALE_AFTER_SECONDS = max(
+    60,
+    _env_int("AUDIOBOOK_LOCAL_JOB_STALE_AFTER_SECONDS", _env_int("UPLOAD_LOCAL_JOB_STALE_AFTER_SECONDS", 3600)),
+)
+_AUDIOBOOK_LOCAL_GET_FILE_READ_TIMEOUT_SEC = max(
+    60.0,
+    _env_float("AUDIOBOOK_LOCAL_GET_FILE_READ_TIMEOUT_SEC", _env_float("UPLOAD_LOCAL_GET_FILE_READ_TIMEOUT_SEC", 300.0)),
+)
+_AUDIOBOOK_LOCAL_DOWNLOAD_READ_TIMEOUT_SEC = max(
+    120.0,
+    _env_float("AUDIOBOOK_LOCAL_DOWNLOAD_READ_TIMEOUT_SEC", _env_float("UPLOAD_LOCAL_DOWNLOAD_READ_TIMEOUT_SEC", 600.0)),
+)
+_AUDIOBOOK_LOCAL_SEND_READ_TIMEOUT_SEC = _env_float("AUDIOBOOK_LOCAL_SEND_READ_TIMEOUT_SEC", 0.0)
+_AUDIOBOOK_LOCAL_SEND_WRITE_TIMEOUT_SEC = _env_float("AUDIOBOOK_LOCAL_SEND_WRITE_TIMEOUT_SEC", 0.0)
+_AUDIOBOOK_LOCAL_CONNECT_TIMEOUT_SEC = max(
+    10.0,
+    _env_float("AUDIOBOOK_LOCAL_CONNECT_TIMEOUT_SEC", _env_float("UPLOAD_LOCAL_CONNECT_TIMEOUT_SEC", 45.0)),
+)
+_AUDIOBOOK_LOCAL_POOL_TIMEOUT_SEC = max(
+    10.0,
+    _env_float("AUDIOBOOK_LOCAL_POOL_TIMEOUT_SEC", _env_float("UPLOAD_LOCAL_POOL_TIMEOUT_SEC", 45.0)),
+)
+_AUDIOBOOK_LOCAL_SEND_MIN_INTERVAL_SEC = max(
+    0.0,
+    _env_float("AUDIOBOOK_LOCAL_SEND_MIN_INTERVAL_SEC", _env_float("AUDIO_UPLOAD_SEND_DELAY_SEC", 1.0)),
+)
+_AUDIOBOOK_LOCAL_WORKER_KEY = "audiobook_local_backup_workers"
 
 
 def _query_fingerprint(query: str) -> str:
@@ -243,6 +308,725 @@ def _normalize_audiobook_folder_title(raw_name: str | None, fallback_id: str | N
                 return normalized
         except Exception:
             pass
+    candidate = re.sub(r"\s+", " ", candidate).strip().lower()
+    return candidate or str(fallback_id or "audiobook").strip().lower() or "audiobook"
+
+
+def _safe_asyncio_current_task():
+    try:
+        return asyncio.current_task()
+    except Exception:
+        return None
+
+
+def _audiobook_storage_clean_title(value: str | None, default: str = "audio") -> str:
+    text = Path(str(value or "").strip()).stem
+    if not text:
+        return default
+    text = text.replace("'", "ʻ").replace("’", "ʻ").replace("ʼ", "ʻ").replace("`", "ʻ")
+    text = re.sub(r'@[\w_]+', ' ', text)
+    text = re.sub(r'https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+', ' ', text, flags=re.IGNORECASE)
+    text = text.replace("_", " ")
+    text = re.sub(r"[\x00-\x1f\x7f/\\<>:*?\"|]+", " ", text)
+    text = re.sub(r"[^\w\sʻ().,\-]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip(" .-_")
+    return (text[:160] or default)
+
+
+def _audiobook_original_extension(part: dict, fallback_name: str | None = None) -> str:
+    for candidate in (
+        fallback_name,
+        part.get("file_name"),
+        part.get("title"),
+        part.get("path"),
+    ):
+        suffix = Path(str(candidate or "").strip()).suffix.strip().lower()
+        if suffix:
+            return suffix
+    kind = str(part.get("media_kind") or "").strip().lower()
+    if kind == "voice":
+        return ".ogg"
+    return ".mp3"
+
+
+def _audiobook_local_filename(part: dict, ext: str) -> str:
+    try:
+        part_index = int(part.get("part_index") or 0)
+    except Exception:
+        part_index = 0
+    base_title = _audiobook_storage_clean_title(
+        part.get("title") or part.get("file_name"),
+        default=f"Part {part_index or 1}",
+    )
+    return f"{base_title}{ext}"
+
+
+def _audiobook_local_target_path(audio_book: dict | None, book: dict | None, part: dict, ext: str) -> Path:
+    folder_title = _audiobook_storage_clean_title(
+        (book or {}).get("display_name")
+        or (book or {}).get("book_name")
+        or (audio_book or {}).get("display_title")
+        or (audio_book or {}).get("title")
+        or "audiobook",
+        default="audiobook",
+    )
+    audio_book_id = str((audio_book or {}).get("id") or part.get("audio_book_id") or "").strip()
+    if audio_book_id:
+        folder_title = f"{folder_title}__{audio_book_id}"
+    return _AUDIOBOOK_LOCAL_DIR / folder_title / _audiobook_local_filename(part, ext)
+
+
+def _audiobook_send_title(part: dict, local_path: str | None = None) -> str | None:
+    fallback = f"Part {part.get('part_index', 0)}"
+    base_title = str(part.get("title") or "").strip()
+    if not base_title and local_path:
+        base_title = Path(local_path).stem.strip()
+    normalized_title = _audiobook_storage_clean_title(base_title or fallback, default=fallback)
+    return normalized_title or None
+
+
+def _delete_local_audiobook_paths(paths: list[str] | tuple[str, ...]) -> dict[str, int]:
+    deleted = 0
+    failed = 0
+    parent_dirs: set[Path] = set()
+    unique_paths = []
+    seen: set[str] = set()
+    for raw in paths or []:
+        path_value = str(raw or "").strip()
+        if not path_value or path_value in seen:
+            continue
+        seen.add(path_value)
+        unique_paths.append(path_value)
+
+    for path_value in unique_paths:
+        path_obj = Path(path_value)
+        parent_dirs.add(path_obj.parent)
+        for candidate in (path_obj, path_obj.with_name(path_obj.name + ".part")):
+            if not candidate.exists():
+                continue
+            try:
+                if candidate.is_file():
+                    candidate.unlink()
+                    deleted += 1
+                elif candidate.is_dir():
+                    failed += 1
+                    logger.warning("Expected audiobook local file but found directory: %s", candidate)
+            except Exception as e:
+                failed += 1
+                logger.warning("Failed to delete audiobook local path %s: %s", candidate, e, exc_info=True)
+
+    for folder in sorted(parent_dirs, key=lambda item: len(item.parts), reverse=True):
+        current = folder
+        while True:
+            try:
+                if current == _AUDIOBOOK_LOCAL_DIR or current == _AUDIOBOOK_LOCAL_DIR.parent:
+                    break
+            except Exception:
+                break
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            except Exception as e:
+                logger.debug("Failed to remove empty audiobook folder %s: %s", current, e)
+                break
+            current = current.parent
+
+    return {"deleted": deleted, "failed": failed}
+
+
+async def _audiobook_local_retry(call, *, desc: str):
+    delay = _AUDIOBOOK_LOCAL_RETRY_BASE_DELAY_SEC
+    for attempt in range(1, _AUDIOBOOK_LOCAL_DOWNLOAD_RETRIES + 1):
+        try:
+            return await call()
+        except Exception as e:
+            retry_after = getattr(e, "retry_after", None)
+            if retry_after is not None and attempt < _AUDIOBOOK_LOCAL_DOWNLOAD_RETRIES:
+                sleep_for = max(1.0, float(retry_after or 1.0)) + 0.5
+                logger.warning(
+                    "%s transient error (%s), retrying in %.1fs (attempt %s/%s)",
+                    desc,
+                    e,
+                    sleep_for,
+                    attempt,
+                    _AUDIOBOOK_LOCAL_DOWNLOAD_RETRIES,
+                )
+                await asyncio.sleep(sleep_for)
+                continue
+            msg_text = str(e).lower()
+            transient = any(
+                marker in msg_text
+                for marker in ("timed out", "timeout", "network", "connection reset", "temporary failure")
+            )
+            if transient and attempt < _AUDIOBOOK_LOCAL_DOWNLOAD_RETRIES:
+                logger.warning(
+                    "%s transient error (%s), retrying in %.1fs (attempt %s/%s)",
+                    desc,
+                    e,
+                    delay,
+                    attempt,
+                    _AUDIOBOOK_LOCAL_DOWNLOAD_RETRIES,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
+                continue
+            raise
+
+
+def _resolve_audiobook_refresh_channel_id(part: dict | None = None) -> int:
+    try:
+        stored_channel_id = int((part or {}).get("channel_id") or 0)
+    except Exception:
+        stored_channel_id = 0
+    if stored_channel_id:
+        return stored_channel_id
+    audio_channel_ids = _resolve_audio_upload_channel_ids()
+    if audio_channel_ids:
+        return int(audio_channel_ids[0])
+    candidates = [
+        globals().get("BOOK_STORAGE_CHANNEL_ID"),
+        os.getenv("BOOK_STORAGE_CHANNEL_ID", ""),
+        globals().get("AUDIO_UPLOAD_CHANNEL_ID"),
+        os.getenv("AUDIO_UPLOAD_CHANNEL_ID", ""),
+        os.getenv("TELEGRAM_OWNER_ID", ""),
+        -1003970604636,
+    ]
+    for raw in candidates:
+        try:
+            value = int(str(raw or "").strip())
+        except Exception:
+            value = 0
+        if value:
+            return value
+    return 0
+
+
+async def _download_audiobook_source_bytes(bot, file_id: str, part_id: str) -> bytes:
+    get_file_kwargs = {
+        "read_timeout": _AUDIOBOOK_LOCAL_GET_FILE_READ_TIMEOUT_SEC,
+        "connect_timeout": _AUDIOBOOK_LOCAL_CONNECT_TIMEOUT_SEC,
+        "pool_timeout": _AUDIOBOOK_LOCAL_POOL_TIMEOUT_SEC,
+    }
+    tg_file = await _audiobook_local_retry(
+        lambda: bot.get_file(file_id, **get_file_kwargs),
+        desc=f"audiobook get_file {part_id or file_id}",
+    )
+    download_kwargs = {
+        "read_timeout": _AUDIOBOOK_LOCAL_DOWNLOAD_READ_TIMEOUT_SEC,
+        "connect_timeout": _AUDIOBOOK_LOCAL_CONNECT_TIMEOUT_SEC,
+        "pool_timeout": _AUDIOBOOK_LOCAL_POOL_TIMEOUT_SEC,
+    }
+    payload = await _audiobook_local_retry(
+        lambda: tg_file.download_as_bytearray(**download_kwargs),
+        desc=f"audiobook download {part_id or file_id}",
+    )
+    return bytes(payload or b"")
+
+
+async def _refresh_audiobook_part_file_id(
+    bot,
+    part: dict,
+    local_path: str,
+    *,
+    app=None,
+    telegram_filename: str | None = None,
+    title: str | None = None,
+    media_kind: str | None = None,
+    duration_seconds: int | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "file_id": None,
+        "file_unique_id": None,
+        "channel_id": None,
+        "channel_message_id": None,
+        "media_kind": None,
+        "duration_seconds": duration_seconds,
+        "error": None,
+    }
+    if not _AUDIOBOOK_LOCAL_REFRESH_FILE_ID:
+        result["error"] = "refresh disabled"
+        return result
+
+    storage_channel_id = _resolve_audiobook_refresh_channel_id(part)
+    if storage_channel_id == 0:
+        result["error"] = "missing audiobook storage channel"
+        return result
+
+    path_obj = Path(str(local_path or "").strip())
+    if not path_obj.exists():
+        result["error"] = "missing local path"
+        return result
+
+    resolved_media_kind = str(media_kind or part.get("media_kind") or _audiobook_part_media_kind(part)).strip().lower()
+    if resolved_media_kind not in {"audio", "voice", "document"}:
+        resolved_media_kind = "audio" if path_obj.suffix.lower() in {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".oga", ".opus"} else "document"
+    resolved_title = str(title or part.get("title") or path_obj.stem or "").strip() or None
+    resolved_filename = str(telegram_filename or path_obj.name or "audio.mp3").strip() or path_obj.name
+    read_timeout = _AUDIOBOOK_LOCAL_SEND_READ_TIMEOUT_SEC if _AUDIOBOOK_LOCAL_SEND_READ_TIMEOUT_SEC > 0 else None
+    write_timeout = _AUDIOBOOK_LOCAL_SEND_WRITE_TIMEOUT_SEC if _AUDIOBOOK_LOCAL_SEND_WRITE_TIMEOUT_SEC > 0 else None
+    send_kwargs = {
+        "read_timeout": read_timeout,
+        "write_timeout": write_timeout,
+        "connect_timeout": _AUDIOBOOK_LOCAL_CONNECT_TIMEOUT_SEC,
+        "pool_timeout": _AUDIOBOOK_LOCAL_POOL_TIMEOUT_SEC,
+        "disable_notification": True,
+    }
+    channel_lock, channel_state = _get_audio_channel_send_guard_for_app(app, int(storage_channel_id))
+
+    async def _send_with_channel_guard(sender, desc: str):
+        try:
+            if channel_lock is not None:
+                async with channel_lock:
+                    if isinstance(channel_state, dict):
+                        now_ts = asyncio.get_running_loop().time()
+                        next_allowed_at = float(channel_state.get("next_allowed_at", 0.0) or 0.0)
+                        if next_allowed_at > now_ts:
+                            await asyncio.sleep(next_allowed_at - now_ts)
+                    sent_message = await sender()
+                    if isinstance(channel_state, dict) and _AUDIOBOOK_LOCAL_SEND_MIN_INTERVAL_SEC > 0:
+                        channel_state["next_allowed_at"] = asyncio.get_running_loop().time() + _AUDIOBOOK_LOCAL_SEND_MIN_INTERVAL_SEC
+                    return sent_message
+            return await sender()
+        except Exception as e:
+            logger.warning("%s failed without retry to avoid duplicate uploads: %s", desc, e)
+            raise
+
+    try:
+        if resolved_media_kind == "audio":
+            async def _send_audio():
+                with open(path_obj, "rb") as fh:
+                    return await bot.send_audio(
+                        chat_id=storage_channel_id,
+                        audio=InputFile(fh, filename=resolved_filename),
+                        title=resolved_title,
+                        duration=duration_seconds,
+                        thumbnail=get_book_thumbnail_input(),
+                        **send_kwargs,
+                    )
+
+            sent = await _send_with_channel_guard(
+                _send_audio,
+                desc=f"audiobook refresh audio {part.get('id') or ''}".strip(),
+            )
+            media = getattr(sent, "audio", None)
+        elif resolved_media_kind == "voice":
+            async def _send_voice():
+                with open(path_obj, "rb") as fh:
+                    return await bot.send_voice(
+                        chat_id=storage_channel_id,
+                        voice=InputFile(fh, filename=resolved_filename),
+                        duration=duration_seconds,
+                        **send_kwargs,
+                    )
+
+            sent = await _send_with_channel_guard(
+                _send_voice,
+                desc=f"audiobook refresh voice {part.get('id') or ''}".strip(),
+            )
+            media = getattr(sent, "voice", None)
+        else:
+            async def _send_document():
+                with open(path_obj, "rb") as fh:
+                    return await bot.send_document(
+                        chat_id=storage_channel_id,
+                        document=InputFile(fh, filename=resolved_filename),
+                        thumbnail=get_book_thumbnail_input(),
+                        **send_kwargs,
+                    )
+
+            sent = await _send_with_channel_guard(
+                _send_document,
+                desc=f"audiobook refresh document {part.get('id') or ''}".strip(),
+            )
+            media = getattr(sent, "document", None)
+
+        file_id = str(getattr(media, "file_id", "") or "").strip()
+        if not file_id:
+            result["error"] = "Telegram did not return refreshed file_id"
+            return result
+        result["file_id"] = file_id
+        result["file_unique_id"] = str(getattr(media, "file_unique_id", "") or "").strip() or None
+        result["channel_id"] = int(storage_channel_id)
+        result["channel_message_id"] = int(getattr(sent, "message_id", 0) or 0) or None
+        result["media_kind"] = resolved_media_kind
+        if result["duration_seconds"] is None:
+            try:
+                duration_value = int(getattr(media, "duration", 0) or 0)
+            except Exception:
+                duration_value = 0
+            if duration_value > 0:
+                result["duration_seconds"] = duration_value
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        logger.warning(
+            "Failed to refresh audiobook part file_id for %s from %s via channel %s: %s",
+            part.get("id"),
+            local_path,
+            storage_channel_id,
+            e,
+            exc_info=True,
+        )
+        return result
+
+
+async def _save_audiobook_part_local(bot, audio_book: dict | None, book: dict | None, part: dict, *, app=None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "part_id": str(part.get("id") or ""),
+        "audio_book_id": str((audio_book or {}).get("id") or part.get("audio_book_id") or ""),
+        "path": None,
+        "source_kind": "missing",
+        "media_kind": None,
+        "duration_seconds": None,
+        "error": None,
+        "db_updated": False,
+        "file_id_refreshed": False,
+    }
+    part_id = result["part_id"]
+    file_id = str(part.get("file_id") or "").strip()
+    if not part_id or not file_id:
+        result["error"] = "missing audiobook part_id or file_id"
+        return result
+
+    try:
+        _AUDIOBOOK_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+        source_ext = _audiobook_original_extension(part, part.get("title"))
+        try:
+            source_duration = int(part.get("duration_seconds") or 0) or None
+        except Exception:
+            source_duration = None
+        clean_title = _audiobook_storage_clean_title(
+            part.get("title") or part.get("file_name"),
+            default=f"Part {part.get('part_index') or 1}",
+        )
+        target_path = _audiobook_local_target_path(audio_book, book, part, ".mp3")
+        output_media_kind = "audio"
+
+        if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
+            result["path"] = str(target_path)
+            result["source_kind"] = "reused-existing"
+            result["media_kind"] = output_media_kind
+            result["duration_seconds"] = source_duration
+        else:
+            source_bytes = await _download_audiobook_source_bytes(bot, file_id, part_id)
+            if not source_bytes:
+                result["error"] = "empty source audio"
+                return result
+
+            output_bytes = source_bytes
+            output_ext = source_ext
+            output_media_kind = _audiobook_part_media_kind(part)
+            try:
+                output_bytes = await run_blocking(
+                    _audio_conv_transform_blocking,
+                    source_bytes,
+                    output_mode="mp3",
+                )
+                output_ext = ".mp3"
+                output_media_kind = "audio"
+                result["source_kind"] = "telegram-file-mp3"
+            except Exception as e:
+                result["source_kind"] = "telegram-file-original"
+                logger.warning(
+                    "Audiobook MP3 transform failed for %s; keeping original media: %s",
+                    part_id,
+                    e,
+                    exc_info=True,
+                )
+
+            if output_media_kind == "audio":
+                cover_payload = get_book_thumbnail_payload()
+                if cover_payload:
+                    try:
+                        cover_bytes, _ = cover_payload
+                        output_bytes = await run_blocking(_audio_conv_apply_cover_blocking, output_bytes, cover_bytes)
+                        result["source_kind"] = "telegram-file-covered-mp3"
+                    except Exception as e:
+                        logger.warning(
+                            "Audiobook cover apply failed for %s; continuing without embedded cover: %s",
+                            part_id,
+                            e,
+                            exc_info=True,
+                        )
+
+            target_path = _audiobook_local_target_path(audio_book, book, part, output_ext)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = target_path.with_name(target_path.name + ".part")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            await asyncio.to_thread(tmp_path.write_bytes, output_bytes)
+            await asyncio.to_thread(tmp_path.replace, target_path)
+            result["path"] = str(target_path)
+            result["media_kind"] = output_media_kind
+            result["duration_seconds"] = source_duration
+
+        await run_blocking(
+            update_audio_book_part_media,
+            part_id,
+            path=str(result["path"]),
+            title=clean_title,
+            media_kind=str(result["media_kind"] or output_media_kind),
+            duration_seconds=result["duration_seconds"],
+        )
+        result["db_updated"] = True
+
+        if result["path"] and _AUDIOBOOK_LOCAL_REFRESH_FILE_ID:
+            refreshed_part = dict(part or {})
+            refreshed_part["path"] = result["path"]
+            refreshed_part["media_kind"] = str(result["media_kind"] or output_media_kind)
+            refresh_info = await _refresh_audiobook_part_file_id(
+                bot,
+                refreshed_part,
+                str(result["path"]),
+                app=app,
+                telegram_filename=Path(str(result["path"])).name,
+                title=clean_title,
+                media_kind=str(result["media_kind"] or output_media_kind),
+                duration_seconds=result["duration_seconds"],
+            )
+            if refresh_info.get("file_id"):
+                await run_blocking(
+                    update_audio_book_part_media,
+                    part_id,
+                    file_id=str(refresh_info.get("file_id") or ""),
+                    file_unique_id=str(refresh_info.get("file_unique_id") or "").strip() or None,
+                    path=str(result["path"]),
+                    title=clean_title,
+                    media_kind=str(refresh_info.get("media_kind") or result["media_kind"] or output_media_kind),
+                    duration_seconds=refresh_info.get("duration_seconds"),
+                    channel_id=refresh_info.get("channel_id"),
+                    channel_message_id=refresh_info.get("channel_message_id"),
+                )
+                result["file_id_refreshed"] = True
+                result["media_kind"] = str(refresh_info.get("media_kind") or result["media_kind"] or output_media_kind)
+                result["duration_seconds"] = refresh_info.get("duration_seconds") or result["duration_seconds"]
+            elif not result["error"]:
+                result["error"] = f"file_id refresh failed: {refresh_info.get('error') or 'unknown error'}"
+
+        logger.info(
+            "Saved audiobook part locally: part_id=%s audio_book_id=%s path=%s",
+            part_id,
+            result["audio_book_id"],
+            result["path"],
+        )
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        logger.error("Failed to save audiobook part locally for %s: %s", part_id, e, exc_info=True)
+        return result
+
+
+def start_audiobook_local_backup_worker(app) -> None:
+    if not _AUDIOBOOK_AUTO_DOWNLOAD_LOCAL:
+        return
+    logger.info(
+        "Audiobook local backup worker config: storage_channel_id=%s auto_download=%s refresh_file_id=%s workers=%s",
+        _resolve_audiobook_refresh_channel_id({}),
+        _AUDIOBOOK_AUTO_DOWNLOAD_LOCAL,
+        _AUDIOBOOK_LOCAL_REFRESH_FILE_ID,
+        _AUDIOBOOK_LOCAL_WORKER_COUNT,
+    )
+    data = app.bot_data
+    data["audiobook_local_backup_worker_target"] = _AUDIOBOOK_LOCAL_WORKER_COUNT
+    workers = data.get(_AUDIOBOOK_LOCAL_WORKER_KEY)
+    live_workers = []
+    if isinstance(workers, list):
+        live_workers = [task for task in workers if task is not None and not task.done()]
+        data[_AUDIOBOOK_LOCAL_WORKER_KEY] = live_workers
+    elif workers and not getattr(workers, "done", lambda: True)():
+        live_workers = [workers]
+        data[_AUDIOBOOK_LOCAL_WORKER_KEY] = live_workers
+    missing_workers = max(0, _AUDIOBOOK_LOCAL_WORKER_COUNT - len(live_workers))
+    if missing_workers <= 0:
+        return
+    start_index = len(live_workers)
+    created_workers = live_workers + [
+        app.create_task(_audiobook_local_backup_worker(app, worker_index=start_index + index + 1))
+        for index in range(missing_workers)
+    ]
+    data[_AUDIOBOOK_LOCAL_WORKER_KEY] = created_workers
+    logger.info("Started %s audiobook local backup worker(s)", missing_workers)
+
+
+async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
+    worker_id = f"audiobook-local-backup:{os.getpid()}:{worker_index}"
+    try:
+        while True:
+            try:
+                job = await run_blocking(
+                    claim_audio_book_part_local_download_job,
+                    worker_id,
+                    _AUDIOBOOK_LOCAL_JOB_STALE_AFTER_SECONDS,
+                )
+                if not job:
+                    await asyncio.sleep(_AUDIOBOOK_LOCAL_WORKER_POLL_SECONDS)
+                    continue
+
+                job_id = str(job.get("id") or "").strip()
+                audio_book_id = str(job.get("audio_book_id") or "").strip()
+                part_id = str(job.get("audio_book_part_id") or "").strip()
+                attempts = int(job.get("attempts") or 0)
+                max_attempts = int(job.get("max_attempts") or 12)
+                logger.info(
+                    "Audiobook local backup job claimed: job_id=%s audio_book_id=%s part_id=%s attempts=%s/%s",
+                    job_id,
+                    audio_book_id,
+                    part_id,
+                    attempts,
+                    max_attempts,
+                )
+
+                if not job_id or not audio_book_id or not part_id:
+                    error = "missing audiobook local backup job payload"
+                    if job_id:
+                        if attempts >= max_attempts:
+                            await run_blocking(fail_audio_book_part_local_download_job, job_id, error)
+                        else:
+                            await run_blocking(retry_audio_book_part_local_download_job, job_id, error, 60.0)
+                    if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
+                        await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
+                    continue
+
+                audio_book = await run_blocking(get_audio_book_by_id, audio_book_id)
+                part = await run_blocking(get_audio_book_part, part_id)
+                if not audio_book or not part:
+                    error = "audiobook or part not found"
+                    if attempts >= max_attempts:
+                        await run_blocking(fail_audio_book_part_local_download_job, job_id, error)
+                    else:
+                        await run_blocking(retry_audio_book_part_local_download_job, job_id, error, 60.0)
+                    if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
+                        await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
+                    continue
+
+                book = None
+                book_id = str((audio_book or {}).get("book_id") or "").strip()
+                db_get_book_by_id_fn = globals().get("db_get_book_by_id")
+                if book_id and callable(db_get_book_by_id_fn):
+                    try:
+                        book = await run_blocking(db_get_book_by_id_fn, book_id)
+                    except Exception as e:
+                        logger.warning("Failed to load parent book %s for audiobook local backup: %s", book_id, e)
+
+                result = await _save_audiobook_part_local(app.bot, audio_book, book, part, app=app)
+                refresh_required = bool(_AUDIOBOOK_LOCAL_REFRESH_FILE_ID)
+                refresh_ok = bool(result.get("file_id_refreshed")) or not refresh_required
+                if result.get("path") and result.get("db_updated") and refresh_ok:
+                    logger.info(
+                        "Audiobook local backup job done: job_id=%s part_id=%s path=%s",
+                        job_id,
+                        part_id,
+                        result["path"],
+                    )
+                    await run_blocking(complete_audio_book_part_local_download_job, job_id)
+                    if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
+                        await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
+                    continue
+
+                timeout_like_refresh_failure = (
+                    bool(result.get("path"))
+                    and bool(result.get("db_updated"))
+                    and refresh_required
+                    and not result.get("file_id_refreshed")
+                    and "timed out" in str(result.get("error") or "").lower()
+                )
+                if timeout_like_refresh_failure:
+                    logger.warning(
+                        "Audiobook local backup refresh timed out after local save; completing job without retry to avoid duplicate channel uploads: job_id=%s part_id=%s path=%s error=%s",
+                        job_id,
+                        part_id,
+                        result.get("path"),
+                        result.get("error"),
+                    )
+                    await run_blocking(complete_audio_book_part_local_download_job, job_id)
+                    if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
+                        await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
+                    continue
+
+                error = str(result.get("error") or "audiobook local backup failed")
+                if result.get("path") and not result.get("db_updated"):
+                    error = f"{error} (local file saved, DB path update pending)"
+                elif result.get("path") and result.get("db_updated") and refresh_required and not result.get("file_id_refreshed"):
+                    error = f"{error} (local file saved, file_id refresh pending)"
+
+                if attempts >= max_attempts:
+                    logger.error(
+                        "Audiobook local backup job failed permanently: job_id=%s part_id=%s attempts=%s/%s error=%s",
+                        job_id,
+                        part_id,
+                        attempts,
+                        max_attempts,
+                        error,
+                    )
+                    await run_blocking(fail_audio_book_part_local_download_job, job_id, error)
+                else:
+                    backoff = max(
+                        _AUDIOBOOK_LOCAL_RETRY_MIN_DELAY_SEC,
+                        min(3600.0, _AUDIOBOOK_LOCAL_RETRY_BASE_DELAY_SEC * (2 ** max(0, attempts - 1))),
+                    )
+                    logger.warning(
+                        "Audiobook local backup job retry scheduled: job_id=%s part_id=%s attempts=%s/%s backoff=%.1fs error=%s",
+                        job_id,
+                        part_id,
+                        attempts,
+                        max_attempts,
+                        backoff,
+                        error,
+                    )
+                    await run_blocking(retry_audio_book_part_local_download_job, job_id, error, backoff)
+                if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
+                    await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Audiobook local backup worker loop failed: %s", e, exc_info=True)
+                await asyncio.sleep(5.0)
+    finally:
+        current_task = _safe_asyncio_current_task()
+        workers = app.bot_data.get(_AUDIOBOOK_LOCAL_WORKER_KEY)
+        if current_task is not None and isinstance(workers, list):
+            remaining = [task for task in workers if task is not current_task and not task.done()]
+            if remaining:
+                app.bot_data[_AUDIOBOOK_LOCAL_WORKER_KEY] = remaining
+            else:
+                app.bot_data.pop(_AUDIOBOOK_LOCAL_WORKER_KEY, None)
+        elif current_task is not None and app.bot_data.get(_AUDIOBOOK_LOCAL_WORKER_KEY) is current_task:
+            app.bot_data.pop(_AUDIOBOOK_LOCAL_WORKER_KEY, None)
+
+
+async def _enqueue_audiobook_local_backup(app, audio_book_id: str, part: dict[str, Any]) -> None:
+    if not _AUDIOBOOK_AUTO_DOWNLOAD_LOCAL:
+        return
+    audio_book_id = str(audio_book_id or "").strip()
+    part_id = str((part or {}).get("id") or "").strip()
+    file_id = str((part or {}).get("file_id") or "").strip()
+    file_name = str((part or {}).get("title") or (part or {}).get("file_name") or "").strip()
+    media_kind = str((part or {}).get("media_kind") or "").strip().lower() or None
+    file_unique_id = str((part or {}).get("file_unique_id") or "").strip() or None
+    if not audio_book_id or not part_id or not file_id:
+        logger.warning("Skipping audiobook local backup enqueue for incomplete payload: audio_book_id=%s part_id=%s", audio_book_id, part_id)
+        return
+    if not file_name:
+        ext = _audiobook_original_extension(part, part.get("title"))
+        file_name = f"{_audiobook_storage_clean_title(part.get('title'), default='audio')}{ext}"
+    try:
+        job_id = await run_blocking(
+            enqueue_audio_book_part_local_download_job,
+            audio_book_id,
+            part_id,
+            file_id,
+            file_name,
+            file_unique_id,
+            media_kind,
+        )
+        logger.info("Queued audiobook local backup job: audio_book_id=%s part_id=%s job_id=%s", audio_book_id, part_id, job_id)
+        start_audiobook_local_backup_worker(app)
+    except Exception as e:
+        logger.error("Failed to enqueue audiobook local backup job for part %s: %s", part_id, e, exc_info=True)
 
 def _callback_reaction_state_key(query) -> str | None:
     msg = getattr(query, "message", None)
@@ -360,8 +1144,7 @@ async def _send_salute_reaction_for_message(update: Update, context: ContextType
     await _send_reaction_for_message(update, context, "🫡")
 
 
-def _get_audio_channel_send_guard(context: ContextTypes.DEFAULT_TYPE, channel_id: int):
-    app = getattr(context, "application", None)
+def _get_audio_channel_send_guard_for_app(app, channel_id: int):
     bot_data = getattr(app, "bot_data", None) if app else None
     if not isinstance(bot_data, dict):
         return None, None
@@ -385,6 +1168,11 @@ def _get_audio_channel_send_guard(context: ContextTypes.DEFAULT_TYPE, channel_id
         states[channel_id] = state
     state.setdefault("next_allowed_at", 0.0)
     return lock, state
+
+
+def _get_audio_channel_send_guard(context: ContextTypes.DEFAULT_TYPE, channel_id: int):
+    app = getattr(context, "application", None)
+    return _get_audio_channel_send_guard_for_app(app, channel_id)
 
 
 def _coerce_int_id_list(raw: Any) -> list[int]:
@@ -1069,6 +1857,7 @@ def _schedule_bg_task(context: ContextTypes.DEFAULT_TYPE, coro) -> None:
 
 
 _AB_PAGE_SIZE = 10
+_AUDIOBOOK_PLAY_ALL_ACTIVE_KEY = "audiobook_play_all_active_jobs"
 _AB_PAGINATION_THRESHOLD = 10
 
 
@@ -1174,6 +1963,20 @@ async def _cache_audiobook_part_file_id(part: dict, message) -> None:
     new_file_unique_id = getattr(media, "file_unique_id", None)
     if not new_file_id:
         return
+    try:
+        preserve_storage_source = bool(
+            int(part.get("channel_id") or 0)
+            and int(part.get("channel_message_id") or 0)
+            and str(part.get("file_id") or "").strip()
+        )
+    except Exception:
+        preserve_storage_source = False
+    if preserve_storage_source:
+        logger.debug(
+            "Skipping audiobook file_id cache overwrite for storage-backed part_id=%s",
+            part.get("id"),
+        )
+        return
     part["file_id"] = new_file_id
     if new_file_unique_id:
         part["file_unique_id"] = new_file_unique_id
@@ -1213,17 +2016,25 @@ async def _send_audiobook_part_to_chat(
     reply_markup=None,
 ):
     file_id = str(part.get("file_id") or "").strip()
-    title = str(part.get("title") or f"Part {part.get('part_index', 0)}").strip() or None
     duration = part.get("duration_seconds")
     media_kind = _audiobook_part_media_kind(part)
     local_path = str(part.get("path") or "").strip()
+    title = _audiobook_send_title(part, local_path if local_path else None)
     cover_input = get_book_thumbnail_input() if media_kind in {"audio", "document"} else None
+    local_path_exists = bool(local_path and Path(local_path).exists() and media_kind in {"audio", "document"})
+    try:
+        channel_id = int(part.get("channel_id") or 0)
+        channel_message_id = int(part.get("channel_message_id") or 0)
+    except Exception:
+        channel_id = 0
+        channel_message_id = 0
+    has_storage_source = bool(channel_id and channel_message_id and file_id)
 
-    if file_id:
+    async def _send_by_file_id(target_file_id: str):
         send_attempts = (
-            ("audio", lambda: context.bot.send_audio(chat_id=chat_id, audio=file_id, caption=caption, title=title, duration=duration, reply_markup=reply_markup)),
-            ("voice", lambda: context.bot.send_voice(chat_id=chat_id, voice=file_id, caption=caption, duration=duration, reply_markup=reply_markup)),
-            ("document", lambda: context.bot.send_document(chat_id=chat_id, document=file_id, caption=caption, reply_markup=reply_markup)),
+            ("audio", lambda: context.bot.send_audio(chat_id=chat_id, audio=target_file_id, caption=caption, title=title, duration=duration, reply_markup=reply_markup)),
+            ("voice", lambda: context.bot.send_voice(chat_id=chat_id, voice=target_file_id, caption=caption, duration=duration, reply_markup=reply_markup)),
+            ("document", lambda: context.bot.send_document(chat_id=chat_id, document=target_file_id, caption=caption, reply_markup=reply_markup)),
         )
         for kind, sender in send_attempts:
             try:
@@ -1237,12 +2048,19 @@ async def _send_audiobook_part_to_chat(
                     part.get("id"),
                     e,
                 )
+        return None
 
-    if local_path and Path(local_path).exists():
+    async def _send_by_local_path(path_value: str):
         try:
-            filename = Path(local_path).name
+            logger.info(
+                "Sending audiobook part from processed local file: part_id=%s path=%s media_kind=%s",
+                part.get("id"),
+                path_value,
+                media_kind,
+            )
+            filename = Path(path_value).name
             if media_kind == "audio":
-                with open(local_path, "rb") as fh:
+                with open(path_value, "rb") as fh:
                     sent = await context.bot.send_audio(
                         chat_id=chat_id,
                         audio=InputFile(fh, filename=filename),
@@ -1253,7 +2071,7 @@ async def _send_audiobook_part_to_chat(
                         thumbnail=cover_input,
                     )
             elif media_kind == "voice":
-                with open(local_path, "rb") as fh:
+                with open(path_value, "rb") as fh:
                     sent = await context.bot.send_voice(
                         chat_id=chat_id,
                         voice=InputFile(fh, filename=filename),
@@ -1262,7 +2080,7 @@ async def _send_audiobook_part_to_chat(
                         reply_markup=reply_markup,
                     )
             else:
-                with open(local_path, "rb") as fh:
+                with open(path_value, "rb") as fh:
                     sent = await context.bot.send_document(
                         chat_id=chat_id,
                         document=InputFile(fh, filename=filename),
@@ -1276,16 +2094,42 @@ async def _send_audiobook_part_to_chat(
             logger.debug(
                 "Audiobook part local-path send failed for %s (%s): %s",
                 part.get("id"),
-                local_path,
+                path_value,
                 e,
             )
+            return None
 
-    try:
-        channel_id = int(part.get("channel_id") or 0)
-        channel_message_id = int(part.get("channel_message_id") or 0)
-    except Exception:
-        channel_id = 0
-        channel_message_id = 0
+    if has_storage_source:
+        logger.info(
+            "Sending audiobook part by refreshed storage file_id first: part_id=%s channel=%s message=%s",
+            part.get("id"),
+            channel_id,
+            channel_message_id,
+        )
+        sent = await _send_by_file_id(file_id)
+        if sent:
+            return sent
+
+    if file_id and not has_storage_source:
+        logger.info(
+            "Sending audiobook part by current source file_id while storage refresh is not ready yet: part_id=%s",
+            part.get("id"),
+        )
+        sent = await _send_by_file_id(file_id)
+        if sent:
+            return sent
+
+    if local_path_exists:
+        sent = await _send_by_local_path(local_path)
+        if sent:
+            return sent
+        if not has_storage_source:
+            logger.warning(
+                "Audiobook local processed fallback send failed for part_id=%s path=%s after current source file_id path also failed",
+                part.get("id"),
+                local_path,
+            )
+
     if channel_id and channel_message_id:
         try:
             forwarded = await context.bot.forward_message(
@@ -1616,134 +2460,15 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
         raise ApplicationHandlerStop()
 
-    # Optional: persist audiobook media in dedicated channels and use that message media file_id.
-    # If multiple channels are configured, pick one in round-robin.
-    audio_channel_ids = _resolve_audio_upload_channel_ids()
-    audio_channel_id = await _pick_audio_upload_channel_id(context, audio_channel_ids)
-    if audio_channel_id:
-        logger.info(
-            "Audiobook channel storage enabled: channels=%s selected=%s audiobook=%s part_index=%s",
-            ",".join(str(x) for x in (audio_channel_ids or [])) or str(audio_channel_id),
-            audio_channel_id,
-            audio_book_id,
-            part_index,
-        )
-        sent = None
-        last_err = None
-        send_retry_max = 5
-        try:
-            send_min_interval = max(0.0, float(os.getenv("AUDIO_UPLOAD_SEND_DELAY_SEC", "0.90") or "0.90"))
-        except Exception:
-            send_min_interval = 0.90
-
-        channel_lock, channel_state = _get_audio_channel_send_guard(context, int(audio_channel_id))
-
-        async def _send_once():
-            if getattr(msg, "audio", None):
-                return await context.bot.send_audio(chat_id=audio_channel_id, audio=file_id)
-            if getattr(msg, "voice", None):
-                return await context.bot.send_voice(chat_id=audio_channel_id, voice=file_id)
-            return await context.bot.send_document(chat_id=audio_channel_id, document=file_id)
-
-        for attempt in range(1, send_retry_max + 1):
-            try:
-                if channel_lock is not None:
-                    async with channel_lock:
-                        if isinstance(channel_state, dict):
-                            now_ts = asyncio.get_running_loop().time()
-                            next_allowed_at = float(channel_state.get("next_allowed_at", 0.0) or 0.0)
-                            if next_allowed_at > now_ts:
-                                await asyncio.sleep(next_allowed_at - now_ts)
-                        sent = await _send_once()
-                        if isinstance(channel_state, dict) and send_min_interval > 0:
-                            channel_state["next_allowed_at"] = asyncio.get_running_loop().time() + send_min_interval
-                else:
-                    sent = await _send_once()
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                retry_after = getattr(e, "retry_after", None)
-                if retry_after is not None and attempt < send_retry_max:
-                    wait_s = float(retry_after or 1) + 0.5
-                    if isinstance(channel_state, dict):
-                        channel_state["next_allowed_at"] = max(
-                            float(channel_state.get("next_allowed_at", 0.0) or 0.0),
-                            asyncio.get_running_loop().time() + wait_s,
-                        )
-                    logger.warning(
-                        "Audio channel flood control for channel %s, waiting %.2fs (attempt %s/%s)",
-                        audio_channel_id,
-                        wait_s,
-                        attempt,
-                        send_retry_max,
-                    )
-                    await asyncio.sleep(wait_s)
-                    continue
-                msg_text = str(e).lower()
-                transient = any(
-                    marker in msg_text
-                    for marker in ("timed out", "timeout", "network", "connection reset", "temporary failure")
-                )
-                if transient and attempt < send_retry_max:
-                    backoff = min(10.0, 0.5 * (2 ** (attempt - 1)))
-                    if isinstance(channel_state, dict):
-                        channel_state["next_allowed_at"] = max(
-                            float(channel_state.get("next_allowed_at", 0.0) or 0.0),
-                            asyncio.get_running_loop().time() + backoff,
-                        )
-                    logger.warning(
-                        "Audio channel transient error for channel %s: %s (attempt %s/%s, wait %.2fs)",
-                        audio_channel_id,
-                        e,
-                        attempt,
-                        send_retry_max,
-                        backoff,
-                    )
-                    await asyncio.sleep(backoff)
-                    continue
-                logger.error("Failed to send audiobook media to audio channel %s: %s", audio_channel_id, e)
-                break
-
-        if not sent:
-            err_text = (str(last_err).strip() if last_err else "unknown error")
-            try:
-                await msg.reply_text(
-                    f"❌ Failed to store this audio in the audio channel.\n{err_text[:180]}"
-                )
-            except Exception:
-                pass
-            if last_err is not None:
-                logger.error("Audiobook channel storage failed after retries: %s", last_err)
-            raise ApplicationHandlerStop()
-
-        stored_channel_id = int(audio_channel_id)
-        stored_channel_message_id = int(getattr(sent, "message_id", 0) or 0) or None
-        sent_media = getattr(sent, "audio", None) or getattr(sent, "voice", None) or getattr(sent, "document", None)
-        if sent_media is not None:
-            new_file_id = getattr(sent_media, "file_id", None)
-            new_file_unique = getattr(sent_media, "file_unique_id", None)
-            if new_file_id:
-                file_id = new_file_id
-            if new_file_unique:
-                file_unique = new_file_unique
-            if duration is None:
-                duration = getattr(sent_media, "duration", None)
-            if not title:
-                title = getattr(sent_media, "file_name", None)
-        logger.info(
-            "Audiobook media stored in channel=%s message_id=%s audiobook=%s part_index=%s",
-            stored_channel_id,
-            stored_channel_message_id,
-            audio_book_id,
-            part_index,
-        )
-    else:
-        logger.info(
-            "Audiobook channel storage disabled (AUDIO_UPLOAD_CHANNEL_IDS/AUDIO_UPLOAD_CHANNEL_ID is empty). audiobook=%s part_index=%s",
-            audio_book_id,
-            part_index,
-        )
+    # Keep the original incoming file_id for now. The background local-backup worker
+    # will download it, clean the name, apply the cover, and upload the processed
+    # file to the storage channel once, producing the fresh final file_id.
+    logger.info(
+        "Audiobook part queued for local processing before storage upload: audiobook=%s part_index=%s media_kind=%s",
+        audio_book_id,
+        part_index,
+        media_kind,
+    )
 
     # In insert mode: shift existing parts >= part_index up by 1 to make room
     if is_insert_mode:
@@ -1799,6 +2524,25 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text(MESSAGES[lang].get("audiobook_part_saved", "✅ Part #{index} saved.").format(index=part_index))
     except Exception:
         pass
+
+    _schedule_bg_task(
+        context,
+        _enqueue_audiobook_local_backup(
+            context.application,
+            audio_book_id,
+            {
+                "id": part_id,
+                "part_index": part_index,
+                "title": title,
+                "file_id": file_id,
+                "file_unique_id": file_unique,
+                "media_kind": media_kind,
+                "duration_seconds": duration,
+                "channel_id": stored_channel_id,
+                "channel_message_id": stored_channel_message_id,
+            },
+        ),
+    )
 
     # Auto-notify users who requested audiobook for this specific book.
     try:
@@ -1938,8 +2682,6 @@ def _build_audiobook_panel_text(
     audio_book: dict,
     parts: list[dict],
     lang: str,
-    *,
-    listened_count: int = 0,
 ) -> str:
     msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
     title = str(audio_book.get("display_title") or audio_book.get("title") or "Audiobook").strip() or "Audiobook"
@@ -1949,16 +2691,7 @@ def _build_audiobook_panel_text(
         "audiobook_listen_panel",
         "🎧 {title}\n🎵 {parts} parts • 🕒 {duration}\n👇 Start listening or choose a specific part.",
     )
-    text = template.format(title=title, parts=parts_count, duration=duration_text)
-    if parts_count > 0:
-        text += "\n" + msgs.get(
-            "audiobook_progress_summary",
-            "✅ Listened: {listened}/{total}",
-        ).format(
-            listened=max(0, min(int(listened_count or 0), parts_count)),
-            total=parts_count,
-        )
-    return text
+    return template.format(title=title, parts=parts_count, duration=duration_text)
 
 
 def _build_audiobook_listen_keyboard(
@@ -1966,22 +2699,22 @@ def _build_audiobook_listen_keyboard(
     parts: list[dict],
     lang: str,
     page: int = 0,
-    *,
-    listened_part_ids: set[str] | None = None,
 ) -> InlineKeyboardMarkup:
     msgs = MESSAGES.get(lang, MESSAGES.get("en", {}))
     parts_per_page = 10
     total_pages = max(1, (len(parts) + parts_per_page - 1) // parts_per_page)
     page = max(0, min(page, total_pages - 1))
     page_parts = parts[page * parts_per_page:(page + 1) * parts_per_page]
-    listened_part_ids = listened_part_ids or set()
-
     rows: list[list[InlineKeyboardButton]] = []
-    first_part_id = str((parts[0] if parts else {}).get("id") or "").strip()
-    if first_part_id:
-        rows.append(
-            [InlineKeyboardButton(msgs.get("audiobook_start_button", "▶ Start"), callback_data=f"abplay:{first_part_id}")]
-        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                msgs.get("audiobook_play_all_button", "🎧 Barchasini tinglash"),
+                callback_data=f"abplayall:{book_id}",
+            )
+        ]
+    )
 
     row: list[InlineKeyboardButton] = []
     for part in page_parts:
@@ -1993,8 +2726,6 @@ def _build_audiobook_listen_keyboard(
         if not part_id or part_index <= 0:
             continue
         label = _audiobook_part_button_text(lang, part_index)
-        if part_id in listened_part_ids:
-            label = f"✓ {label}"
         row.append(
             InlineKeyboardButton(
                 label,
@@ -2082,6 +2813,53 @@ def _build_audiobook_part_controls(
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+async def _send_full_audiobook_parts(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    audio_book: dict,
+    parts: list[dict],
+    lang: str,
+) -> tuple[int, int]:
+    sent_count = 0
+    total = len(parts)
+    title = str(audio_book.get("display_title") or audio_book.get("title") or "Audiobook").strip() or "Audiobook"
+
+    for idx, part in enumerate(parts, start=1):
+        caption = MESSAGES[lang].get(
+            "audiobook_part_caption",
+            "🎧 {title}\n🎵 Part {current}/{total}",
+        ).format(
+            title=title,
+            current=int(part.get("part_index") or idx) or idx,
+            total=total,
+        )
+        sent = await _send_audiobook_part_to_chat(
+            context,
+            chat_id,
+            part,
+            caption=caption,
+            reply_markup=None,
+        )
+        if sent:
+            sent_count += 1
+            await asyncio.sleep(0.25)
+
+    return sent_count, total
+
+
+def _get_audiobook_play_all_active_jobs(context: ContextTypes.DEFAULT_TYPE) -> set[tuple[int, str]]:
+    data = getattr(context.application, "bot_data", None)
+    if not isinstance(data, dict):
+        return set()
+    jobs = data.get(_AUDIOBOOK_PLAY_ALL_ACTIVE_KEY)
+    if isinstance(jobs, set):
+        return jobs
+    jobs = set()
+    data[_AUDIOBOOK_PLAY_ALL_ACTIVE_KEY] = jobs
+    return jobs
+
+
 async def handle_audiobook_listen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle user request to listen to an audiobook (show audio parts)."""
     logger.debug("handle_audiobook_listen_callback called")
@@ -2118,29 +2896,13 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
         await _handle_missing_audiobook_request(update, context, query, lang, book_id)
         return
 
-    user_id = int(query.from_user.id or 0) if query.from_user else 0
-    listened_part_ids: set[str] = set()
-    if user_id:
-        try:
-            listened_part_ids = set(
-                await run_blocking(list_user_audiobook_listened_part_ids, user_id, str(audio_book.get("id") or ""))
-            )
-        except Exception as e:
-            logger.debug("Failed to load listened audiobook parts for user=%s audiobook=%s: %s", user_id, audio_book.get("id"), e)
-
     context.user_data[f"abook_page_{book_id}"] = 0
-    text = _build_audiobook_panel_text(
-        audio_book,
-        all_parts,
-        lang,
-        listened_count=len(listened_part_ids),
-    )
+    text = _build_audiobook_panel_text(audio_book, all_parts, lang)
     keyboard = _build_audiobook_listen_keyboard(
         book_id,
         all_parts,
         lang,
         page=0,
-        listened_part_ids=listened_part_ids,
     )
 
     try:
@@ -2151,6 +2913,86 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
         return
 
     await safe_answer(query)
+
+
+async def handle_audiobook_play_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send all parts of an audiobook in order while keeping the current parts panel unchanged."""
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    limited, wait_s = spam_check_callback(update, context)
+    if limited:
+        await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
+        return
+    data = query.data or ""
+    if not data.startswith("abplayall:"):
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        return
+    book_id = data.split(":", 1)[1]
+
+    audio_book = await run_blocking(get_audio_book_for_book, book_id)
+    if not audio_book:
+        await safe_answer(query, MESSAGES[lang].get("audiobook_not_found", "Audiobook not found"), show_alert=True)
+        return
+
+    all_parts = await run_blocking(list_audio_book_parts, audio_book.get("id"))
+    if not all_parts:
+        await safe_answer(query, MESSAGES[lang].get("audiobook_no_parts", "No audio parts found"), show_alert=True)
+        return
+
+    try:
+        chat_id = int(query.message.chat_id)
+    except Exception:
+        chat_id = 0
+    audio_book_id = str(audio_book.get("id") or "").strip()
+    active_jobs = _get_audiobook_play_all_active_jobs(context)
+    job_key = (chat_id, audio_book_id)
+    if chat_id and audio_book_id and job_key in active_jobs:
+        await safe_answer(
+            query,
+            MESSAGES[lang].get("audiobook_play_all_busy", "⏳ This audiobook is already being sent."),
+            show_alert=True,
+        )
+        return
+    if chat_id and audio_book_id:
+        active_jobs.add(job_key)
+
+    await safe_answer(query, MESSAGES[lang].get("audiobook_play_all_started", "🎧 Sending all audiobook parts..."))
+
+    async def _runner():
+        try:
+            sent_count, total = await _send_full_audiobook_parts(
+                context,
+                chat_id=query.message.chat_id,
+                audio_book=audio_book,
+                parts=all_parts,
+                lang=lang,
+            )
+            if sent_count <= 0:
+                try:
+                    await query.message.reply_text(
+                        MESSAGES[lang].get("audiobook_play_all_failed", "Failed to send audiobook parts."),
+                    )
+                except Exception:
+                    pass
+                return
+            _schedule_bg_task(context, _run_db_retry(increment_audio_book_download, str(audio_book.get("id") or "")))
+            if sent_count < total:
+                try:
+                    await query.message.reply_text(
+                        MESSAGES[lang].get(
+                            "audiobook_play_all_partial",
+                            "Sent {sent}/{total} parts.",
+                        ).format(sent=sent_count, total=total),
+                    )
+                except Exception:
+                    pass
+        finally:
+            if chat_id and audio_book_id:
+                active_jobs.discard(job_key)
+
+    _schedule_bg_task(context, _runner())
 
 
 async def handle_audiobook_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2193,28 +3035,12 @@ async def handle_audiobook_page_callback(update: Update, context: ContextTypes.D
         await safe_answer(query, MESSAGES[lang].get("audiobook_no_parts", "No audio parts found"), show_alert=True)
         return
 
-    user_id = int(query.from_user.id or 0) if query.from_user else 0
-    listened_part_ids: set[str] = set()
-    if user_id:
-        try:
-            listened_part_ids = set(
-                await run_blocking(list_user_audiobook_listened_part_ids, user_id, str(audio_book.get("id") or ""))
-            )
-        except Exception:
-            listened_part_ids = set()
-
-    text = _build_audiobook_panel_text(
-        audio_book,
-        all_parts,
-        lang,
-        listened_count=len(listened_part_ids),
-    )
+    text = _build_audiobook_panel_text(audio_book, all_parts, lang)
     keyboard = _build_audiobook_listen_keyboard(
         book_id,
         all_parts,
         lang,
         page=current_page,
-        listened_part_ids=listened_part_ids,
     )
     
     try:
@@ -2292,46 +3118,6 @@ async def handle_audiobook_part_play_callback(update: Update, context: ContextTy
         reply_markup=reply_markup,
     )
     if sent:
-        user_id = int(query.from_user.id or 0) if query.from_user else 0
-        if user_id:
-            _schedule_bg_task(
-                context,
-                _run_db_retry(
-                    record_user_audiobook_progress,
-                    user_id,
-                    audio_book_id,
-                    part_id,
-                    current_part_number,
-                    len(all_parts),
-                ),
-            )
-            listened_part_ids = set()
-            try:
-                listened_part_ids = set(
-                    await run_blocking(list_user_audiobook_listened_part_ids, user_id, audio_book_id)
-                )
-            except Exception:
-                listened_part_ids = set()
-            listened_part_ids.add(part_id)
-            current_page = int(context.user_data.get(f"abook_page_{book_id}", 0) or 0)
-            try:
-                await query.message.edit_text(
-                    _build_audiobook_panel_text(
-                        audio_book,
-                        all_parts,
-                        lang,
-                        listened_count=len(listened_part_ids),
-                    ),
-                    reply_markup=_build_audiobook_listen_keyboard(
-                        book_id,
-                        all_parts,
-                        lang,
-                        page=current_page,
-                        listened_part_ids=listened_part_ids,
-                    ),
-                )
-            except Exception:
-                pass
         _schedule_bg_task(context, _run_db_retry(increment_audio_book_download, audio_book_id))
         await safe_answer(query)
         return
@@ -2365,8 +3151,16 @@ async def handle_audiobook_part_delete_callback(update: Update, context: Context
     if not part:
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
-    # delete the part
-    await run_blocking(delete_audio_book_part, part_id)
+    local_paths = [str(part.get("path") or "").strip()] if str(part.get("path") or "").strip() else []
+    deleted = await run_blocking(delete_audio_book_part, part_id)
+    if deleted and local_paths:
+        cleanup = await asyncio.to_thread(_delete_local_audiobook_paths, local_paths)
+        logger.info(
+            "Audiobook part delete cleanup: part_id=%s local_deleted=%s local_failed=%s",
+            part_id,
+            cleanup.get("deleted", 0),
+            cleanup.get("failed", 0),
+        )
     await safe_answer(query, MESSAGES[lang].get("audiobook_part_deleted", "✅ Part deleted."))
     try:
         await query.message.reply_text(MESSAGES[lang].get("audiobook_part_deleted", "✅ Part deleted."))
@@ -2397,8 +3191,18 @@ async def handle_audiobook_delete_callback(update: Update, context: ContextTypes
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     audio_book_id = data.split(":", 1)[1]
+    parts = await run_blocking(list_audio_book_parts, audio_book_id)
+    local_paths = [str(item.get("path") or "").strip() for item in (parts or []) if str(item.get("path") or "").strip()]
     # delete the audiobook (cascades to parts)
-    await run_blocking(delete_audio_book, audio_book_id)
+    deleted = await run_blocking(delete_audio_book, audio_book_id)
+    if deleted and local_paths:
+        cleanup = await asyncio.to_thread(_delete_local_audiobook_paths, local_paths)
+        logger.info(
+            "Audiobook delete cleanup: audio_book_id=%s local_deleted=%s local_failed=%s",
+            audio_book_id,
+            cleanup.get("deleted", 0),
+            cleanup.get("failed", 0),
+        )
     await safe_answer(query, MESSAGES[lang].get("audiobook_deleted", "✅ Audiobook deleted."))
     try:
         await query.message.reply_text(MESSAGES[lang].get("audiobook_deleted", "✅ Audiobook deleted."))
@@ -2429,8 +3233,28 @@ async def handle_audiobook_delete_by_book_callback(update: Update, context: Cont
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     book_id = data.split(":", 1)[1]
+    audio_books = await run_blocking(list_audio_books_by_book_id, book_id)
+    local_paths: list[str] = []
+    for audio_book in audio_books or []:
+        audio_book_id = str((audio_book or {}).get("id") or "").strip()
+        if not audio_book_id:
+            continue
+        parts = await run_blocking(list_audio_book_parts, audio_book_id)
+        local_paths.extend(
+            str(item.get("path") or "").strip()
+            for item in (parts or [])
+            if str(item.get("path") or "").strip()
+        )
     deleted = await run_blocking(delete_audio_books_by_book_id, book_id)
     if deleted > 0:
+        if local_paths:
+            cleanup = await asyncio.to_thread(_delete_local_audiobook_paths, local_paths)
+            logger.info(
+                "Audiobook delete-by-book cleanup: book_id=%s local_deleted=%s local_failed=%s",
+                book_id,
+                cleanup.get("deleted", 0),
+                cleanup.get("failed", 0),
+            )
         text = MESSAGES[lang].get(
             "audiobook_delete_all_done",
             "✅ All audios for this book were deleted.",
@@ -3097,7 +3921,6 @@ from db import (
     create_audio_book_for_book,
     insert_audio_book_part,
     list_audio_book_parts,
-    list_user_audiobook_listened_part_ids,
     get_audio_book_part,
     update_audio_book_part_media,
     get_audio_book_part_by_file_unique_id_and_audio_book,
@@ -3106,7 +3929,6 @@ from db import (
     delete_audio_books_by_book_id,
     increment_audio_book_download,
     increment_audio_book_searches,
-    record_user_audiobook_progress,
     shift_audio_book_parts_from,
     enqueue_audio_book_part_local_download_job,
     claim_audio_book_part_local_download_job,

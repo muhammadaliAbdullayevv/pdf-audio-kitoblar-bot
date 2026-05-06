@@ -1526,9 +1526,21 @@ async def handle_summary_placeholder_callback(update: Update, context: ContextTy
         "chat_id": chat_id,
         "reply_to_message_id": reply_to_message_id,
     }
-    job_id = db_enqueue_background_job("book_summary", user_id, job_data)
-    if not job_id:
-        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+    job_meta = db_enqueue_background_job(
+        "book_summary",
+        user_id,
+        job_data,
+        chat_id=chat_id,
+        message_id=reply_to_message_id,
+        return_meta=True,
+    )
+    if not job_meta or not job_meta.get("ok"):
+        reason = str((job_meta or {}).get("reason") or "")
+        await safe_answer(
+            query,
+            MESSAGES[lang]["job_limit_wait"] if reason in {"pending_limit", "running_limit"} else MESSAGES[lang]["error"],
+            show_alert=True,
+        )
         return
     await safe_answer(query)
     if query.message:

@@ -3,6 +3,7 @@ import logging
 import re
 import json
 import uuid
+import base64
 from contextlib import contextmanager
 from datetime import datetime, date
 from typing import Any, Iterable
@@ -23,6 +24,19 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+BG_STATUS_PENDING = "PENDING"
+BG_STATUS_RUNNING = "RUNNING"
+BG_STATUS_DONE = "DONE"
+BG_STATUS_FAILED = "FAILED"
+BG_STATUS_CANCELLED = "CANCELLED"
+
+_BG_PENDING_ALIASES = ("queued", BG_STATUS_PENDING)
+_BG_RUNNING_ALIASES = ("processing", BG_STATUS_RUNNING)
+_BG_DONE_ALIASES = ("completed", BG_STATUS_DONE)
+_BG_FAILED_ALIASES = ("failed", BG_STATUS_FAILED)
+_BG_CANCELLED_ALIASES = ("cancelled", BG_STATUS_CANCELLED)
+_BG_ACTIVE_ALIASES = _BG_PENDING_ALIASES + _BG_RUNNING_ALIASES
+
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_PATH = os.path.join(_BASE_DIR, ".env")
 _PROJECT_DOTENV = dotenv_values(_ENV_PATH) if callable(dotenv_values) and os.path.exists(_ENV_PATH) else {}
@@ -35,6 +49,87 @@ def _env_project_first(name: str, default: str = "") -> str:
         if text:
             return text
     return str(os.getenv(name, default) or "").strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(_env_project_first(name, str(default)) or str(default))
+    except Exception:
+        return int(default)
+
+
+def _background_job_owner_id() -> int:
+    try:
+        return int(_env_project_first("TELEGRAM_OWNER_ID", "0") or "0")
+    except Exception:
+        return 0
+
+
+def _background_job_limit_running() -> int:
+    return max(1, _env_int("MAX_RUNNING_JOBS_PER_USER", 2))
+
+
+def _background_job_limit_pending() -> int:
+    return max(1, _env_int("MAX_PENDING_JOBS_PER_USER", 5))
+
+
+def _background_job_user_has_limit_bypass(user_id: int) -> bool:
+    owner_id = _background_job_owner_id()
+    return bool(owner_id and int(user_id or 0) == owner_id)
+
+
+def _normalize_background_job_status(raw: str | None) -> str:
+    status = str(raw or "").strip().upper()
+    if status == BG_STATUS_PENDING or status == "QUEUED":
+        return BG_STATUS_PENDING
+    if status == BG_STATUS_RUNNING or status == "PROCESSING":
+        return BG_STATUS_RUNNING
+    if status == BG_STATUS_DONE or status == "COMPLETED":
+        return BG_STATUS_DONE
+    if status == BG_STATUS_FAILED:
+        return BG_STATUS_FAILED
+    if status == BG_STATUS_CANCELLED:
+        return BG_STATUS_CANCELLED
+    return status or BG_STATUS_PENDING
+
+
+def _bg_payload_to_jsonable(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {"__kind__": "bytes_b64", "data": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, bytearray):
+        return {"__kind__": "bytes_b64", "data": base64.b64encode(bytes(value)).decode("ascii")}
+    if isinstance(value, dict):
+        return {str(k): _bg_payload_to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_bg_payload_to_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def serialize_background_job_payload(payload: dict | None) -> tuple[str, str]:
+    clean = _bg_payload_to_jsonable(payload or {})
+    text = json.dumps(clean, ensure_ascii=False)
+    return text, text
+
+
+def deserialize_background_job_payload(payload: Any) -> Any:
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload or "{}")
+        except Exception:
+            return {}
+    if isinstance(payload, dict):
+        kind = str(payload.get("__kind__") or "").strip()
+        if kind == "bytes_b64":
+            try:
+                return base64.b64decode(str(payload.get("data") or "").encode("ascii"))
+            except Exception:
+                return b""
+        return {k: deserialize_background_job_payload(v) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [deserialize_background_job_payload(v) for v in payload]
+    return payload
 
 
 def _ensure_schema_migrations(cur) -> None:
@@ -257,6 +352,69 @@ def _apply_schema_migrations(cur) -> None:
                 "ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS channel_id BIGINT;",
                 "ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS channel_message_id BIGINT;",
                 "ALTER TABLE audio_book_parts ADD COLUMN IF NOT EXISTS display_order BIGINT;",
+            ],
+        ),
+        (
+            22,
+            "background jobs: production worker fields, statuses, and indexes",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS background_jobs (
+                    id TEXT PRIMARY KEY,
+                    job_type TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT,
+                    message_id BIGINT,
+                    data_json TEXT NOT NULL DEFAULT '{}',
+                    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    result_json JSONB,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    idempotency_key TEXT,
+                    next_attempt_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    locked_at TIMESTAMP,
+                    locked_by TEXT,
+                    worker_id TEXT,
+                    started_at TIMESTAMP,
+                    finished_at TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    error_message TEXT,
+                    last_error TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS chat_id BIGINT;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS message_id BIGINT;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 100;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS payload_json JSONB;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS result_json JSONB;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS locked_by TEXT;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS error_message TEXT;",
+                "ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
+                "UPDATE background_jobs SET payload_json = COALESCE(payload_json, CASE WHEN data_json IS NULL OR BTRIM(data_json) = '' THEN '{}'::jsonb ELSE data_json::jsonb END) WHERE payload_json IS NULL;",
+                "UPDATE background_jobs SET status = 'PENDING' WHERE UPPER(COALESCE(status, '')) = 'QUEUED';",
+                "UPDATE background_jobs SET status = 'RUNNING' WHERE UPPER(COALESCE(status, '')) = 'PROCESSING';",
+                "UPDATE background_jobs SET status = 'DONE' WHERE UPPER(COALESCE(status, '')) = 'COMPLETED';",
+                "UPDATE background_jobs SET status = 'FAILED' WHERE UPPER(COALESCE(status, '')) = 'FAILED';",
+                "UPDATE background_jobs SET status = 'CANCELLED' WHERE UPPER(COALESCE(status, '')) = 'CANCELLED';",
+                "UPDATE background_jobs SET locked_by = COALESCE(locked_by, worker_id) WHERE locked_by IS NULL AND worker_id IS NOT NULL;",
+                "UPDATE background_jobs SET error_message = COALESCE(error_message, last_error) WHERE error_message IS NULL AND last_error IS NOT NULL;",
+                "UPDATE background_jobs SET finished_at = COALESCE(finished_at, completed_at) WHERE finished_at IS NULL AND completed_at IS NOT NULL;",
+                "UPDATE background_jobs SET started_at = COALESCE(started_at, locked_at) WHERE started_at IS NULL AND locked_at IS NOT NULL;",
+                "CREATE INDEX IF NOT EXISTS idx_background_jobs_user_id ON background_jobs (user_id);",
+                "CREATE INDEX IF NOT EXISTS idx_background_jobs_status ON background_jobs (status);",
+                "CREATE INDEX IF NOT EXISTS idx_background_jobs_next_attempt_at ON background_jobs (next_attempt_at);",
+                "CREATE INDEX IF NOT EXISTS idx_background_jobs_job_type ON background_jobs (job_type);",
+                "CREATE INDEX IF NOT EXISTS idx_background_jobs_claim ON background_jobs (status, priority, next_attempt_at, created_at);",
+                "CREATE INDEX IF NOT EXISTS idx_background_jobs_idempotency ON background_jobs (user_id, idempotency_key, status);",
+                "CREATE INDEX IF NOT EXISTS idx_background_jobs_locked_at ON background_jobs (locked_at) WHERE locked_at IS NOT NULL;",
             ],
         ),
     ]
@@ -3560,6 +3718,26 @@ def get_audio_book_for_book(book_id: str) -> dict | None:
             return dict(row) if row else None
 
 
+def list_audio_books_by_book_id(book_id: str) -> list[dict]:
+    if not book_id:
+        return []
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM audio_books
+                WHERE book_id=%s
+                ORDER BY
+                    display_order DESC NULLS LAST,
+                    created_at DESC
+                """,
+                (book_id,),
+            )
+            rows = cur.fetchall() or []
+            return [dict(r) for r in rows]
+
+
 def get_audio_book_by_id(audio_book_id: str) -> dict | None:
     if not audio_book_id:
         return None
@@ -3727,6 +3905,7 @@ def update_audio_book_part_media(
     file_id: str | None = None,
     file_unique_id: str | None = None,
     path: str | None = None,
+    title: str | None = None,
     media_kind: str | None = None,
     duration_seconds: int | None = None,
     channel_id: int | None = None,
@@ -3745,6 +3924,9 @@ def update_audio_book_part_media(
     if path is not None:
         fields.append("path=%s")
         values.append(str(path))
+    if title is not None:
+        fields.append("title=%s")
+        values.append(str(title))
     if media_kind is not None:
         fields.append("media_kind=%s")
         values.append(str(media_kind))
@@ -4268,34 +4450,224 @@ def get_storage_stats() -> dict:
 
 # Background Jobs
 
-def enqueue_background_job(job_type: str, user_id: int, data: dict) -> str | None:
-    job_type = str(job_type or "").strip()
-    user_id = int(user_id or 0)
-    if not job_type or not user_id:
-        return None
-    import json
-    data_json = json.dumps(data or {}, ensure_ascii=False)
-    job_id = uuid.uuid4().hex
+def get_background_job_user_usage(user_id: int) -> dict[str, int]:
+    usage = {"pending": 0, "running": 0, "done": 0, "failed": 0, "cancelled": 0, "total": 0}
+    try:
+        user_id = int(user_id or 0)
+    except Exception:
+        user_id = 0
+    if not user_id:
+        return usage
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO background_jobs (
-                    id, job_type, user_id, data_json,
-                    status, attempts, max_attempts, next_attempt_at,
-                    locked_at, worker_id, last_error, completed_at,
-                    created_at, updated_at
-                )
-                VALUES (%s,%s,%s,%s,'queued',0,3,NOW(),NULL,NULL,NULL,NULL,NOW(),NOW())
+                SELECT UPPER(COALESCE(status, 'PENDING')) AS status_key, COUNT(*)::int
+                FROM background_jobs
+                WHERE user_id = %s
+                GROUP BY UPPER(COALESCE(status, 'PENDING'))
                 """,
-                (job_id, job_type, user_id, data_json),
+                (user_id,),
             )
-    return job_id
+            for status_key, count in (cur.fetchall() or []):
+                key = _normalize_background_job_status(status_key)
+                try:
+                    value = int(count or 0)
+                except Exception:
+                    value = 0
+                if key == BG_STATUS_PENDING:
+                    usage["pending"] += value
+                elif key == BG_STATUS_RUNNING:
+                    usage["running"] += value
+                elif key == BG_STATUS_DONE:
+                    usage["done"] += value
+                elif key == BG_STATUS_FAILED:
+                    usage["failed"] += value
+                elif key == BG_STATUS_CANCELLED:
+                    usage["cancelled"] += value
+                usage["total"] += value
+    return usage
 
 
-def claim_background_job(worker_id: str, stale_after_seconds: int = 1800) -> dict | None:
+def create_background_job(
+    job_type: str,
+    user_id: int,
+    data: dict | None,
+    *,
+    chat_id: int | None = None,
+    message_id: int | None = None,
+    priority: int = 100,
+    max_attempts: int = 3,
+    idempotency_key: str | None = None,
+    ignore_limits: bool = False,
+) -> dict[str, Any]:
+    job_type = str(job_type or "").strip()
+    try:
+        user_id = int(user_id or 0)
+    except Exception:
+        user_id = 0
+    if not job_type or not user_id:
+        return {"ok": False, "job_id": None, "reason": "invalid"}
+
+    payload = data or {}
+    data_json, payload_json = serialize_background_job_payload(payload)
+    priority = max(1, int(priority or 100))
+    max_attempts = max(1, int(max_attempts or 3))
+    idem = str(idempotency_key or "").strip() or None
+    bypass_limits = bool(ignore_limits) or _background_job_user_has_limit_bypass(user_id)
+    pending_limit = _background_job_limit_pending()
+    running_limit = _background_job_limit_running()
+
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if idem:
+                cur.execute(
+                    """
+                    SELECT id, status
+                    FROM background_jobs
+                    WHERE user_id = %s
+                      AND idempotency_key = %s
+                      AND UPPER(COALESCE(status, 'PENDING')) IN ('PENDING', 'RUNNING', 'QUEUED', 'PROCESSING')
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (user_id, idem),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    return {
+                        "ok": True,
+                        "job_id": str(existing.get("id") or "").strip() or None,
+                        "reason": "existing",
+                    }
+
+            if not bypass_limits:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (
+                            WHERE UPPER(COALESCE(status, 'PENDING')) IN ('PENDING', 'QUEUED')
+                        )::int AS pending_count,
+                        COUNT(*) FILTER (
+                            WHERE UPPER(COALESCE(status, 'PENDING')) IN ('RUNNING', 'PROCESSING')
+                        )::int AS running_count
+                    FROM background_jobs
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone() or {}
+                pending_count = int(row.get("pending_count") or 0)
+                running_count = int(row.get("running_count") or 0)
+                if running_count >= running_limit:
+                    return {
+                        "ok": False,
+                        "job_id": None,
+                        "reason": "running_limit",
+                        "pending_count": pending_count,
+                        "running_count": running_count,
+                    }
+                if pending_count >= pending_limit:
+                    return {
+                        "ok": False,
+                        "job_id": None,
+                        "reason": "pending_limit",
+                        "pending_count": pending_count,
+                        "running_count": running_count,
+                    }
+
+            job_id = uuid.uuid4().hex
+            cur.execute(
+                """
+                INSERT INTO background_jobs (
+                    id,
+                    job_type,
+                    user_id,
+                    chat_id,
+                    message_id,
+                    data_json,
+                    payload_json,
+                    status,
+                    priority,
+                    progress,
+                    attempts,
+                    max_attempts,
+                    idempotency_key,
+                    next_attempt_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s::jsonb,
+                    %s, %s, 0, 0, %s, %s, NOW(), NOW(), NOW()
+                )
+                """,
+                (
+                    job_id,
+                    job_type,
+                    user_id,
+                    int(chat_id) if chat_id is not None else None,
+                    int(message_id) if message_id is not None else None,
+                    data_json,
+                    payload_json,
+                    BG_STATUS_PENDING,
+                    priority,
+                    max_attempts,
+                    idem,
+                ),
+            )
+    logger.info(
+        "background job created: job_id=%s job_type=%s user_id=%s chat_id=%s priority=%s",
+        job_id,
+        job_type,
+        user_id,
+        chat_id,
+        priority,
+    )
+    return {"ok": True, "job_id": job_id, "reason": None}
+
+
+def enqueue_background_job(
+    job_type: str,
+    user_id: int,
+    data: dict,
+    *,
+    chat_id: int | None = None,
+    message_id: int | None = None,
+    priority: int = 100,
+    max_attempts: int = 3,
+    idempotency_key: str | None = None,
+    ignore_limits: bool = False,
+    return_meta: bool = False,
+) -> str | dict[str, Any] | None:
+    meta = create_background_job(
+        job_type,
+        user_id,
+        data,
+        chat_id=chat_id,
+        message_id=message_id,
+        priority=priority,
+        max_attempts=max_attempts,
+        idempotency_key=idempotency_key,
+        ignore_limits=ignore_limits,
+    )
+    if return_meta:
+        return meta
+    if meta.get("ok"):
+        return str(meta.get("job_id") or "").strip() or None
+    return None
+
+
+def claim_background_job(
+    worker_id: str,
+    stale_after_seconds: int = 1800,
+    allowed_job_types: list[str] | tuple[str, ...] | None = None,
+    excluded_job_types: list[str] | tuple[str, ...] | None = None,
+) -> dict | None:
     worker_id = str(worker_id or "").strip() or "worker"
     stale_after_seconds = max(60, int(stale_after_seconds or 1800))
+    allowed_job_types = [str(item or "").strip() for item in (allowed_job_types or []) if str(item or "").strip()]
+    excluded_job_types = [str(item or "").strip() for item in (excluded_job_types or []) if str(item or "").strip()]
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -4303,54 +4675,108 @@ def claim_background_job(worker_id: str, stale_after_seconds: int = 1800) -> dic
                 WITH candidate AS (
                     SELECT id
                     FROM background_jobs
-                    WHERE next_attempt_at <= NOW()
+                    WHERE COALESCE(next_attempt_at, NOW()) <= NOW()
                       AND (
-                          status = 'queued'
+                          COALESCE(array_length(%s::text[], 1), 0) = 0
+                          OR job_type = ANY(%s)
+                      )
+                      AND (
+                          COALESCE(array_length(%s::text[], 1), 0) = 0
+                          OR NOT (job_type = ANY(%s))
+                      )
+                      AND (
+                          UPPER(COALESCE(status, 'PENDING')) IN ('PENDING', 'QUEUED')
                           OR (
-                              status = 'processing'
+                              UPPER(COALESCE(status, 'PENDING')) IN ('RUNNING', 'PROCESSING')
                               AND locked_at IS NOT NULL
                               AND locked_at < NOW() - (%s * INTERVAL '1 second')
                           )
                       )
-                    ORDER BY next_attempt_at ASC, created_at ASC, id ASC
+                    ORDER BY priority ASC, next_attempt_at ASC, created_at ASC, id ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )
                 UPDATE background_jobs j
                 SET
-                    status='processing',
+                    status=%s,
                     attempts=attempts + 1,
+                    progress=GREATEST(COALESCE(progress, 0), 1),
                     locked_at=NOW(),
+                    locked_by=%s,
                     worker_id=%s,
+                    started_at=COALESCE(j.started_at, NOW()),
                     updated_at=NOW()
                 FROM candidate
                 WHERE j.id = candidate.id
                 RETURNING j.*
                 """,
-                (stale_after_seconds, worker_id),
+                (
+                    allowed_job_types,
+                    allowed_job_types,
+                    excluded_job_types,
+                    excluded_job_types,
+                    stale_after_seconds,
+                    BG_STATUS_RUNNING,
+                    worker_id,
+                    worker_id,
+                ),
             )
             row = cur.fetchone()
             return dict(row) if row else None
 
 
-def complete_background_job(job_id: str) -> int:
+def complete_background_job(job_id: str, result: dict | None = None) -> int:
     job_id = str(job_id or "").strip()
     if not job_id:
         return 0
+    result_json, _ = serialize_background_job_payload(result or {})
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE background_jobs
-                SET status='completed',
+                SET status=%s,
+                    result_json=CASE
+                        WHEN %s::jsonb = '{}'::jsonb AND result_json IS NOT NULL THEN result_json
+                        ELSE %s::jsonb
+                    END,
+                    progress=100,
                     locked_at=NULL,
+                    locked_by=NULL,
                     worker_id=NULL,
+                    started_at=COALESCE(started_at, NOW()),
                     last_error=NULL,
+                    error_message=NULL,
+                    finished_at=NOW(),
                     completed_at=NOW(),
                     updated_at=NOW()
                 WHERE id=%s
                 """,
-                (job_id,),
+                (BG_STATUS_DONE, result_json, result_json, job_id),
+            )
+            return cur.rowcount
+
+
+def update_background_job_progress(job_id: str, progress: int, result: dict | None = None) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    progress = max(0, min(100, int(progress or 0)))
+    result_json, _ = serialize_background_job_payload(result or {})
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE background_jobs
+                SET progress=%s,
+                    result_json=CASE
+                        WHEN %s::jsonb = '{}'::jsonb AND result_json IS NOT NULL THEN result_json
+                        ELSE %s::jsonb
+                    END,
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (progress, result_json, result_json, job_id),
             )
             return cur.rowcount
 
@@ -4365,15 +4791,23 @@ def retry_background_job(job_id: str, error: str, retry_after_seconds: float = 6
             cur.execute(
                 """
                 UPDATE background_jobs
-                SET status='queued',
+                SET status=%s,
                     next_attempt_at=NOW() + (%s * INTERVAL '1 second'),
                     locked_at=NULL,
+                    locked_by=NULL,
                     worker_id=NULL,
                     last_error=%s,
+                    error_message=%s,
                     updated_at=NOW()
                 WHERE id=%s
                 """,
-                (retry_after_seconds, str(error or "")[:2000], job_id),
+                (
+                    BG_STATUS_PENDING,
+                    retry_after_seconds,
+                    str(error or "")[:2000],
+                    str(error or "")[:2000],
+                    job_id,
+                ),
             )
             return cur.rowcount
 
@@ -4387,16 +4821,133 @@ def fail_background_job(job_id: str, error: str) -> int:
             cur.execute(
                 """
                 UPDATE background_jobs
-                SET status='failed',
+                SET status=%s,
                     locked_at=NULL,
+                    locked_by=NULL,
                     worker_id=NULL,
                     last_error=%s,
+                    error_message=%s,
+                    finished_at=NOW(),
                     updated_at=NOW()
                 WHERE id=%s
                 """,
-                (str(error or "")[:2000], job_id),
+                (BG_STATUS_FAILED, str(error or "")[:2000], str(error or "")[:2000], job_id),
             )
             return cur.rowcount
+
+
+def cancel_background_job(job_id: str, error: str | None = None) -> int:
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+    text = str(error or "cancelled")[:2000]
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE background_jobs
+                SET status=%s,
+                    locked_at=NULL,
+                    locked_by=NULL,
+                    worker_id=NULL,
+                    last_error=%s,
+                    error_message=%s,
+                    finished_at=NOW(),
+                    updated_at=NOW()
+                WHERE id=%s
+                """,
+                (BG_STATUS_CANCELLED, text, text, job_id),
+            )
+            return cur.rowcount
+
+
+def recover_stale_background_jobs(lock_timeout_minutes: int = 30) -> dict[str, int]:
+    lock_timeout_minutes = max(1, int(lock_timeout_minutes or 30))
+    recovered = 0
+    failed = 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE background_jobs
+                SET status=%s,
+                    next_attempt_at=NOW(),
+                    locked_at=NULL,
+                    locked_by=NULL,
+                    worker_id=NULL,
+                    last_error=COALESCE(last_error, 'stale worker lock recovered'),
+                    error_message=COALESCE(error_message, 'stale worker lock recovered'),
+                    updated_at=NOW()
+                WHERE UPPER(COALESCE(status, 'PENDING')) IN ('RUNNING', 'PROCESSING')
+                  AND locked_at IS NOT NULL
+                  AND locked_at < NOW() - (%s * INTERVAL '1 minute')
+                  AND attempts < max_attempts
+                """,
+                (BG_STATUS_PENDING, lock_timeout_minutes),
+            )
+            recovered = int(cur.rowcount or 0)
+            cur.execute(
+                """
+                UPDATE background_jobs
+                SET status=%s,
+                    locked_at=NULL,
+                    locked_by=NULL,
+                    worker_id=NULL,
+                    last_error=COALESCE(last_error, 'stale worker lock exceeded max attempts'),
+                    error_message=COALESCE(error_message, 'stale worker lock exceeded max attempts'),
+                    finished_at=NOW(),
+                    updated_at=NOW()
+                WHERE UPPER(COALESCE(status, 'PENDING')) IN ('RUNNING', 'PROCESSING')
+                  AND locked_at IS NOT NULL
+                  AND locked_at < NOW() - (%s * INTERVAL '1 minute')
+                  AND attempts >= max_attempts
+                """,
+                (BG_STATUS_FAILED, lock_timeout_minutes),
+            )
+            failed = int(cur.rowcount or 0)
+    return {"recovered": recovered, "failed": failed}
+
+
+def get_background_job_admin_summary(lock_timeout_minutes: int = 30) -> dict[str, Any]:
+    summary = {
+        "pending": 0,
+        "running": 0,
+        "failed": 0,
+        "oldest_pending_seconds": None,
+        "stuck_jobs": 0,
+    }
+    lock_timeout_minutes = max(1, int(lock_timeout_minutes or 30))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE UPPER(COALESCE(status, 'PENDING')) IN ('PENDING', 'QUEUED'))::int AS pending_count,
+                    COUNT(*) FILTER (WHERE UPPER(COALESCE(status, 'PENDING')) IN ('RUNNING', 'PROCESSING'))::int AS running_count,
+                    COUNT(*) FILTER (WHERE UPPER(COALESCE(status, 'PENDING')) = 'FAILED')::int AS failed_count,
+                    COUNT(*) FILTER (
+                        WHERE UPPER(COALESCE(status, 'PENDING')) IN ('RUNNING', 'PROCESSING')
+                          AND locked_at IS NOT NULL
+                          AND locked_at < NOW() - (%s * INTERVAL '1 minute')
+                    )::int AS stuck_count,
+                    EXTRACT(EPOCH FROM (
+                        NOW() - MIN(created_at) FILTER (
+                            WHERE UPPER(COALESCE(status, 'PENDING')) IN ('PENDING', 'QUEUED')
+                        )
+                    ))::bigint AS oldest_pending_seconds
+                FROM background_jobs
+                WHERE UPPER(COALESCE(status, 'PENDING')) IN ('PENDING', 'QUEUED', 'RUNNING', 'PROCESSING', 'FAILED')
+                """,
+                (lock_timeout_minutes,),
+            )
+            row = cur.fetchone() or {}
+            summary["pending"] = int(row.get("pending_count") or 0)
+            summary["running"] = int(row.get("running_count") or 0)
+            summary["failed"] = int(row.get("failed_count") or 0)
+            summary["stuck_jobs"] = int(row.get("stuck_count") or 0)
+            oldest = row.get("oldest_pending_seconds")
+            summary["oldest_pending_seconds"] = int(oldest) if oldest is not None else None
+    return summary
 
 
 def get_background_job_status_counts() -> dict[str, int]:
@@ -4405,6 +4956,7 @@ def get_background_job_status_counts() -> dict[str, int]:
         "processing": 0,
         "completed": 0,
         "failed": 0,
+        "cancelled": 0,
         "total": 0,
     }
     with db_conn() as conn:
@@ -4417,13 +4969,74 @@ def get_background_job_status_counts() -> dict[str, int]:
                 """
             )
             for status, count in (cur.fetchall() or []):
-                key = str(status or "").strip().lower()
+                key = _normalize_background_job_status(status)
                 try:
                     value = int(count or 0)
                 except Exception:
                     value = 0
-                if key in counts:
-                    counts[key] = value
+                if key == BG_STATUS_PENDING:
+                    counts["queued"] += value
+                elif key == BG_STATUS_RUNNING:
+                    counts["processing"] += value
+                elif key == BG_STATUS_DONE:
+                    counts["completed"] += value
+                elif key == BG_STATUS_FAILED:
+                    counts["failed"] += value
+                elif key == BG_STATUS_CANCELLED:
+                    counts["cancelled"] += value
                 counts["total"] += value
     counts["pending"] = counts["queued"] + counts["processing"]
+    counts["running"] = counts["processing"]
+    counts["done"] = counts["completed"]
     return counts
+
+
+def get_background_job_status_counts_by_type() -> dict[str, dict[str, int]]:
+    summary: dict[str, dict[str, int]] = {}
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(job_type, 'unknown') AS job_type,
+                    COALESCE(status, 'unknown') AS status,
+                    COUNT(*)::int
+                FROM background_jobs
+                GROUP BY COALESCE(job_type, 'unknown'), COALESCE(status, 'unknown')
+                """
+            )
+            for job_type, status, count in (cur.fetchall() or []):
+                key = str(job_type or "").strip() or "unknown"
+                status_key = str(status or "").strip().lower() or "unknown"
+                bucket = summary.setdefault(
+                    key,
+                    {
+                        "queued": 0,
+                        "processing": 0,
+                        "completed": 0,
+                        "failed": 0,
+                        "cancelled": 0,
+                        "total": 0,
+                    },
+                )
+                try:
+                    value = int(count or 0)
+                except Exception:
+                    value = 0
+                normalized = _normalize_background_job_status(status_key)
+                if normalized == BG_STATUS_PENDING:
+                    bucket["queued"] += value
+                elif normalized == BG_STATUS_RUNNING:
+                    bucket["processing"] += value
+                elif normalized == BG_STATUS_DONE:
+                    bucket["completed"] += value
+                elif normalized == BG_STATUS_FAILED:
+                    bucket["failed"] += value
+                elif normalized == BG_STATUS_CANCELLED:
+                    bucket["cancelled"] += value
+                bucket["total"] += value
+    for bucket in summary.values():
+        bucket["pending"] = bucket.get("queued", 0) + bucket.get("processing", 0)
+        bucket["running"] = bucket.get("processing", 0)
+        bucket["done"] = bucket.get("completed", 0)
+    return summary

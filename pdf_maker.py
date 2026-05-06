@@ -1163,7 +1163,7 @@ async def _pdf_maker_send_text_as_pdf(
         return False
 
     # Enqueue background job instead of processing synchronously
-    user_id = target_message.chat_id
+    user_id = update.effective_user.id if update.effective_user else target_message.chat_id
     job_data = {
         "text": clean,
         "title": title,
@@ -1172,13 +1172,23 @@ async def _pdf_maker_send_text_as_pdf(
         "orientation_key": orientation_key,
         "lang": lang,
     }
-    job_id = db_enqueue_background_job("pdf_maker", user_id, job_data)
-    if not job_id:
-        await target_message.reply_text(msgs["unavailable"])
+    job_meta = db_enqueue_background_job(
+        "pdf_maker",
+        user_id,
+        job_data,
+        chat_id=target_message.chat_id,
+        message_id=target_message.message_id,
+        return_meta=True,
+    )
+    if not job_meta or not job_meta.get("ok"):
+        reason = str((job_meta or {}).get("reason") or "")
+        if reason in {"pending_limit", "running_limit"}:
+            await target_message.reply_text(MESSAGES[lang]["job_limit_wait"])
+        else:
+            await target_message.reply_text(msgs["unavailable"])
         return False
 
-    # Send queued confirmation
-    await target_message.reply_text("✅ PDF generation queued! You'll receive the file soon.")
+    await target_message.reply_text(MESSAGES[lang]["job_queued"])
     return True
 
 

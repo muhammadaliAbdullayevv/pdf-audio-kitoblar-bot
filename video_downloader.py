@@ -393,9 +393,9 @@ def _video_dl_max_mb_limit() -> int | None:
     if _video_dl_unlimited_mode_enabled():
         return None
     try:
-        return max(1, int(os.getenv("VIDEO_DL_MAX_MB", "15")))
+        return max(1, int(os.getenv("VIDEO_DL_MAX_MB", os.getenv("MAX_VIDEO_SIZE_MB", "50"))))
     except Exception:
-        return 15
+        return 50
 
 
 def _video_dl_max_bytes_limit() -> int | None:
@@ -1258,12 +1258,23 @@ async def handle_video_downloader_callback(update: Update, context: ContextTypes
             "lang": lang,
             "platform": str(session.get("platform") or "generic"),
         }
-        job_id = db_enqueue_background_job("video_download", user_id, job_data)
-        if not job_id:
-            await _send_with_retry(lambda: query.message.reply_text(t["download_failed"]))
+        job_meta = db_enqueue_background_job(
+            "video_download",
+            user_id,
+            job_data,
+            chat_id=query.message.chat_id if query.message else None,
+            message_id=query.message.message_id if query.message else None,
+            return_meta=True,
+        )
+        if not job_meta or not job_meta.get("ok"):
+            reason = str((job_meta or {}).get("reason") or "")
+            if reason in {"pending_limit", "running_limit"}:
+                await _send_with_retry(lambda: query.message.reply_text(MESSAGES[lang]["job_limit_wait"]))
+            else:
+                await _send_with_retry(lambda: query.message.reply_text(t["download_failed"]))
             return
 
-        await _send_with_retry(lambda: query.message.reply_text("✅ Video download queued! You'll receive the file soon."))
+        await _send_with_retry(lambda: query.message.reply_text(MESSAGES[lang]["job_queued"]))
         _video_dl_clear_session(context)
     except Exception:
         logger.exception("video downloader: callback handler failed")

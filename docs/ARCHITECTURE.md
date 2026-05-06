@@ -8,7 +8,7 @@ yet. The practical model is:
 - feature modules for bounded areas of behavior
 - PostgreSQL as the source of truth
 - Elasticsearch as an optional search accelerator
-- a local dashboard and systemd-based deployment path
+- a systemd-based deployment path
 
 ## High-Level Components
 
@@ -45,10 +45,6 @@ yet. The practical model is:
 - `admin_runtime.py`
   Owner/admin control panel, task inspection, duplicate cleanup controls, and
   maintenance helpers.
-- `dashboard_server.py`
-  Local admin dashboard backend serving data from PostgreSQL/Elasticsearch.
-- `dashboard_ui/`
-  Static frontend for the local dashboard.
 
 ### Data and Persistence
 
@@ -162,7 +158,6 @@ The repository ships public-safe templates in `systemd/`:
 
 - `pdf_audio_kitoblar_bot.service` — local Telegram Bot API server
 - `pdf_audio_kitoblar_bot-bot.service` — main bot process
-- `pdf_audio_kitoblar_bot-dashboard.service` — local dashboard
 - `pdf_audio_kitoblar_bot-stack.target` — optional grouping target
 - `pdf_audio_kitoblar_bot-hotkey.sudoers` — example sudoers snippet
 

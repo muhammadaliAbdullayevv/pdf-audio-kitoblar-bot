@@ -929,12 +929,23 @@ async def handle_sticker_tools_callback(update: Update, context: ContextTypes.DE
             "chat_id": int(chat_id),
             "reply_to_message_id": int(reply_to_message_id or 0),
         }
-        job_id = db_enqueue_background_job("sticker_convert", user_id, job_data)
-        if not job_id:
-            await safe_answer(query, t["failed"], show_alert=True)
+        job_meta = db_enqueue_background_job(
+            "sticker_convert",
+            user_id,
+            job_data,
+            chat_id=int(chat_id),
+            message_id=int(reply_to_message_id or 0) or None,
+            return_meta=True,
+        )
+        if not job_meta or not job_meta.get("ok"):
+            reason = str((job_meta or {}).get("reason") or "")
+            if reason in {"pending_limit", "running_limit"}:
+                await safe_answer(query, MESSAGES[lang]["job_limit_wait"], show_alert=True)
+            else:
+                await safe_answer(query, t["failed"], show_alert=True)
             if query.message:
                 try:
-                    await query.message.reply_text(t["failed"])
+                    await query.message.reply_text(MESSAGES[lang]["job_limit_wait"] if reason in {"pending_limit", "running_limit"} else t["failed"])
                 except Exception:
                     pass
             return

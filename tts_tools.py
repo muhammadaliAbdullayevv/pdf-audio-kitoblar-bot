@@ -332,9 +332,10 @@ def _tts_allowed_tones(sex_key: str) -> tuple[str, ...]:
 
 def _tts_max_input_chars() -> int:
     try:
-        return max(4000, min(120000, int(os.getenv("TTS_MAX_INPUT_CHARS", "50000") or "50000")))
+        configured = os.getenv("TTS_MAX_INPUT_CHARS", os.getenv("MAX_TTS_CHARS", "5000"))
+        return max(1000, min(120000, int(configured or "5000")))
     except Exception:
-        return 50000
+        return 5000
 
 
 def _tts_chunk_max_chars() -> int:
@@ -1515,19 +1516,29 @@ async def _tts_generate_and_send(update: Update, context: ContextTypes.DEFAULT_T
     opts["lang"] = lang_key
 
     # Enqueue background job instead of processing synchronously
-    user_id = target_message.chat_id
+    user_id = update.effective_user.id if update.effective_user else target_message.chat_id
     job_data = {
         "text": clean,
         "opts": opts,
         "lang_ui": lang_ui,
     }
-    job_id = db_enqueue_background_job("tts_generate", user_id, job_data)
-    if not job_id:
-        await target_message.reply_text(msgs["tools_missing"])
+    job_meta = db_enqueue_background_job(
+        "tts_generate",
+        user_id,
+        job_data,
+        chat_id=target_message.chat_id,
+        message_id=target_message.message_id,
+        return_meta=True,
+    )
+    if not job_meta or not job_meta.get("ok"):
+        reason = str((job_meta or {}).get("reason") or "")
+        if reason in {"pending_limit", "running_limit"}:
+            await target_message.reply_text(MESSAGES[lang_ui]["job_limit_wait"])
+        else:
+            await target_message.reply_text(msgs["tools_missing"])
         return False
 
-    # Send queued confirmation
-    await target_message.reply_text("✅ Audio generation queued! You'll receive the file soon.")
+    await target_message.reply_text(MESSAGES[lang_ui]["job_queued"])
     return True
 
 

@@ -201,6 +201,128 @@ async def _build_background_tasks_with_history_text(
     return text
 
 
+def _count_live_task_entries(value: Any) -> int:
+    if isinstance(value, list):
+        return len([task for task in value if task is not None and not getattr(task, "done", lambda: True)()])
+    if value and not getattr(value, "done", lambda: True)():
+        return 1
+    return 0
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return int(default)
+
+
+def _worker_queue_marker(live: int, target: int, pending: int) -> str:
+    if target > 0 and live <= 0 and pending > 0:
+        return "DOWN"
+    if target > 0 and live >= target and pending > 0:
+        return "SATURATED"
+    if pending > 0:
+        return "BUSY"
+    return "IDLE"
+
+
+async def _build_worker_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    app = context.application
+    bot_data = getattr(app, "bot_data", {}) or {}
+
+    bg_live = _count_live_task_entries(bot_data.get("background_job_workers"))
+    bg_target = _safe_int(bot_data.get("background_job_worker_target"), 0)
+    bg_inflight = bot_data.get("background_job_type_inflight")
+    if not isinstance(bg_inflight, dict):
+        bg_inflight = {}
+    bg_limits = bot_data.get("background_job_type_limits")
+    if not isinstance(bg_limits, dict):
+        bg_limits = {}
+
+    book_live = _count_live_task_entries(bot_data.get("upload_local_backup_workers"))
+    book_target = _safe_int(bot_data.get("upload_local_backup_worker_target"), 0)
+    audio_live = _count_live_task_entries(bot_data.get("audiobook_local_backup_workers"))
+    audio_target = _safe_int(bot_data.get("audiobook_local_backup_worker_target"), 0)
+
+    bg_counts = {}
+    bg_type_counts = {}
+    bg_admin_summary = {}
+    book_counts = {}
+    audio_counts = {}
+    get_bg_counts = globals().get("db_get_background_job_status_counts")
+    get_bg_type_counts = globals().get("db_get_background_job_status_counts_by_type")
+    get_bg_admin_summary = globals().get("db_get_background_job_admin_summary")
+    get_book_counts = globals().get("db_get_book_local_download_job_status_counts")
+    get_audio_counts = globals().get("db_get_audio_book_part_local_download_job_status_counts")
+
+    try:
+        if callable(get_bg_counts):
+            bg_counts = await run_blocking(get_bg_counts)
+    except Exception as e:
+        logger.warning("Failed to load background job status counts: %s", e)
+    try:
+        if callable(get_bg_type_counts):
+            bg_type_counts = await run_blocking(get_bg_type_counts)
+    except Exception as e:
+        logger.warning("Failed to load background job type status counts: %s", e)
+    try:
+        if callable(get_bg_admin_summary):
+            bg_admin_summary = await run_blocking(get_bg_admin_summary)
+    except Exception as e:
+        logger.warning("Failed to load background job admin summary: %s", e)
+    try:
+        if callable(get_book_counts):
+            book_counts = await run_blocking(get_book_counts)
+    except Exception as e:
+        logger.warning("Failed to load local book queue counts: %s", e)
+    try:
+        if callable(get_audio_counts):
+            audio_counts = await run_blocking(get_audio_counts)
+    except Exception as e:
+        logger.warning("Failed to load local audiobook queue counts: %s", e)
+
+    lines = [
+        "Worker status",
+        "──────────",
+        f"Generic background workers: {bg_live}/{bg_target or bg_live or 1}",
+        f"- queued={_safe_int(bg_counts.get('queued'))} processing={_safe_int(bg_counts.get('processing'))} failed={_safe_int(bg_counts.get('failed'))}",
+        f"- oldest_pending={_safe_int(bg_admin_summary.get('oldest_pending_seconds'))}s stuck={_safe_int(bg_admin_summary.get('stuck_jobs'))}",
+        "──────────",
+        "Per job type",
+    ]
+
+    type_names = set(bg_type_counts.keys()) | set(bg_limits.keys()) | set(bg_inflight.keys())
+    if not type_names:
+        lines.append("- No tracked background job types.")
+    else:
+        for job_type in sorted(type_names):
+            counts = bg_type_counts.get(job_type) or {}
+            queued = _safe_int(counts.get("queued"))
+            processing = _safe_int(counts.get("processing"))
+            inflight = _safe_int(bg_inflight.get(job_type))
+            limit = _safe_int(bg_limits.get(job_type))
+            if limit > 0 and inflight >= limit and queued > 0:
+                state = "SATURATED"
+            elif inflight > 0 or queued > 0 or processing > 0:
+                state = "BUSY"
+            else:
+                state = "IDLE"
+            limit_text = str(limit) if limit > 0 else "inf"
+            lines.append(
+                f"- {job_type}: {state} | inflight={inflight}/{limit_text} queued={queued} processing={processing}"
+            )
+
+    book_pending = _safe_int(book_counts.get("pending"))
+    audio_pending = _safe_int(audio_counts.get("pending"))
+    lines += [
+        "──────────",
+        "Local media workers",
+        f"- Books: {_worker_queue_marker(book_live, book_target, book_pending)} | workers={book_live}/{book_target or book_live or 1} queued={_safe_int(book_counts.get('queued'))} downloading={_safe_int(book_counts.get('downloading'))} failed={_safe_int(book_counts.get('failed'))}",
+        f"- Audiobooks: {_worker_queue_marker(audio_live, audio_target, audio_pending)} | workers={audio_live}/{audio_target or audio_live or 1} queued={_safe_int(audio_counts.get('queued'))} downloading={_safe_int(audio_counts.get('downloading'))} failed={_safe_int(audio_counts.get('failed'))}",
+    ]
+    return "\n".join(lines)
+
+
 def _now_dt():
     try:
         return datetime.now()
@@ -247,6 +369,7 @@ def _admin_panel_keyboard(section: str = "main") -> InlineKeyboardMarkup:
     elif section == "tasks":
         rows = [
             [InlineKeyboardButton("🧵 Show tasks", callback_data="adminp:act:tasks_show")],
+            [InlineKeyboardButton("📈 Worker status", callback_data="adminp:act:worker_status")],
             [InlineKeyboardButton("⬅ Back", callback_data="adminp:nav:main")],
         ]
     elif section == "maint":
@@ -435,6 +558,15 @@ async def handle_admin_panel_callback(update: Update, context: ContextTypes.DEFA
     if value == "tasks_show":
         context.user_data["_skip_spam_check_once"] = True
         await cancel_task_command(update, context)
+        await _admin_panel_send_or_edit(update, context, "tasks")
+        return
+    if value == "worker_status":
+        await safe_answer(query)
+        text = await _build_worker_status_text(context)
+        try:
+            await query.message.reply_text(text)
+        except Exception:
+            pass
         await _admin_panel_send_or_edit(update, context, "tasks")
         return
     if value == "dupes_status":
