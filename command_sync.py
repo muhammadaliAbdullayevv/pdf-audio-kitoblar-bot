@@ -14,7 +14,7 @@ from telegram import (
 )
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
-_PUBLIC_PREFERRED_ORDER = ("start", "random", "language", "help", "upload")
+_PUBLIC_PREFERRED_ORDER = ("start", "random", "top_users", "help", "contact_admin", "language", "upload")
 _COMMAND_SYNC_BACKOFF_KEY = "command_sync_backoff_until"
 _USER_COMMANDS_LANG_CACHE_KEY = "user_commands_lang_cache"
 _USER_COMMANDS_LAST_SYNC_KEY = "user_commands_last_sync"
@@ -26,6 +26,8 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
         "en": [
             BotCommand("start", "🚀 Start / choose language"),
             BotCommand("random", "🎲 Get 10 random books"),
+            BotCommand("top_users", "🏆 View top users"),
+            BotCommand("contact_admin", "📞 Contact the admin"),
             BotCommand("upload", "⬆️ Upload books to the bot"),
             BotCommand("language", "🌐 Change language"),
             BotCommand("help", "❓ How to use the bot"),
@@ -33,6 +35,8 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
         "ru": [
             BotCommand("start", "🚀 Запуск / выбор языка"),
             BotCommand("random", "🎲 10 случайных книг"),
+            BotCommand("top_users", "🏆 Топ пользователей"),
+            BotCommand("contact_admin", "📞 Связаться с админом"),
             BotCommand("upload", "⬆️ Загружать книги в бота"),
             BotCommand("language", "🌐 Сменить язык"),
             BotCommand("help", "❓ Как пользоваться ботом"),
@@ -40,6 +44,8 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
         "uz": [
             BotCommand("start", "🚀 Botni ishga tushirish / til tanlash"),
             BotCommand("random", "🎲 10 ta tasodifiy kitob"),
+            BotCommand("top_users", "🏆 Top foydalanuvchilar"),
+            BotCommand("contact_admin", "📞 Admin bilan aloqa"),
             BotCommand("upload", "⬆️ Botga kitob yuklash"),
             BotCommand("language", "🌐 Tilni o‘zgartirish"),
             BotCommand("help", "❓ Botdan foydalanish"),
@@ -88,7 +94,7 @@ def _set_sync_backoff(application, seconds: float) -> None:
 def get_group_commands(lang: str = "en") -> list[BotCommand]:
     by_name = {cmd.command: cmd for cmd in get_public_commands(lang)}
     ordered: list[BotCommand] = []
-    for name in ("start", "random", "language", "help", "upload"):
+    for name in ("start", "random", "top_users", "help", "contact_admin", "language", "upload"):
         cmd = by_name.get(name)
         if cmd:
             ordered.append(cmd)

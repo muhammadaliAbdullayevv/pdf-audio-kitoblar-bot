@@ -63,7 +63,6 @@ def db_list_admin_task_runs(*args: Any, **kwargs: Any) -> list: raise RuntimeErr
 def db_insert_admin_task_run(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
 def db_update_admin_task_run(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
 def es_available(*args: Any, **kwargs: Any) -> bool: raise RuntimeError("admin_runtime not configured")
-def _tts_tools_available(*args: Any, **kwargs: Any) -> bool: raise RuntimeError("admin_runtime not configured")
 def _dupes_confirm_keyboard(*args: Any, **kwargs: Any): raise RuntimeError("admin_runtime not configured")
 def _update_dupes_status(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
 def _compute_db_duplicate_cleanup_plan(*args: Any, **kwargs: Any) -> tuple: raise RuntimeError("admin_runtime not configured")
@@ -465,12 +464,6 @@ async def smoke_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     es_ok = bool(es_available())
-    pdf_ok = bool(globals().get("canvas") and globals().get("A4"))
-    tts_ok = False
-    try:
-        tts_ok = bool(_tts_tools_available())
-    except Exception:
-        tts_ok = False
     ollama_url = str(os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
 
     def mark(ok: bool) -> str:
@@ -481,8 +474,6 @@ async def smoke_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "──────────",
         "Runtime snapshot",
         f"{mark(es_ok)} Elasticsearch: {'available' if es_ok else 'unavailable'}",
-        f"{mark(pdf_ok)} PDF Maker deps (reportlab): {'ready' if pdf_ok else 'missing'}",
-        f"{mark(tts_ok)} TTS deps (edge-tts + ffmpeg): {'ready' if tts_ok else 'missing'}",
         f"🤖 Ollama URL: {ollama_url}",
         "──────────",
         "Manual checks",

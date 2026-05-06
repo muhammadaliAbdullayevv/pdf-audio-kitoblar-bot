@@ -59,21 +59,17 @@ def build_help_text(
         title = "📚 Yordam"
         intro = "👇 Botdan menyu orqali foydalaning."
         main_title = "🏠 Asosiy menyu"
-        other_title = "🛠️ Boshqa funksiyalar"
+        commands_title = "⌨️ Buyruqlar"
         notes_title = "ℹ️ Eslatma"
         main_lines = [
             f"{m.get('menu_search_books', '🔎 Kitob qidirish')} — kitob nomini yuborib qidiring.",
             f"{m.get('menu_favorites', '⭐ Sevimlilar')} — saqlangan kitoblaringiz.",
             f"{m.get('menu_myprofile', '👤 Mening profilim')} — statistika va tangalarni ko‘ring.",
         ]
-        other_lines = [
-            f"{m.get('menu_text_to_voice', '🎙️ Matndan ovoz')} — matndan audio yarating.",
-            f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — matndan PDF tayyorlaydi.",
-            f"{m.get('menu_pdf_editor', '🧰 PDF muharriri')} — PDF siqish, OCR, TXT/EPUB va suv belgisi.",
-            f"{m.get('menu_audio_converter', '🎛️ Audio muharriri')} — audio kesish va formatlash.",
-            f"{m.get('menu_sticker_tools', '🧩 Sticker vositalar')} — rasm/video dan sticker tayyorlash.",
-            f"{m.get('menu_top_users', '🏆 Top foydalanuvchilar')} — eng faol foydalanuvchilar.",
-            f"{m.get('menu_contact_admin', '📞 Admin bilan aloqa')} — bog‘lanish ma’lumoti.",
+        command_lines = [
+            "/top_users — eng faol foydalanuvchilar.",
+            "/contact_admin — admin bilan bog‘lanish.",
+            "/help — shu yo‘riqnoma.",
         ]
         note_lines = [
             "🌐 Tilni o‘zgartirish uchun Language bo‘limidan foydalaning.",
@@ -84,21 +80,17 @@ def build_help_text(
         title = "📚 Помощь"
         intro = "👇 Пользуйтесь ботом через меню."
         main_title = "🏠 Главное меню"
-        other_title = "🛠️ Другие функции"
+        commands_title = "⌨️ Команды"
         notes_title = "ℹ️ Примечание"
         main_lines = [
             f"{m.get('menu_search_books', '🔎 Поиск книг')} — отправьте название книги для поиска.",
             f"{m.get('menu_favorites', '⭐ Избранное')} — сохранённые книги.",
             f"{m.get('menu_myprofile', '👤 Мой профиль')} — статистика и монеты.",
         ]
-        other_lines = [
-            f"{m.get('menu_text_to_voice', '🎙️ Текст в голос')} — преобразование текста в аудио.",
-            f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — создание PDF из текста.",
-            f"{m.get('menu_pdf_editor', '🧰 PDF редактор')} — сжатие PDF, OCR, TXT/EPUB и водяной знак.",
-            f"{m.get('menu_audio_converter', '🎛️ Аудиоредактор')} — обрезка и форматирование аудио.",
-            f"{m.get('menu_sticker_tools', '🧩 Стикер инструменты')} — создание стикеров.",
-            f"{m.get('menu_top_users', '🏆 Топ пользователей')} — самые активные пользователи.",
-            f"{m.get('menu_contact_admin', '📞 Связаться с админом')} — контакты и группа.",
+        command_lines = [
+            "/top_users — самые активные пользователи.",
+            "/contact_admin — связь с админом.",
+            "/help — эта инструкция.",
         ]
         note_lines = [
             "🌐 Язык можно изменить через раздел Language.",
@@ -109,21 +101,17 @@ def build_help_text(
         title = "📚 Help"
         intro = "👇 Use the bot through the menu."
         main_title = "🏠 Main Menu"
-        other_title = "🛠️ Other Functions"
+        commands_title = "⌨️ Commands"
         notes_title = "ℹ️ Notes"
         main_lines = [
             f"{m.get('menu_search_books', '🔎 Search Books')} — send a book name to search.",
             f"{m.get('menu_favorites', '⭐ Favorites')} — your saved books.",
             f"{m.get('menu_myprofile', '👤 My Profile')} — stats and coins.",
         ]
-        other_lines = [
-            f"{m.get('menu_text_to_voice', '🎙️ Text to Voice')} — convert text into audio.",
-            f"{m.get('menu_pdf_maker', '🤖 AI PDF Maker')} — create a PDF from text.",
-            f"{m.get('menu_pdf_editor', '🧰 PDF Editor')} — compress PDF, OCR, TXT/EPUB, and watermark.",
-            f"{m.get('menu_audio_converter', '🎛️ Audio Editor')} — trim and convert audio.",
-            f"{m.get('menu_sticker_tools', '🧩 Sticker Tools')} — make stickers from media.",
-            f"{m.get('menu_top_users', '🏆 Top Users')} — most active users.",
-            f"{m.get('menu_contact_admin', '📞 Contact Admin')} — contact details and group.",
+        command_lines = [
+            "/top_users — most active users.",
+            "/contact_admin — contact the admin.",
+            "/help — this guide.",
         ]
         note_lines = [
             "🌐 Use the Language section to change your language.",
@@ -135,7 +123,7 @@ def build_help_text(
 
     blocks.extend([
             f"{main_title}\n" + "\n".join(main_lines),
-            f"{other_title}\n" + "\n".join(other_lines),
+            f"{commands_title}\n" + "\n".join(command_lines),
         ])
     
     # Add admin section for admin users
@@ -159,37 +147,22 @@ def get_item_description(key: str, lang: str) -> str:
     descriptions = {
         "uz": {
             "menu_search_books": "kitob nomini yuborib qidiring.",
-            "menu_text_to_voice": "matndan audio yarating.",
-            "menu_pdf_maker": "matndan PDF tayyorlaydi.",
-            "menu_pdf_editor": "PDF siqish, OCR, TXT/EPUB va suv belgisi.",
             "menu_top_books": "eng mashhur kitoblar.",
             "menu_favorites": "saqlangan kitoblar.",
-            "menu_audio_converter": "voice/mp3 formatni o'zgartirish, kesish va nomini o'zgartirish.",
-            "menu_sticker_tools": "sticker yasash va video sticker tayyorlash.",
             "menu_myprofile": "statistika va sovg'alar.",
             "menu_help": "ushbu yo'riqnoma.",
         },
         "ru": {
             "menu_search_books": "отправьте название книги для поиска.",
-            "menu_text_to_voice": "преобразование текста в аудио.",
-            "menu_pdf_maker": "создание PDF из текста.",
-            "menu_pdf_editor": "сжатие PDF, OCR, TXT/EPUB и водяной знак.",
             "menu_top_books": "самые популярные книги.",
             "menu_favorites": "сохранённые книги.",
-            "menu_audio_converter": "конвертация voice/mp3, обрезка и переименование.",
-            "menu_sticker_tools": "создание стикеров и видео-стикеров.",
             "menu_myprofile": "статистика и бонусы.",
             "menu_help": "эта инструкция.",
         },
         "en": {
             "menu_search_books": "send a book name to search.",
-            "menu_text_to_voice": "convert text into audio.",
-            "menu_pdf_maker": "create a PDF from text.",
-            "menu_pdf_editor": "compress PDF, OCR, TXT/EPUB, and watermark.",
             "menu_top_books": "most popular books.",
             "menu_favorites": "saved books.",
-            "menu_audio_converter": "convert voice/mp3, cut audio, and rename files.",
-            "menu_sticker_tools": "create static/video stickers from media.",
             "menu_myprofile": "stats and rewards.",
             "menu_help": "this guide.",
         }
@@ -208,9 +181,6 @@ def main_menu_text_action(
     labels = admin_labels or ADMIN_MENU_LABELS
     key_to_action = {
         "menu_search_books": "search",
-        "menu_text_to_voice": "tts",
-        "menu_pdf_maker": "pdf",
-        "menu_pdf_editor": "pdf_editor",
         "menu_favorites": "favorites",
         "menu_request_book": "request",
         "menu_other_functions": "other",
@@ -218,8 +188,6 @@ def main_menu_text_action(
         "menu_top_books": "top_books",
         "menu_top_users": "top_users",
         "menu_upload": "upload",
-        "menu_audio_converter": "audio_converter",
-        "menu_sticker_tools": "sticker_tools",
         "menu_contact_admin": "contact_admin",
         "menu_help": "help",
         "menu_back": "back",

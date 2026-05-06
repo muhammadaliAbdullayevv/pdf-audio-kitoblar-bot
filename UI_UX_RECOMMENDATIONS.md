@@ -98,7 +98,7 @@ descriptions_extended = {
     "uz": {
         "menu_search_books": "📚 Kitob nomini kiriting va oʻxshash kitoblarni toping",
         "menu_request_book": "📩 Kerakli kitobni so'rov bering → admin tasdiqlab yuboradi",
-        "menu_text_to_voice": "🎤 Matn → MP3/WAV audio konversiya (sifat tanlash mumkin)",
+        "menu_top_users": "🏆 Eng faol foydalanuvchilar roʻyxatini ko‘ring",
     }
 }
 ```
@@ -110,10 +110,10 @@ descriptions_extended = {
 keyboard = [
     # QUICK ACCESS (first 2 rows)
     [m.get("menu_search_books", "🔎 Search"), m.get("menu_favorites", "⭐ Favorites")],
-    [m.get("menu_text_to_voice", "🎙️ Text→Voice"), m.get("menu_pdf_maker", "🤖 PDF Maker")],
+    [m.get("menu_top_books", "🔥 Top"), m.get("menu_myprofile", "👤 Profile")],
     # MAIN MENU
-    [m.get("menu_request_book", "📝 Request"), m.get("menu_myprofile", "👤 Profile")],
-    [m.get("menu_other_functions", "🎬 Media Tools")],
+    [m.get("menu_request_book", "📝 Request"), m.get("menu_top_users", "🏆 Users")],
+    [m.get("menu_other_functions", "🛠 Other Functions")],
 ]
 ```
 
@@ -474,18 +474,18 @@ MESSAGES["en"]["awaiting_input_expired"] = (
 await _send_progress_message(update, "Processing...")
 
 # Recommended - be specific:
-async def pdf_maker_process(update, context):
+async def upload_process(update, context):
     # Show what we're doing
     msg = await _send_progress_message(
         update, 
-        "🤖 Converting text to PDF...\n"
-        "⏳ This may take 10-30 seconds depending on length"
+        "⬆️ Kitob saqlanmoqda...\n"
+        "⏳ Bu bir necha soniya olishi mumkin"
     )
     
     # Update with progress
     try:
-        result = await process_pdf(text)
-        await msg.edit_text("✅ PDF created! Sending to you...")
+        result = await process_upload(document)
+        await msg.edit_text("✅ Kitob saqlandi! Endi qidiruvda ko‘rinadi.")
     except Exception as e:
         await msg.edit_text(
             f"❌ PDF creation failed:\n{str(e)[:100]}\n"
@@ -803,15 +803,15 @@ async def myprofile_command(update, context):
 **Issue**: Users don't understand what some features do
 ```python
 # Add inline help for complex features:
-MESSAGES["en"]["pdf_maker_help"] = (
-    "🤖 **PDF Maker** - AI converts your text to a PDF book\n\n"
+MESSAGES["en"]["audiobook_help"] = (
+    "🎧 **Audiobook** - send book parts one by one\n\n"
     "**Use it for:**\n"
-    "• Articles → Formatted documents\n"
-    "• Notes → Beautiful book format\n"
-    "• Blog posts → Shareable PDFs\n\n"
+    "• Long books with multiple audio parts\n"
+    "• Ordered listening by chapter or part\n"
+    "• Reusable storage-backed delivery\n\n"
     "**How:**\n"
-    "1. Click 🤖 PDF Maker\n"
-    "2. Paste your text\n"
+    "1. Click 🎧 Audiobook\n"
+    "2. Choose a part\n"
     "3. Choose formatting\n"
     "4. Download as PDF\n\n"
     "⏱️ Takes 10-30 seconds"

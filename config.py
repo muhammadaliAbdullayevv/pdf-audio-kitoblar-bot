@@ -58,8 +58,6 @@ except Exception:
     BOOK_STORAGE_CHANNEL_ID = 0
 _AUDIO_UPLOAD_CHANNEL_ID_RAW = _env_project_first("AUDIO_UPLOAD_CHANNEL_ID", "")
 _AUDIO_UPLOAD_CHANNEL_IDS_RAW = _env_project_first("AUDIO_UPLOAD_CHANNEL_IDS", "")
-_VIDEO_UPLOAD_CHANNEL_ID_RAW = _env_project_first("VIDEO_UPLOAD_CHANNEL_ID", "")
-_VIDEO_UPLOAD_CHANNEL_IDS_RAW = _env_project_first("VIDEO_UPLOAD_CHANNEL_IDS", "")
 
 def _parse_id_list(raw: str) -> list[int]:
     items = []
@@ -80,14 +78,6 @@ if not _audio_ids:
 
 AUDIO_UPLOAD_CHANNEL_IDS = _audio_ids
 AUDIO_UPLOAD_CHANNEL_ID = _audio_ids[0] if _audio_ids else _env_int("AUDIO_UPLOAD_CHANNEL_ID", 0)
-
-_video_ids = _parse_id_list(_VIDEO_UPLOAD_CHANNEL_IDS_RAW)
-if not _video_ids:
-    # Allow comma-separated IDs in VIDEO_UPLOAD_CHANNEL_ID as well.
-    _video_ids = _parse_id_list(_VIDEO_UPLOAD_CHANNEL_ID_RAW)
-
-VIDEO_UPLOAD_CHANNEL_IDS = _video_ids
-VIDEO_UPLOAD_CHANNEL_ID = _video_ids[0] if _video_ids else _env_int("VIDEO_UPLOAD_CHANNEL_ID", 0)
 
 # Coins / leaderboard settings
 COIN_SEARCH = _env_int("COIN_SEARCH", 1)

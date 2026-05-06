@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -14,9 +15,9 @@ from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import ContextTypes
-from audio_converter import _audio_conv_apply_cover_blocking, _audio_conv_transform_blocking
 from book_thumbnail import get_book_thumbnail_input, get_book_thumbnail_payload
 from language import get_language_keyboard
+import safe_subprocess
 
 try:
     from telegram import ReactionTypeEmoji
@@ -82,6 +83,106 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _audiobook_ffmpeg_time(seconds: float) -> str:
+    total_ms = max(0, int(round(float(seconds) * 1000)))
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    secs, millis = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def _audio_conv_transform_blocking(
+    input_bytes: bytes,
+    *,
+    output_mode: str,
+    start_s: float | None = None,
+    end_s: float | None = None,
+) -> bytes:
+    if not input_bytes:
+        raise RuntimeError("empty input")
+    if output_mode not in {"mp3", "voice"}:
+        raise RuntimeError("unsupported output mode")
+
+    with tempfile.TemporaryDirectory(prefix="audioconv_") as td:
+        in_path = os.path.join(td, "input.bin")
+        out_path = os.path.join(td, "output.mp3" if output_mode == "mp3" else "output.ogg")
+        with open(in_path, "wb") as fp:
+            fp.write(input_bytes)
+
+        cmd = ["ffmpeg", "-y", "-i", in_path]
+        if start_s is not None:
+            cmd[2:2] = ["-ss", _audiobook_ffmpeg_time(float(start_s))]
+        if end_s is not None:
+            duration = max(0.01, float(end_s) - float(start_s or 0.0))
+            cmd.extend(["-t", _audiobook_ffmpeg_time(duration)])
+        cmd.extend(["-vn"])
+        if output_mode == "voice":
+            cmd.extend(["-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", out_path])
+        else:
+            cmd.extend(["-c:a", "libmp3lame", "-q:a", "4", out_path])
+
+        timeout_s = float(os.getenv("AUDIO_CONVERTER_FFMPEG_TIMEOUT_S", "150") or "150")
+        proc = safe_subprocess.run(cmd, timeout_s=timeout_s, max_output_chars=8000, text=False)
+        if proc.returncode != 0:
+            err = proc.stderr
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            raise RuntimeError((str(err or "ffmpeg failed")).strip()[-800:])
+        if not os.path.exists(out_path):
+            raise RuntimeError("ffmpeg output missing")
+        with open(out_path, "rb") as fp:
+            return fp.read()
+
+
+def _audio_conv_apply_cover_blocking(audio_bytes: bytes, cover_bytes: bytes) -> bytes:
+    if not audio_bytes:
+        raise RuntimeError("empty audio")
+    if not cover_bytes:
+        raise RuntimeError("empty cover")
+
+    with tempfile.TemporaryDirectory(prefix="audiocover_") as td:
+        in_audio = os.path.join(td, "in_audio.mp3")
+        in_cover = os.path.join(td, "cover.img")
+        out_mp3 = os.path.join(td, "out_with_cover.mp3")
+
+        with open(in_audio, "wb") as fp:
+            fp.write(audio_bytes)
+        with open(in_cover, "wb") as fp:
+            fp.write(cover_bytes)
+
+        timeout_s = float(os.getenv("AUDIO_CONVERTER_FFMPEG_TIMEOUT_S", "150") or "150")
+        cmd_copy = [
+            "ffmpeg", "-y", "-i", in_audio, "-i", in_cover,
+            "-map", "0:a", "-map", "1:v",
+            "-c:a", "copy", "-c:v", "mjpeg",
+            "-id3v2_version", "3",
+            "-metadata:s:v", "title=Album cover",
+            "-metadata:s:v", "comment=Cover (front)",
+            out_mp3,
+        ]
+        proc = safe_subprocess.run(cmd_copy, timeout_s=timeout_s, max_output_chars=8000, text=False)
+        if proc.returncode != 0:
+            cmd_reencode = [
+                "ffmpeg", "-y", "-i", in_audio, "-i", in_cover,
+                "-map", "0:a", "-map", "1:v",
+                "-c:a", "libmp3lame", "-q:a", "4", "-c:v", "mjpeg",
+                "-id3v2_version", "3",
+                "-metadata:s:v", "title=Album cover",
+                "-metadata:s:v", "comment=Cover (front)",
+                out_mp3,
+            ]
+            proc = safe_subprocess.run(cmd_reencode, timeout_s=timeout_s, max_output_chars=8000, text=False)
+        if proc.returncode != 0:
+            err = proc.stderr
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            raise RuntimeError((str(err or "ffmpeg cover failed")).strip()[-800:])
+        if not os.path.exists(out_mp3):
+            raise RuntimeError("ffmpeg cover output missing")
+        with open(out_mp3, "rb") as fp:
+            return fp.read()
 
 
 def _search_cache_namespace() -> str:
@@ -823,6 +924,8 @@ async def _save_audiobook_part_local(bot, audio_book: dict | None, book: dict | 
 def start_audiobook_local_backup_worker(app) -> None:
     if not _AUDIOBOOK_AUTO_DOWNLOAD_LOCAL:
         return
+    if app.bot_data.get("_shutdown_in_progress"):
+        return
     logger.info(
         "Audiobook local backup worker config: storage_channel_id=%s auto_download=%s refresh_file_id=%s workers=%s",
         _resolve_audiobook_refresh_channel_id({}),
@@ -844,8 +947,11 @@ def start_audiobook_local_backup_worker(app) -> None:
     if missing_workers <= 0:
         return
     start_index = len(live_workers)
+    scheduler = globals().get("_schedule_application_task")
     created_workers = live_workers + [
-        app.create_task(_audiobook_local_backup_worker(app, worker_index=start_index + index + 1))
+        scheduler(app, _audiobook_local_backup_worker(app, worker_index=start_index + index + 1))
+        if callable(scheduler)
+        else app.create_task(_audiobook_local_backup_worker(app, worker_index=start_index + index + 1))
         for index in range(missing_workers)
     ]
     data[_AUDIOBOOK_LOCAL_WORKER_KEY] = created_workers
@@ -856,6 +962,10 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
     worker_id = f"audiobook-local-backup:{os.getpid()}:{worker_index}"
     try:
         while True:
+            job_id = ""
+            attempts = 0
+            max_attempts = 12
+            released = False
             try:
                 job = await run_blocking(
                     claim_audio_book_part_local_download_job,
@@ -885,8 +995,10 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
                     if job_id:
                         if attempts >= max_attempts:
                             await run_blocking(fail_audio_book_part_local_download_job, job_id, error)
+                            released = True
                         else:
                             await run_blocking(retry_audio_book_part_local_download_job, job_id, error, 60.0)
+                            released = True
                     if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
                         await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
                     continue
@@ -897,8 +1009,10 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
                     error = "audiobook or part not found"
                     if attempts >= max_attempts:
                         await run_blocking(fail_audio_book_part_local_download_job, job_id, error)
+                        released = True
                     else:
                         await run_blocking(retry_audio_book_part_local_download_job, job_id, error, 60.0)
+                        released = True
                     if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
                         await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
                     continue
@@ -923,6 +1037,7 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
                         result["path"],
                     )
                     await run_blocking(complete_audio_book_part_local_download_job, job_id)
+                    released = True
                     if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
                         await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
                     continue
@@ -943,6 +1058,7 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
                         result.get("error"),
                     )
                     await run_blocking(complete_audio_book_part_local_download_job, job_id)
+                    released = True
                     if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
                         await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
                     continue
@@ -963,6 +1079,7 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
                         error,
                     )
                     await run_blocking(fail_audio_book_part_local_download_job, job_id, error)
+                    released = True
                 else:
                     backoff = max(
                         _AUDIOBOOK_LOCAL_RETRY_MIN_DELAY_SEC,
@@ -978,9 +1095,15 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
                         error,
                     )
                     await run_blocking(retry_audio_book_part_local_download_job, job_id, error, backoff)
+                    released = True
                 if _AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS > 0:
                     await asyncio.sleep(_AUDIOBOOK_LOCAL_JOB_COOLDOWN_SECONDS)
             except asyncio.CancelledError:
+                if job_id and not released:
+                    try:
+                        await run_blocking(retry_audio_book_part_local_download_job, job_id, "Worker shutdown", 5.0)
+                    except Exception:
+                        logger.exception("Failed to release audiobook local backup job during shutdown: %s", job_id)
                 raise
             except Exception as e:
                 logger.error("Audiobook local backup worker loop failed: %s", e, exc_info=True)
@@ -2376,18 +2499,6 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     pending = context.user_data.get("pending_abook")
     logger.debug("handle_abook_audio called (pending=%s)", pending is not None)
     if not pending:
-        # If audiobook flow is not active, let audio converter session consume media.
-        audio_conv_handler = globals().get("_audio_conv_handle_media_input")
-        if callable(audio_conv_handler):
-            try:
-                lang = ensure_user_language(update, context)
-                handled = await audio_conv_handler(update, context, lang)
-                if handled:
-                    raise ApplicationHandlerStop()
-            except ApplicationHandlerStop:
-                raise
-            except Exception as e:
-                logger.warning("audio converter media handler failed: %s", e, exc_info=True)
         logger.debug("handle_abook_audio: no pending audiobook flow, returning")
         return
     # identify file object
@@ -2868,12 +2979,17 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
         logger.debug("handle_audiobook_listen_callback: no query")
         return
     lang = ensure_user_language(update, context)
+    limited, wait_s = spam_check_callback(update, context)
+    if limited:
+        await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
+        return
     data = query.data or ""
     logger.debug("audiobook callback data=%s", data)
     if not data.startswith("abook:"):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     book_id = data.split(":", 1)[1]
+    await safe_answer(query)
 
     reaction_state_key, reaction_state_seq = _reserve_callback_reaction_seq(query, context)
     await _send_callback_reaction_with_fallbacks(
@@ -2909,10 +3025,7 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
         await query.message.reply_text(text, reply_markup=keyboard)
     except Exception as e:
         logger.debug("Failed to send audiobook parts message: %s", e)
-        await safe_answer(query)
         return
-
-    await safe_answer(query)
 
 
 async def handle_audiobook_play_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2930,15 +3043,16 @@ async def handle_audiobook_play_all_callback(update: Update, context: ContextTyp
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     book_id = data.split(":", 1)[1]
+    await safe_answer(query)
 
     audio_book = await run_blocking(get_audio_book_for_book, book_id)
     if not audio_book:
-        await safe_answer(query, MESSAGES[lang].get("audiobook_not_found", "Audiobook not found"), show_alert=True)
+        await query.message.reply_text(MESSAGES[lang].get("audiobook_not_found", "Audiobook not found"))
         return
 
     all_parts = await run_blocking(list_audio_book_parts, audio_book.get("id"))
     if not all_parts:
-        await safe_answer(query, MESSAGES[lang].get("audiobook_no_parts", "No audio parts found"), show_alert=True)
+        await query.message.reply_text(MESSAGES[lang].get("audiobook_no_parts", "No audio parts found"))
         return
 
     try:
@@ -2949,19 +3063,21 @@ async def handle_audiobook_play_all_callback(update: Update, context: ContextTyp
     active_jobs = _get_audiobook_play_all_active_jobs(context)
     job_key = (chat_id, audio_book_id)
     if chat_id and audio_book_id and job_key in active_jobs:
-        await safe_answer(
-            query,
+        await query.message.reply_text(
             MESSAGES[lang].get("audiobook_play_all_busy", "⏳ This audiobook is already being sent."),
-            show_alert=True,
         )
         return
     if chat_id and audio_book_id:
         active_jobs.add(job_key)
 
-    await safe_answer(query, MESSAGES[lang].get("audiobook_play_all_started", "🎧 Sending all audiobook parts..."))
-
     async def _runner():
         try:
+            try:
+                await query.message.reply_text(
+                    MESSAGES[lang].get("audiobook_play_all_started", "🎧 Sending all audiobook parts..."),
+                )
+            except Exception:
+                pass
             sent_count, total = await _send_full_audiobook_parts(
                 context,
                 chat_id=query.message.chat_id,
@@ -3057,26 +3173,31 @@ async def handle_audiobook_part_play_callback(update: Update, context: ContextTy
     if not query:
         return
     lang = ensure_user_language(update, context)
+    limited, wait_s = spam_check_callback(update, context)
+    if limited:
+        await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
+        return
     data = query.data or ""
     if not data.startswith("abplay:"):
         await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         return
     part_id = data.split(":", 1)[1]
+    await safe_answer(query)
     
     # Get the audio part
     part = await run_blocking(get_audio_book_part, part_id)
     if not part:
-        await safe_answer(query, MESSAGES[lang].get("audio_part_not_found", "Audio part not found"), show_alert=True)
+        await query.message.reply_text(MESSAGES[lang].get("audio_part_not_found", "Audio part not found"))
         return
     
     audio_book_id = str(part.get("audio_book_id") or "").strip()
     audio_book = await run_blocking(get_audio_book_by_id, audio_book_id) if audio_book_id else None
     if not audio_book:
-        await safe_answer(query, MESSAGES[lang].get("audiobook_not_found", "Audiobook not found"), show_alert=True)
+        await query.message.reply_text(MESSAGES[lang].get("audiobook_not_found", "Audiobook not found"))
         return
     all_parts = await run_blocking(list_audio_book_parts, audio_book_id)
     if not all_parts:
-        await safe_answer(query, MESSAGES[lang].get("audiobook_no_parts", "No audio parts found"), show_alert=True)
+        await query.message.reply_text(MESSAGES[lang].get("audiobook_no_parts", "No audio parts found"))
         return
 
     # Send the audio file with richer navigation controls
@@ -3417,7 +3538,9 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         limited, wait_s = spam_check_message(update, context)
         if limited:
-            await update.message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+            await update.message.reply_text(
+                MESSAGES[lang].get("slow_down_soft", "Juda tez so‘rov yuboryapsiz. Bir oz kuting.")
+            )
             return
 
         # User activity persistence should not delay visible UX paths.
@@ -3429,16 +3552,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.application.create_task(update_user_info(update, context))
         except Exception:
             pass
-
-        if await _tts_handle_text_input(update, context, lang):
-            return
-
-        if await _pdf_maker_handle_text_input(update, context, lang):
-            return
-
-        if callable(globals().get("_pdfed_handle_text_input")):
-            if await _pdfed_handle_text_input(update, context, lang):
-                return
 
         pending_bonus = context.user_data.get("awaiting_user_bonus")
         if pending_bonus and _is_admin_user(update.effective_user.id):
@@ -3675,14 +3788,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if await _video_dl_handle_text_input(update, context, lang):
                 return
 
-        if callable(globals().get("_audio_conv_handle_text_input")):
-            if await _audio_conv_handle_text_input(update, context, lang):
-                return
-
-        if callable(globals().get("_sticker_handle_text_input")):
-            if await _sticker_handle_text_input(update, context, lang):
-                return
-
         # Simple thanks replies
         thanks_lang = _detect_thanks_reply_lang(update.message.text)
         if thanks_lang:
@@ -3722,10 +3827,13 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _reply_search_menu_click_hint(update, context, lang)
             return
 
-        limited, wait_s = rate_limited(context, "last_search_ts", SEARCH_COOLDOWN_SEC)
-        if limited:
-            await update.message.reply_text(MESSAGES[lang]["rate_limited"].format(seconds=wait_s))
-            return
+        if not _is_admin_user(update.effective_user.id):
+            limited, wait_s = rate_limited(context, "last_search_ts", SEARCH_COOLDOWN_SEC)
+            if limited:
+                await update.message.reply_text(
+                    MESSAGES[lang].get("slow_down_soft", "Juda tez so‘rov yuboryapsiz. Bir oz kuting.")
+                )
+                return
         query = update.message.text.strip()
         if not query:
             await update.message.reply_text(MESSAGES[lang]["enter_specific"])
@@ -3955,6 +4063,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             book_id = data.split(":", 1)[1].strip()
         else:
             book_id = data  # backward compatibility for old buttons
+        await safe_answer(query)
 
         # --- Lookup book by UUID in DB ---
         book = await run_blocking(db_get_book_by_id, book_id)
@@ -3977,8 +4086,26 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         # --- If still not found ---
         if not book:
             logger.debug(f"Book not found for UUID {book_id}")
-            await safe_answer(query, MESSAGES[lang]["book_not_found"])
+            await query.message.reply_text(MESSAGES[lang]["book_not_found"])
             return
+
+        async def _load_delivery_snapshot() -> dict:
+            snapshot_fn = globals().get("db_get_book_delivery_snapshot")
+            if callable(snapshot_fn):
+                snapshot = await run_blocking(snapshot_fn, book_id, query.from_user.id)
+                if snapshot:
+                    return snapshot
+            return dict(book)
+
+        def _snapshot_reaction_counts(snapshot: dict) -> dict[str, int]:
+            return {
+                "like": int(snapshot.get("like_count", snapshot.get("like", 0)) or 0),
+                "dislike": int(snapshot.get("dislike_count", snapshot.get("dislike", 0)) or 0),
+                "berry": int(snapshot.get("berry_count", snapshot.get("berry", 0)) or 0),
+                "whale": int(snapshot.get("whale_count", snapshot.get("whale", 0)) or 0),
+            }
+
+        book = await _load_delivery_snapshot()
 
         local_path = book.get("path")
         file_id = book.get("file_id")
@@ -4009,24 +4136,17 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         error_key = None
         sent_ok = False
         sent = None
-        stats = await run_blocking(db_get_book_stats, book_id)
-        downloads = stats.get("downloads", 0)
-        fav_count = stats.get("fav_count", 0)
-        counts = {
-            "like": stats.get("like", 0),
-            "dislike": stats.get("dislike", 0),
-            "berry": stats.get("berry", 0),
-            "whale": stats.get("whale", 0),
-        }
+        downloads = int(book.get("downloads") or 0)
+        fav_count = int(book.get("fav_count", 0) or 0)
+        counts = _snapshot_reaction_counts(book)
         caption = build_book_caption(book, downloads, fav_count, counts)
-        is_fav_now = await run_blocking(is_favorited, query.from_user.id, book_id)
-        user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
+        is_fav_now = bool(book.get("is_favorited"))
+        user_reaction = book.get("user_reaction")
         can_delete = await _can_show_delete_button(update, query.from_user.id)
         is_group_chat = _is_group_chat(update)
         allow_management_buttons = not is_group_chat
         # Audiobook flags: show listen if audiobook exists; allow add for admins
-        audio_book = await run_blocking(get_audio_book_for_book, book_id)
-        has_ab = bool(audio_book)
+        has_ab = bool(book.get("has_audiobook"))
         can_add_ab = False
         if allow_management_buttons and callable(globals().get("is_audio_allowed")):
             try:
@@ -4153,21 +4273,15 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 await _run_db_retry(db_increment_book_download, book_id)
                 invalidate_top_caches(context)
-                stats = await run_blocking(db_get_book_stats, book_id)
-                new_downloads = stats.get("downloads", 0)
-                fav_count = stats.get("fav_count", 0)
-                counts = {
-                    "like": stats.get("like", 0),
-                    "dislike": stats.get("dislike", 0),
-                    "berry": stats.get("berry", 0),
-                    "whale": stats.get("whale", 0),
-                }
+                book = await _load_delivery_snapshot()
+                new_downloads = int(book.get("downloads") or 0)
+                fav_count = int(book.get("fav_count", 0) or 0)
+                counts = _snapshot_reaction_counts(book)
                 if sent:
-                    is_fav_now = await run_blocking(is_favorited, query.from_user.id, book_id)
-                    user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
+                    is_fav_now = bool(book.get("is_favorited"))
+                    user_reaction = book.get("user_reaction")
                     # Recompute audiobook flags for refreshed keyboard
-                    audio_book2 = await run_blocking(get_audio_book_for_book, book_id)
-                    has_ab2 = bool(audio_book2)
+                    has_ab2 = bool(book.get("has_audiobook"))
                     can_add_ab2 = False
                     if allow_management_buttons and callable(globals().get("is_audio_allowed")):
                         try:
@@ -4207,8 +4321,6 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                 await status_msg.edit_text(MESSAGES[lang]["sent"])
             except Exception:
                 pass
-
-        await safe_answer(query)
 
     except Exception as e:
         logger.error(f"handle_book_selection failed: {e}", exc_info=True)
@@ -4316,7 +4428,6 @@ async def handle_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(result_text, reply_markup=reply_markup)
     except Exception:
         pass
-    await safe_answer(query)
 
 
 async def handle_user_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

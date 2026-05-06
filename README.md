@@ -80,8 +80,6 @@ This codebase demonstrates engineering work across multiple layers:
 - **Search engine:** Elasticsearch (`books` catalog)
 - **Background work:** PostgreSQL-backed `background_jobs` + async workers
 - **Media processing:** `ffmpeg`
-- **TTS backends:** `edge-tts`, optional `espeak-ng`
-- **Downloader:** `yt-dlp`
 ## Current Feature Scope
 
 Active user-facing features:
@@ -93,11 +91,6 @@ Active user-facing features:
 - Book requests when search misses (`/request`, `/requests`, and no-results actions)
 - Upload access requests for non-owner `/upload` usage
 - Favorites, reactions, top books, top users, and user profile stats
-- PDF Maker
-- Text to Voice
-- Audio Editor
-- PDF Editor
-- Sticker Tools with DB-backed background jobs
 - Contact Admin card
 - Owner/admin control tools
 
@@ -161,10 +154,6 @@ Implemented but not shown in the default public command menu:
 - `/mystats`
 - `/request`
 - `/requests`
-- `/pdf_maker`
-- `/pdf_editor`
-- `/text_to_voice`
-- `/sticker_tools`
 
 Owner/admin commands:
 
@@ -254,8 +243,6 @@ Common optional:
 - `BOOK_STORAGE_CHANNEL_ID`
 - `AUDIO_UPLOAD_CHANNEL_ID`
 - `AUDIO_UPLOAD_CHANNEL_IDS`
-- `VIDEO_UPLOAD_CHANNEL_ID`
-- `VIDEO_UPLOAD_CHANNEL_IDS`
 - `ES_URL`
 - `ES_USER`
 - `ES_PASS`
@@ -278,8 +265,11 @@ Systemd deployment templates in this repo:
 
 - `systemd/pdf_audio_kitoblar_bot.service`
 - `systemd/pdf_audio_kitoblar_bot-bot.service`
+- `systemd/pdf_audio_kitoblar_bot-worker.service`
+- `systemd/pdf_audio_kitoblar_bot-cleanup.service`
 - `systemd/pdf_audio_kitoblar_bot-stack.target`
 - `systemd/pdf_audio_kitoblar_bot-hotkey.sudoers` (example only)
+- `systemd/restart-smartai-bot.sh` (example hotkey restart helper)
 
 The `systemd/` files are templates. Before installing them, replace the example
 user, group, project directory, virtualenv path, and sudoers account values to

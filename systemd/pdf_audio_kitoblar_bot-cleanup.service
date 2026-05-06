@@ -12,7 +12,7 @@ Group=pdfbot
 WorkingDirectory=/opt/pdf_audio_kitoblar_bot
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/pdf_audio_kitoblar_bot.env
-ExecStart=/opt/pdf_audio_kitoblar_bot/.venv/bin/python /opt/pdf_audio_kitoblar_bot/workers/cleanup_worker.py
+ExecStart=/opt/pdf_audio_kitoblar_bot/.venv/bin/python -m workers.cleanup_worker
 Restart=always
 RestartSec=10
 TimeoutStopSec=20

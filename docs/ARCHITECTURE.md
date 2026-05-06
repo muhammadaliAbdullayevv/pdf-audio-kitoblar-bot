@@ -36,9 +36,6 @@ yet. The practical model is:
   Favorites, reactions, and book action callbacks.
 - `user_interactions.py`
   Book request lifecycle and user-facing request status interactions.
-- `tts_tools.py`, `pdf_maker.py`, `pdf_editor.py`, `audio_converter.py`,
-  `sticker_tools.py`
-  Tool-style feature modules exposed from the "Other Functions" menu.
 
 ### Admin and Operations
 

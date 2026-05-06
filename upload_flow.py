@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
@@ -13,13 +14,81 @@ from telegram import InputFile
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
 try:
-    from pdf_editor import _pdf_editor_watermark_blocking as _shared_pdf_watermark_blocking
+    from pypdf import PdfReader, PdfWriter
 except Exception:
-    _shared_pdf_watermark_blocking = None
+    PdfReader = None  # type: ignore
+    PdfWriter = None  # type: ignore
+
+try:
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.pdfbase import pdfmetrics
+except Exception:
+    rl_canvas = None  # type: ignore
+    pdfmetrics = None  # type: ignore
 
 import uuid
 
 logger = logging.getLogger(__name__)
+
+
+def _shared_pdf_watermark_blocking(pdf_bytes: bytes, watermark_text: str) -> bytes:
+    if PdfReader is None or PdfWriter is None:
+        raise RuntimeError("pypdf-missing")
+    if rl_canvas is None:
+        raise RuntimeError("watermark-tools-missing")
+
+    rd = PdfReader(io.BytesIO(pdf_bytes))
+    if getattr(rd, "is_encrypted", False):
+        raise RuntimeError("encrypted-pdf")
+    wr = PdfWriter()
+    overlay_cache: dict[tuple[int, int], Any] = {}
+
+    def make_overlay(width: float, height: float):
+        key = (int(width), int(height))
+        if key in overlay_cache:
+            return overlay_cache[key]
+
+        text = str(watermark_text or "")[:140]
+        page_span = max(1.0, min(float(width), float(height)))
+        font_size = max(30.0, min(52.0, page_span / 6.0))
+        if pdfmetrics is not None:
+            try:
+                text_width = float(pdfmetrics.stringWidth(text, "Helvetica-Bold", 1.0) or 0.0)
+            except Exception:
+                text_width = 0.0
+            if text_width > 0:
+                target_width = float(width) * 0.80
+                font_size = target_width / max(text_width, 1.0)
+        font_size = max(30.0, min(52.0, font_size))
+
+        packet = io.BytesIO()
+        canvas = rl_canvas.Canvas(packet, pagesize=(float(width), float(height)))
+        canvas.saveState()
+        try:
+            canvas.setFillAlpha(0.19)
+        except Exception:
+            pass
+        canvas.setFont("Helvetica-Bold", font_size)
+        canvas.setFillColorRGB(0.52, 0.52, 0.52)
+        canvas.translate(float(width) / 2, float(height) / 2)
+        canvas.rotate(30)
+        canvas.drawCentredString(0, -page_span * 0.04, text)
+        canvas.restoreState()
+        canvas.save()
+        packet.seek(0)
+        overlay = PdfReader(packet).pages[0]
+        overlay_cache[key] = overlay
+        return overlay
+
+    for page in rd.pages:
+        width = float(page.mediabox.width)
+        height = float(page.mediabox.height)
+        page.merge_page(make_overlay(width, height))
+        wr.add_page(page)
+
+    out = io.BytesIO()
+    wr.write(out)
+    return out.getvalue()
 
 _CONFIG_REQUIRED_KEYS = (
     "MESSAGES",
@@ -38,7 +107,6 @@ _CONFIG_REQUIRED_KEYS = (
     "db_update_upload_receipt",
     "db_insert_book",
     "db_update_book_upload_meta",
-    "db_enqueue_background_job",
     "db_enqueue_book_local_download_job",
     "db_claim_book_local_download_job",
     "db_complete_book_local_download_job",
@@ -232,69 +300,6 @@ def _book_upload_is_allowed_file(file_name: str) -> bool:
     return _book_upload_file_extension(file_name) in _BOOK_UPLOAD_ALLOWED_EXTENSIONS
 
 
-def _coerce_int_id_list(raw: Any) -> list[int]:
-    values: list[Any]
-    if raw is None:
-        values = []
-    elif isinstance(raw, (list, tuple, set)):
-        values = list(raw)
-    else:
-        values = str(raw).split(",")
-
-    out: list[int] = []
-    seen: set[int] = set()
-    for item in values:
-        text = str(item).strip()
-        if not text:
-            continue
-        try:
-            value = int(text)
-        except Exception:
-            continue
-        if value == 0 or value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-    return out
-
-
-def _resolve_video_upload_channel_ids() -> list[int]:
-    # Preferred: VIDEO_UPLOAD_CHANNEL_IDS (list/comma-separated), with
-    # VIDEO_UPLOAD_CHANNEL_ID kept as backward-compatible fallback.
-    ids = _coerce_int_id_list(globals().get("VIDEO_UPLOAD_CHANNEL_IDS"))
-    if ids:
-        return ids
-    ids = _coerce_int_id_list(os.getenv("VIDEO_UPLOAD_CHANNEL_IDS", ""))
-    if ids:
-        return ids
-    ids = _coerce_int_id_list([globals().get("VIDEO_UPLOAD_CHANNEL_ID")])
-    if ids:
-        return ids
-    return _coerce_int_id_list([os.getenv("VIDEO_UPLOAD_CHANNEL_ID", "")])
-
-
-async def _pick_video_upload_channel_id(context: ContextTypes.DEFAULT_TYPE, channel_ids: list[int] | None = None) -> int | None:
-    ids = list(channel_ids or _resolve_video_upload_channel_ids())
-    if not ids:
-        return None
-
-    app = getattr(context, "application", None)
-    if app is None:
-        return ids[0]
-
-    data = app.bot_data
-    lock = data.get("video_upload_channel_lock")
-    if lock is None:
-        lock = asyncio.Lock()
-        data["video_upload_channel_lock"] = lock
-
-    async with lock:
-        idx = int(data.get("video_upload_channel_index", 0) or 0)
-        channel_id = ids[idx % len(ids)]
-        data["video_upload_channel_index"] = idx + 1
-        return channel_id
-
-
 def _safe_asyncio_current_task():
     try:
         return asyncio.current_task()
@@ -486,7 +491,11 @@ async def enqueue_bulk_index_job(app, job: dict):
     await q.put(job)
     task = data.get("upload_bulk_index_worker")
     if not task or task.done():
-        data["upload_bulk_index_worker"] = app.create_task(upload_bulk_index_worker(app))
+        scheduler = globals().get("_schedule_application_task")
+        if callable(scheduler):
+            data["upload_bulk_index_worker"] = scheduler(app, upload_bulk_index_worker(app))
+        else:
+            data["upload_bulk_index_worker"] = app.create_task(upload_bulk_index_worker(app))
 
 
 def _upload_local_normalized_label(value: str, default: str = "book") -> str:
@@ -853,6 +862,8 @@ def _resolve_book_storage_channel_id() -> int:
 def start_upload_local_backup_worker(app) -> None:
     if not _UPLOAD_AUTO_DOWNLOAD_LOCAL:
         return
+    if app.bot_data.get("_shutdown_in_progress"):
+        return
     logger.info(
         "Local backup worker config: storage_channel_id=%s auto_download=%s refresh_file_id=%s workers=%s",
         _resolve_book_storage_channel_id(),
@@ -874,8 +885,11 @@ def start_upload_local_backup_worker(app) -> None:
     if missing_workers <= 0:
         return
     start_index = len(live_workers)
+    scheduler = globals().get("_schedule_application_task")
     created_workers = live_workers + [
-        app.create_task(_upload_local_backup_worker(app, worker_index=start_index + index + 1))
+        scheduler(app, _upload_local_backup_worker(app, worker_index=start_index + index + 1))
+        if callable(scheduler)
+        else app.create_task(_upload_local_backup_worker(app, worker_index=start_index + index + 1))
         for index in range(missing_workers)
     ]
     data[_UPLOAD_LOCAL_WORKER_KEY] = created_workers
@@ -886,6 +900,11 @@ async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
     worker_id = f"upload-local-backup:{os.getpid()}:{worker_index}"
     try:
         while True:
+            job_id = ""
+            attempts = 0
+            max_attempts = 12
+            retry_fn = None
+            released = False
             try:
                 claim_fn = globals().get("db_claim_book_local_download_job")
                 retry_fn = globals().get("db_retry_book_local_download_job")
@@ -924,8 +943,10 @@ async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
                     if job_id:
                         if attempts >= max_attempts:
                             await run_blocking(fail_fn, job_id, error)
+                            released = True
                         else:
                             await run_blocking(retry_fn, job_id, error, 60.0)
+                            released = True
                     if _UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS > 0:
                         await asyncio.sleep(_UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS)
                     continue
@@ -936,6 +957,7 @@ async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
                 if result.get("path") and result.get("db_updated") and refresh_ok:
                     logger.info("Local backup job done: job_id=%s book_id=%s path=%s", job_id, book_id, result["path"])
                     await run_blocking(complete_fn, job_id)
+                    released = True
                     if _UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS > 0:
                         await asyncio.sleep(_UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS)
                     continue
@@ -955,6 +977,7 @@ async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
                         error,
                     )
                     await run_blocking(fail_fn, job_id, error)
+                    released = True
                 else:
                     backoff = max(
                         _UPLOAD_LOCAL_RETRY_MIN_DELAY_SEC,
@@ -970,9 +993,15 @@ async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
                         error,
                     )
                     await run_blocking(retry_fn, job_id, error, backoff)
+                    released = True
                 if _UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS > 0:
                     await asyncio.sleep(_UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS)
             except asyncio.CancelledError:
+                if job_id and not released and callable(retry_fn):
+                    try:
+                        await run_blocking(retry_fn, job_id, "Worker shutdown", 5.0)
+                    except Exception:
+                        logger.exception("Failed to release local backup job during shutdown: %s", job_id)
                 raise
             except Exception as e:
                 logger.error("Local backup worker loop failed: %s", e, exc_info=True)
@@ -1128,6 +1157,7 @@ async def _process_upload(
     caption_text: str | None = None,
     receipt_id: str | None = None,
     uploader_user_id: int | None = None,
+    upload_chat_id: int | None = None,
 ):
     receipt_saved_to_db = False
     receipt_saved_to_es = False
@@ -1299,41 +1329,68 @@ async def _process_upload(
             reply_only=no_status_edits,
         )
 
-        # respond fast, index in background via DB-backed worker
-        logger.info(f"Preparing confirmation message for {file_name}")
+        # Keep uploads immediately searchable again; only storage refresh stays in background.
+        logger.info("Running immediate search index for uploaded book %s", new_book["id"])
         if es_available():
-            if receipt_id:
-                try:
-                    await run_blocking(db_update_upload_receipt, receipt_id, status="indexing", error=None)
-                except Exception:
-                    logger.exception("Failed to update upload receipt status=indexing")
-            enqueue_meta = db_enqueue_background_job(
-                "SEARCH_INDEX_BOOK",
-                int(uploader_user_id or 0) or int(context.bot.id if getattr(context, "bot", None) else 0) or 1,
-                {
-                    "doc": {
-                        "id": new_book["id"],
-                        "book_name": new_book["book_name"],
-                        "display_name": new_book.get("display_name"),
-                        "file_id": new_book.get("file_id"),
-                        "file_unique_id": new_book.get("file_unique_id"),
-                        "path": new_book.get("path"),
-                        "indexed": True,
-                    },
-                    "book_id": new_book["id"],
-                    "receipt_id": receipt_id,
-                    "lang": lang,
-                },
-                chat_id=int(update.effective_chat.id) if update.effective_chat else None,
-                message_id=int(status_msg.message_id) if status_msg else None,
-                priority=30,
-                max_attempts=5,
-                idempotency_key=f"search-index-book:{new_book['id']}",
-                ignore_limits=True,
-                return_meta=True,
-            )
-            if not enqueue_meta or not enqueue_meta.get("ok"):
-                logger.warning("Failed to enqueue SEARCH_INDEX_BOOK for %s, leaving DB save intact", new_book["id"])
+            try:
+                await run_blocking(ensure_index)
+                indexed_id = await run_blocking(
+                    index_book,
+                    new_book["book_name"],
+                    new_book.get("file_id"),
+                    new_book.get("path"),
+                    new_book["id"],
+                    new_book.get("display_name") or new_book["book_name"],
+                    new_book.get("file_unique_id"),
+                )
+                receipt_saved_to_es = bool(indexed_id)
+                if receipt_saved_to_es:
+                    await run_blocking(update_book_indexed, new_book["id"], True)
+                    if receipt_id:
+                        try:
+                            await run_blocking(
+                                db_update_upload_receipt,
+                                receipt_id,
+                                status="indexed",
+                                book_id=new_book["id"],
+                                saved_to_db=True,
+                                saved_to_es=True,
+                                error=None,
+                            )
+                        except Exception:
+                            logger.exception("Failed to update upload receipt after immediate ES index")
+                    try:
+                        await notify_request_matches(context.bot, dict(new_book, indexed=True))
+                    except Exception:
+                        logger.exception("Failed to notify request matches for uploaded book %s", new_book["id"])
+                    try:
+                        search_cache_ns = str(globals().get("SEARCH_CACHE_NS", os.getenv("SEARCH_CACHE_NS", "v1")) or "v1")
+                        clear_pattern = globals().get("cache_clear_pattern")
+                        delete_cache_key = globals().get("cache_delete")
+                        if callable(clear_pattern):
+                            clear_pattern(f"search:books:entries:{search_cache_ns}:*")
+                            clear_pattern("top_results:*")
+                        if callable(delete_cache_key):
+                            delete_cache_key("top:books:entries")
+                    except Exception as cache_e:
+                        logger.debug("Failed to clear search caches after upload for %s: %s", new_book["id"], cache_e)
+                else:
+                    logger.warning("Immediate ES index returned empty result for %s", new_book["id"])
+                    if receipt_id:
+                        try:
+                            await run_blocking(
+                                db_update_upload_receipt,
+                                receipt_id,
+                                status="index_failed",
+                                book_id=new_book["id"],
+                                saved_to_db=True,
+                                saved_to_es=False,
+                                error="indexing failed",
+                            )
+                        except Exception:
+                            logger.exception("Failed to update upload receipt after immediate index failure")
+            except Exception as index_e:
+                logger.warning("Immediate ES index failed for %s: %s", new_book["id"], index_e, exc_info=True)
                 if receipt_id:
                     try:
                         await run_blocking(
@@ -1343,10 +1400,10 @@ async def _process_upload(
                             book_id=new_book["id"],
                             saved_to_db=True,
                             saved_to_es=False,
-                            error="index queue unavailable",
+                            error=str(index_e)[:1000],
                         )
                     except Exception:
-                        logger.exception("Failed to update upload receipt after index queue failure")
+                        logger.exception("Failed to update upload receipt after immediate index exception")
         else:
             if receipt_id:
                 try:
@@ -1469,19 +1526,23 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 receipt_id = None
 
             logger.info(f"Starting upload process for file: {file_name} by user {update.effective_user.id if update.effective_user else 'unknown'}")
-            context.application.create_task(
-                _process_upload(
-                    context,
-                    status_msg,
-                    file_id,
-                    file_name,
-                    lang,
-                    file_unique_id,
-                    caption_text=str(getattr(update.message, "caption", "") or ""),
-                    receipt_id=receipt_id,
-                    uploader_user_id=update.effective_user.id if update.effective_user else None,
-                )
+            scheduler = globals().get("_schedule_application_task")
+            coro = _process_upload(
+                context,
+                status_msg,
+                file_id,
+                file_name,
+                lang,
+                file_unique_id,
+                caption_text=str(getattr(update.message, "caption", "") or ""),
+                receipt_id=receipt_id,
+                uploader_user_id=update.effective_user.id if update.effective_user else None,
+                upload_chat_id=update.effective_chat.id if update.effective_chat else None,
             )
+            if callable(scheduler):
+                scheduler(context.application, coro)
+            else:
+                context.application.create_task(coro)
         else:
             logger.info(
                 "handle_file: ELSE branch - user_mode=%s, is_allowed=%s",

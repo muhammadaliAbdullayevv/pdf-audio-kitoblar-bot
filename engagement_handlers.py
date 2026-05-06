@@ -42,6 +42,43 @@ def _callback_reaction_state_key(query) -> str | None:
     return f"{chat.id}:{message_id}:{user_id or 0}"
 
 
+def _delete_local_media_paths(paths: list[str] | tuple[str, ...]) -> dict[str, int]:
+    deleted = 0
+    missing = 0
+    failed = 0
+    seen: set[str] = set()
+    for raw_path in paths:
+        candidate = str(raw_path or "").strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            if os.path.isfile(candidate):
+                os.remove(candidate)
+                deleted += 1
+            elif os.path.isdir(candidate):
+                shutil.rmtree(candidate, ignore_errors=False)
+                deleted += 1
+            else:
+                missing += 1
+                continue
+            parent = os.path.dirname(candidate)
+            for _ in range(3):
+                if not parent:
+                    break
+                try:
+                    os.rmdir(parent)
+                except OSError:
+                    break
+                parent = os.path.dirname(parent)
+        except FileNotFoundError:
+            missing += 1
+        except Exception as e:
+            failed += 1
+            logger.warning("Failed to delete local media path %s: %s", candidate, e, exc_info=True)
+    return {"deleted": deleted, "missing": missing, "failed": failed}
+
+
 def _reserve_callback_reaction_seq(query, context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, int]:
     key = _callback_reaction_state_key(query)
     if key is None:
@@ -1572,23 +1609,27 @@ async def handle_delete_book_callback(update: Update, context: ContextTypes.DEFA
 
     book = await run_blocking(db_get_book_by_id, book_id)
     title = get_result_title(book) if book else book_id
-
-    local_deleted = False
-    local_missing = False
+    local_paths: list[str] = []
     if book and book.get("path"):
-        path = book.get("path")
+        local_paths.append(str(book.get("path") or "").strip())
+    try:
+        audio_books = await run_blocking(list_audio_books_by_book_id, book_id)
+    except Exception:
+        audio_books = []
+    for audio_book in audio_books or []:
+        audio_book_id = str((audio_book or {}).get("id") or "").strip()
+        if not audio_book_id:
+            continue
         try:
-            if path and os.path.exists(path):
-                os.remove(path)
-                local_deleted = True
-            else:
-                local_missing = True
-        except Exception as e:
-            logger.error(f"Failed to delete local file {path}: {e}")
+            parts = await run_blocking(list_audio_book_parts, audio_book_id)
+        except Exception:
+            parts = []
+        for part in parts or []:
+            path = str((part or {}).get("path") or "").strip()
+            if path:
+                local_paths.append(path)
 
     deleted_db = await run_blocking(delete_book_and_related, book_id)
-    # cascade delete audiobooks associated with this book
-    await run_blocking(delete_audio_books_by_book_id, book_id)
 
     deleted_es = 0
     failed_es = 0
@@ -1611,10 +1652,11 @@ async def handle_delete_book_callback(update: Update, context: ContextTypes.DEFA
     except Exception:
         pass
 
+    cleanup = await asyncio.to_thread(_delete_local_media_paths, local_paths)
     local_note = ""
-    if local_deleted:
+    if cleanup.get("deleted", 0) > 0:
         local_note = MESSAGES[lang]["delete_local_deleted"]
-    elif local_missing:
+    elif cleanup.get("missing", 0) > 0:
         local_note = MESSAGES[lang]["delete_local_missing"]
 
     delete_msg = MESSAGES[lang]["delete_done"].format(

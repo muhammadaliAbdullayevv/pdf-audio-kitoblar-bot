@@ -25,15 +25,6 @@ REQUIRED_DEP_KEYS = (
     "handle_file",
     "search_books",
     "language_command_handler",
-    "pdf_maker_command",
-    "pdf_editor_command",
-    "text_to_voice_command",
-    "sticker_tools_command",
-    "handle_pdf_maker_callback",
-    "handle_pdf_editor_callback",
-    "handle_tts_callback",
-    "handle_audio_converter_callback",
-    "handle_sticker_tools_callback",
     "handle_language_callback",
     "handle_page_callback",
     "handle_user_page_callback",
@@ -63,6 +54,7 @@ REQUIRED_DEP_KEYS = (
     "random_command",
     "top_command",
     "top_users_command",
+    "contact_admin_command",
     "help_command",
     "request_command",
     "requests_command",
@@ -116,15 +108,6 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(MessageHandler(filters.Document.ALL, d["handle_file"]))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, d["search_books"]))
     app.add_handler(CommandHandler("language", d["language_command_handler"]))
-    app.add_handler(CommandHandler("pdf_maker", d["pdf_maker_command"]))
-    app.add_handler(CommandHandler("pdf_editor", d["pdf_editor_command"]))
-    app.add_handler(CommandHandler("text_to_voice", d["text_to_voice_command"]))
-    app.add_handler(CommandHandler("sticker_tools", d["sticker_tools_command"]))
-    app.add_handler(CallbackQueryHandler(d["handle_pdf_maker_callback"], pattern="^pdfmk:"))
-    app.add_handler(CallbackQueryHandler(d["handle_pdf_editor_callback"], pattern="^pdfed:"))
-    app.add_handler(CallbackQueryHandler(d["handle_tts_callback"], pattern="^tts:"))
-    app.add_handler(CallbackQueryHandler(d["handle_audio_converter_callback"], pattern="^atool:"))
-    app.add_handler(CallbackQueryHandler(d["handle_sticker_tools_callback"], pattern="^stkr:"))
     app.add_handler(CallbackQueryHandler(d["handle_language_callback"], pattern="^lang_"))
     app.add_handler(CallbackQueryHandler(d["handle_page_callback"], pattern="^page:"))
     app.add_handler(CallbackQueryHandler(d["handle_user_page_callback"], pattern="^userpage:"))
@@ -154,6 +137,7 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CommandHandler("random", d["random_command"]))
     app.add_handler(CommandHandler("top", d["top_command"]))
     app.add_handler(CommandHandler("top_users", d["top_users_command"]))
+    app.add_handler(CommandHandler("contact_admin", d["contact_admin_command"]))
     app.add_handler(CommandHandler("help", d["help_command"]))
     app.add_handler(CommandHandler("request", d["request_command"]))
     app.add_handler(CommandHandler("requests", d["requests_command"]))

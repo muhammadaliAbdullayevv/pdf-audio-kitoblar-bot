@@ -2,3 +2,5 @@
 # Copy this file and replace `pdfbotadmin` with the account that should run the shortcut.
 pdfbotadmin ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
 pdfbotadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart pdf_audio_kitoblar_bot-bot.service
+pdfbotadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart pdf_audio_kitoblar_bot-worker.service
+pdfbotadmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart pdf_audio_kitoblar_bot-cleanup.service

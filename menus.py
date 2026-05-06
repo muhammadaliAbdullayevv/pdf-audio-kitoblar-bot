@@ -40,15 +40,7 @@ def build_main_menu_keyboard(
     labels = admin_labels or ADMIN_MENU_LABELS
     is_admin = bool(user_id and is_admin_user_fn(user_id))
 
-    if section == "other":
-        keyboard = [
-            [m.get("menu_text_to_voice", "🎙️ Text to Voice"), m.get("menu_pdf_maker", "🤖 AI PDF Maker")],
-            [m.get("menu_pdf_editor", "🧰 PDF Editor"), m.get("menu_audio_converter", "🎛️ Audio Editor")],
-            [m.get("menu_sticker_tools", "🧩 Sticker Tools"), m.get("menu_top_users", "🏆 Top Users")],
-            [m.get("menu_contact_admin", "📞 Contact Admin"), m.get("menu_help", "❓ Help")],
-            [m.get("menu_back", "⬅️ Back")],
-        ]
-    elif section == "admin":
+    if section == "admin":
         admin_items = [
             labels["admin_user_search"],
             labels["admin_upload"],
@@ -88,7 +80,6 @@ def build_main_menu_keyboard(
             [m.get("menu_search_books", "🔎 Search Books")],
             [m.get("menu_favorites", "⭐ Favorites")],
             [m.get("menu_myprofile", "👤 My Profile"), m.get("menu_top_books", "🔥 Top Books")],
-            [m.get("menu_other_functions", "🛠️ Other Functions")],
         ]
         if is_admin:
             keyboard.insert(1, [labels["admin_panel"]])
@@ -113,10 +104,6 @@ def build_main_menu_message_text(
     m = messages.get(lang, messages["en"])
     labels = admin_labels or ADMIN_MENU_LABELS
 
-    if section == "other":
-        title = m.get("menu_other_functions", "🛠️ Other Functions")
-        subtitle = m.get("menu_other_subtitle", "More tools and sections 👇")
-        return f"{title}\n{subtitle}"
     if section == "admin":
         return admin_guide_text_fn() if admin_guide_text_fn else labels["admin_panel"]
     if section.startswith("admin"):
@@ -138,8 +125,4 @@ def build_main_menu_chat_text(
     messages: dict,
 ) -> str:
     m = messages.get(lang, messages["en"])
-    return (
-        f"{m.get('menu_other_functions', '🛠️ Other Functions')}\n{m.get('menu_other_subtitle', 'More tools and sections 👇')}"
-        if section == "other"
-        else m.get("start_menu_subtitle", "Choose what you want to do 👇")
-    )
+    return m.get("start_menu_subtitle", "Choose what you want to do 👇")

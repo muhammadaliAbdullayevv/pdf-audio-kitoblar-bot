@@ -417,6 +417,47 @@ def _apply_schema_migrations(cur) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_background_jobs_locked_at ON background_jobs (locked_at) WHERE locked_at IS NOT NULL;",
             ],
         ),
+        (
+            23,
+            "remove deprecated media/pdf/tts/sticker tool job rows and counters",
+            [
+                """
+                DELETE FROM background_jobs
+                WHERE job_type IN (
+                    'pdf_maker',
+                    'pdf_editor',
+                    'tts_generate',
+                    'audio_convert',
+                    'sticker_convert',
+                    'PDF_CREATE',
+                    'PDF_MERGE',
+                    'PDF_SPLIT',
+                    'PDF_COMPRESS',
+                    'PDF_EDIT',
+                    'TEXT_TO_VOICE',
+                    'AUDIO_TRIM',
+                    'STICKER_CONVERT'
+                );
+                """,
+                "DELETE FROM analytics_counters WHERE key IN ('ai_pdf_created');",
+            ],
+        ),
+        (
+            24,
+            "remove deprecated video downloader jobs and counters",
+            [
+                "DELETE FROM background_jobs WHERE job_type IN ('video_download', 'VIDEO_DOWNLOAD');",
+                "DELETE FROM analytics_counters WHERE key = 'video_downloads' OR key LIKE 'video_dl_%';",
+            ],
+        ),
+        (
+            25,
+            "add delivery-path indexes",
+            [
+                "CREATE INDEX IF NOT EXISTS idx_books_display_name ON books (display_name);",
+                "CREATE INDEX IF NOT EXISTS idx_upload_receipts_book_id ON upload_receipts (book_id);",
+            ],
+        ),
     ]
     for version, note, stmts in migrations:
         if version in applied:
@@ -578,6 +619,7 @@ def init_db():
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_books_name ON books (book_name);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_books_display_name ON books (display_name);")
             cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS file_unique_id TEXT;")
             cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS downloads INTEGER NOT NULL DEFAULT 0;")
             cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS searches INTEGER NOT NULL DEFAULT 0;")
@@ -670,6 +712,7 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_upload_receipts_created_at ON upload_receipts (created_at DESC);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_upload_receipts_status ON upload_receipts (status);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_upload_receipts_file_unique_id ON upload_receipts (file_unique_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_upload_receipts_book_id ON upload_receipts (book_id);")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS book_summaries (
@@ -2245,6 +2288,66 @@ def get_book_by_id(book_id: str):
             return cur.fetchone()
 
 
+def get_book_delivery_snapshot(book_id: str, user_id: int | None = None):
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    b.*,
+                    j.status AS local_backup_status,
+                    j.attempts AS local_backup_attempts,
+                    j.max_attempts AS local_backup_max_attempts,
+                    j.last_error AS local_backup_error,
+                    j.next_attempt_at AS local_backup_next_attempt_at,
+                    j.updated_at AS local_backup_updated_at,
+                    j.completed_at AS local_backup_completed_at,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM user_favorites uf WHERE uf.book_id = b.id),
+                        0
+                    ) AS fav_count,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM book_reactions br WHERE br.book_id = b.id AND br.reaction = 'like'),
+                        0
+                    ) AS like_count,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM book_reactions br WHERE br.book_id = b.id AND br.reaction = 'dislike'),
+                        0
+                    ) AS dislike_count,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM book_reactions br WHERE br.book_id = b.id AND br.reaction = 'berry'),
+                        0
+                    ) AS berry_count,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM book_reactions br WHERE br.book_id = b.id AND br.reaction = 'whale'),
+                        0
+                    ) AS whale_count,
+                    EXISTS(
+                        SELECT 1
+                        FROM user_favorites uf
+                        WHERE uf.book_id = b.id AND uf.user_id = %s
+                    ) AS is_favorited,
+                    (
+                        SELECT br.reaction
+                        FROM book_reactions br
+                        WHERE br.book_id = b.id AND br.user_id = %s
+                        LIMIT 1
+                    ) AS user_reaction,
+                    EXISTS(
+                        SELECT 1
+                        FROM audio_books ab
+                        WHERE ab.book_id = b.id
+                    ) AS has_audiobook
+                FROM books b
+                LEFT JOIN book_local_download_jobs j ON j.book_id = b.id
+                WHERE b.id = %s
+                LIMIT 1
+                """,
+                (user_id, user_id, book_id),
+            )
+            return cur.fetchone()
+
+
 def get_book_summary(book_id: str, lang: str, mode: str):
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2536,27 +2639,27 @@ def get_book_stats(book_id: str):
                 """
                 SELECT
                     COALESCE(b.downloads, 0) AS downloads,
-                    COALESCE(f.fav_count, 0) AS fav_count,
-                    COALESCE(r.like_count, 0) AS like_count,
-                    COALESCE(r.dislike_count, 0) AS dislike_count,
-                    COALESCE(r.berry_count, 0) AS berry_count,
-                    COALESCE(r.whale_count, 0) AS whale_count
+                    COALESCE(
+                        (SELECT COUNT(*) FROM user_favorites uf WHERE uf.book_id = b.id),
+                        0
+                    ) AS fav_count,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM book_reactions br WHERE br.book_id = b.id AND br.reaction = 'like'),
+                        0
+                    ) AS like_count,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM book_reactions br WHERE br.book_id = b.id AND br.reaction = 'dislike'),
+                        0
+                    ) AS dislike_count,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM book_reactions br WHERE br.book_id = b.id AND br.reaction = 'berry'),
+                        0
+                    ) AS berry_count,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM book_reactions br WHERE br.book_id = b.id AND br.reaction = 'whale'),
+                        0
+                    ) AS whale_count
                 FROM books b
-                LEFT JOIN (
-                    SELECT book_id, COUNT(*) AS fav_count
-                    FROM user_favorites
-                    GROUP BY book_id
-                ) f ON f.book_id = b.id
-                LEFT JOIN (
-                    SELECT
-                        book_id,
-                        SUM(CASE WHEN reaction='like' THEN 1 ELSE 0 END) AS like_count,
-                        SUM(CASE WHEN reaction='dislike' THEN 1 ELSE 0 END) AS dislike_count,
-                        SUM(CASE WHEN reaction='berry' THEN 1 ELSE 0 END) AS berry_count,
-                        SUM(CASE WHEN reaction='whale' THEN 1 ELSE 0 END) AS whale_count
-                    FROM book_reactions
-                    GROUP BY book_id
-                ) r ON r.book_id = b.id
                 WHERE b.id = %s
                 """,
                 (book_id,),
@@ -3679,6 +3782,16 @@ def list_recent_upload_receipts(limit: int = 20, pending_only: bool = False):
             return cur.fetchall()
 
 
+def get_upload_receipt_by_id(receipt_id: str):
+    receipt_id = str(receipt_id or "").strip()
+    if not receipt_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM upload_receipts WHERE id=%s LIMIT 1", (receipt_id,))
+            return cur.fetchone()
+
+
 def update_book_by_path(path: str, file_id: str | None = None, indexed: bool | None = None):
     fields = []
     values = []
@@ -4167,9 +4280,14 @@ def delete_book_and_related(book_id: str) -> int:
             # Delete audiobook references first (foreign key constraint)
             cur.execute("DELETE FROM audio_books WHERE book_id=%s", (book_id,))
             # Delete other related records
+            cur.execute("DELETE FROM book_local_download_jobs WHERE book_id=%s", (book_id,))
+            cur.execute("DELETE FROM upload_receipts WHERE book_id=%s", (book_id,))
+            cur.execute("DELETE FROM book_summaries WHERE book_id=%s", (book_id,))
             cur.execute("DELETE FROM user_favorites WHERE book_id=%s", (book_id,))
+            cur.execute("DELETE FROM user_favorite_awards WHERE book_id=%s", (book_id,))
             cur.execute("DELETE FROM user_recents WHERE book_id=%s", (book_id,))
             cur.execute("DELETE FROM book_reactions WHERE book_id=%s", (book_id,))
+            cur.execute("DELETE FROM user_reaction_awards WHERE book_id=%s", (book_id,))
             cur.execute("UPDATE book_requests SET book_id=NULL WHERE book_id=%s", (book_id,))
             # Finally delete the book
             cur.execute("DELETE FROM books WHERE id=%s", (book_id,))
