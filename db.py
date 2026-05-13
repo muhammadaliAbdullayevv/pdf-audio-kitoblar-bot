@@ -73,6 +73,14 @@ def _background_job_limit_pending() -> int:
     return max(1, _env_int("MAX_PENDING_JOBS_PER_USER", 5))
 
 
+def _guest_docs_forbidden_threshold() -> int:
+    return max(1, _env_int("GUEST_DOCS_FORBIDDEN_THRESHOLD", 2))
+
+
+def _guest_docs_skip_minutes() -> int:
+    return max(5, _env_int("GUEST_DOCS_SKIP_MINUTES", 720))
+
+
 def _background_job_user_has_limit_bypass(user_id: int) -> bool:
     owner_id = _background_job_owner_id()
     return bool(owner_id and int(user_id or 0) == owner_id)
@@ -458,6 +466,132 @@ def _apply_schema_migrations(cur) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_upload_receipts_book_id ON upload_receipts (book_id);",
             ],
         ),
+        (
+            26,
+            "guest mode analytics: persist guest group usage",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS guest_groups (
+                    chat_id BIGINT PRIMARY KEY,
+                    chat_type TEXT,
+                    title TEXT,
+                    username TEXT,
+                    public_link TEXT,
+                    last_query TEXT,
+                    searches INTEGER NOT NULL DEFAULT 0,
+                    last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_guest_groups_last_seen ON guest_groups (last_seen_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_guest_groups_username ON guest_groups (username);",
+            ],
+        ),
+        (
+            27,
+            "guest mode analytics: add missing first_seen_at to existing guest_groups tables",
+            [
+                "ALTER TABLE guest_groups ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP NOT NULL DEFAULT NOW();",
+                "ALTER TABLE guest_groups ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP NOT NULL DEFAULT NOW();",
+            ],
+        ),
+        (
+            28,
+            "guest mode: persist private-chat handoff payloads",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS guest_private_handoffs (
+                    token TEXT PRIMARY KEY,
+                    handoff_type TEXT NOT NULL DEFAULT 'query',
+                    creator_user_id BIGINT,
+                    query_text TEXT,
+                    book_id TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    last_used_at TIMESTAMP,
+                    use_count INTEGER NOT NULL DEFAULT 0
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_guest_private_handoffs_created_at ON guest_private_handoffs (created_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_guest_private_handoffs_book_id ON guest_private_handoffs (book_id);",
+            ],
+        ),
+        (
+            29,
+            "guest mode analytics: persist guest user searches",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS guest_user_activity (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    chat_id BIGINT,
+                    chat_type TEXT,
+                    group_title TEXT,
+                    group_username TEXT,
+                    public_link TEXT,
+                    query_text TEXT,
+                    searched_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_guest_user_activity_ts ON guest_user_activity (searched_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_guest_user_activity_user ON guest_user_activity (user_id, searched_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_guest_user_activity_chat ON guest_user_activity (chat_id, searched_at DESC);",
+            ],
+        ),
+        (
+            30,
+            "inline analytics: persist inline searches and chosen results",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS inline_search_activity (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    query_text TEXT,
+                    searched_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_inline_search_activity_ts ON inline_search_activity (searched_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_inline_search_activity_user ON inline_search_activity (user_id, searched_at DESC);",
+                """
+                CREATE TABLE IF NOT EXISTS inline_chosen_activity (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    query_text TEXT,
+                    result_id TEXT,
+                    chosen_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_inline_chosen_activity_ts ON inline_chosen_activity (chosen_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_inline_chosen_activity_user ON inline_chosen_activity (user_id, chosen_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_inline_chosen_activity_result ON inline_chosen_activity (result_id, chosen_at DESC);",
+            ],
+        ),
+        (
+            31,
+            "guest mode: persist source chat and delivery capability memory",
+            [
+                "ALTER TABLE guest_private_handoffs ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;",
+                "ALTER TABLE guest_private_handoffs ADD COLUMN IF NOT EXISTS source_chat_type TEXT;",
+                "ALTER TABLE guest_private_handoffs ADD COLUMN IF NOT EXISTS source_chat_title TEXT;",
+                "ALTER TABLE guest_private_handoffs ADD COLUMN IF NOT EXISTS source_chat_username TEXT;",
+                "ALTER TABLE guest_private_handoffs ADD COLUMN IF NOT EXISTS source_public_link TEXT;",
+                "CREATE INDEX IF NOT EXISTS idx_guest_private_handoffs_source_chat_id ON guest_private_handoffs (source_chat_id);",
+                "ALTER TABLE guest_groups ADD COLUMN IF NOT EXISTS guest_doc_forbidden_count INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE guest_groups ADD COLUMN IF NOT EXISTS guest_doc_success_count INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE guest_groups ADD COLUMN IF NOT EXISTS guest_doc_skip_until TIMESTAMP;",
+                "ALTER TABLE guest_groups ADD COLUMN IF NOT EXISTS guest_doc_last_forbidden_at TIMESTAMP;",
+                "ALTER TABLE guest_groups ADD COLUMN IF NOT EXISTS guest_doc_last_success_at TIMESTAMP;",
+            ],
+        ),
     ]
     for version, note, stmts in migrations:
         if version in applied:
@@ -680,6 +814,28 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_group_private_start_prompts_chat_msg ON group_private_start_prompts (chat_id, message_id);")
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS guest_private_handoffs (
+                    token TEXT PRIMARY KEY,
+                    handoff_type TEXT NOT NULL DEFAULT 'query',
+                    creator_user_id BIGINT,
+                    query_text TEXT,
+                    book_id TEXT,
+                    source_chat_id BIGINT,
+                    source_chat_type TEXT,
+                    source_chat_title TEXT,
+                    source_chat_username TEXT,
+                    source_public_link TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    last_used_at TIMESTAMP,
+                    use_count INTEGER NOT NULL DEFAULT 0
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_private_handoffs_created_at ON guest_private_handoffs (created_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_private_handoffs_book_id ON guest_private_handoffs (book_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_private_handoffs_source_chat_id ON guest_private_handoffs (source_chat_id);")
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS bot_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -817,6 +973,81 @@ def init_db():
                 );
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guest_groups (
+                    chat_id BIGINT PRIMARY KEY,
+                    chat_type TEXT,
+                    title TEXT,
+                    username TEXT,
+                    public_link TEXT,
+                    last_query TEXT,
+                    searches BIGINT NOT NULL DEFAULT 0,
+                    first_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    guest_doc_forbidden_count INTEGER NOT NULL DEFAULT 0,
+                    guest_doc_success_count INTEGER NOT NULL DEFAULT 0,
+                    guest_doc_skip_until TIMESTAMP,
+                    guest_doc_last_forbidden_at TIMESTAMP,
+                    guest_doc_last_success_at TIMESTAMP
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_groups_last_seen ON guest_groups (last_seen_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_groups_username ON guest_groups (username);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guest_user_activity (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    chat_id BIGINT,
+                    chat_type TEXT,
+                    group_title TEXT,
+                    group_username TEXT,
+                    public_link TEXT,
+                    query_text TEXT,
+                    searched_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_user_activity_ts ON guest_user_activity (searched_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_user_activity_user ON guest_user_activity (user_id, searched_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_user_activity_chat ON guest_user_activity (chat_id, searched_at DESC);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS inline_search_activity (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    query_text TEXT,
+                    searched_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_inline_search_activity_ts ON inline_search_activity (searched_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_inline_search_activity_user ON inline_search_activity (user_id, searched_at DESC);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS inline_chosen_activity (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    query_text TEXT,
+                    result_id TEXT,
+                    chosen_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_inline_chosen_activity_ts ON inline_chosen_activity (chosen_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_inline_chosen_activity_user ON inline_chosen_activity (user_id, chosen_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_inline_chosen_activity_result ON inline_chosen_activity (result_id, chosen_at DESC);")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS book_requests (
@@ -1806,6 +2037,672 @@ def get_daily_analytics(day: date):
             }
 
 
+def upsert_guest_group(
+    chat_id: int,
+    chat_type: str | None = None,
+    title: str | None = None,
+    username: str | None = None,
+    public_link: str | None = None,
+    last_query: str | None = None,
+    increment_searches: bool = False,
+) -> dict[str, Any]:
+    try:
+        safe_chat_id = int(chat_id or 0)
+    except Exception:
+        safe_chat_id = 0
+    if not safe_chat_id:
+        return {}
+
+    safe_chat_type = str(chat_type or "").strip()
+    safe_title = str(title or "").strip()
+    safe_username = str(username or "").strip().lstrip("@")
+    safe_public_link = str(public_link or "").strip()
+    safe_last_query = str(last_query or "").strip()
+    inc = 1 if increment_searches else 0
+
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO guest_groups (
+                    chat_id,
+                    chat_type,
+                    title,
+                    username,
+                    public_link,
+                    last_query,
+                    searches,
+                    first_seen_at,
+                    last_seen_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    chat_type = COALESCE(NULLIF(EXCLUDED.chat_type, ''), guest_groups.chat_type),
+                    title = COALESCE(NULLIF(EXCLUDED.title, ''), guest_groups.title),
+                    username = COALESCE(NULLIF(EXCLUDED.username, ''), guest_groups.username),
+                    public_link = COALESCE(NULLIF(EXCLUDED.public_link, ''), guest_groups.public_link),
+                    last_query = COALESCE(NULLIF(EXCLUDED.last_query, ''), guest_groups.last_query),
+                    searches = guest_groups.searches + %s,
+                    last_seen_at = NOW()
+                RETURNING
+                    chat_id,
+                    chat_type,
+                    title,
+                    username,
+                    public_link,
+                    last_query,
+                    searches,
+                    first_seen_at,
+                    last_seen_at
+                """,
+                (
+                    safe_chat_id,
+                    safe_chat_type,
+                    safe_title,
+                    safe_username,
+                    safe_public_link,
+                    safe_last_query,
+                    inc,
+                    inc,
+                ),
+            )
+            row = cur.fetchone()
+            return dict(row or {})
+
+
+def get_guest_group_audit_stats(limit: int = 5) -> dict[str, Any]:
+    safe_limit = max(1, min(20, int(limit or 5)))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_groups,
+                    COALESCE(SUM(searches), 0) AS total_group_searches
+                FROM guest_groups
+                WHERE chat_type IN ('group', 'supergroup')
+                """
+            )
+            summary = cur.fetchone() or {}
+            cur.execute(
+                """
+                SELECT
+                    chat_id,
+                    chat_type,
+                    title,
+                    username,
+                    public_link,
+                    last_query,
+                    searches,
+                    first_seen_at,
+                    last_seen_at
+                FROM guest_groups
+                WHERE chat_type IN ('group', 'supergroup')
+                ORDER BY last_seen_at DESC, searches DESC, chat_id DESC
+                LIMIT %s
+                """,
+                (safe_limit,),
+            )
+            groups = [dict(row or {}) for row in (cur.fetchall() or [])]
+            return {
+                "total_groups": int((summary or {}).get("total_groups") or 0),
+                "total_group_searches": int((summary or {}).get("total_group_searches") or 0),
+                "groups": groups,
+            }
+
+
+def record_guest_user_activity(
+    user_id: int | None,
+    username: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    chat_id: int | None = None,
+    chat_type: str | None = None,
+    group_title: str | None = None,
+    group_username: str | None = None,
+    public_link: str | None = None,
+    query_text: str | None = None,
+) -> dict[str, Any]:
+    try:
+        safe_user_id = int(user_id or 0) or None
+    except Exception:
+        safe_user_id = None
+    try:
+        safe_chat_id = int(chat_id or 0) or None
+    except Exception:
+        safe_chat_id = None
+
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO guest_user_activity (
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    chat_id,
+                    chat_type,
+                    group_title,
+                    group_username,
+                    public_link,
+                    query_text,
+                    searched_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                RETURNING
+                    id,
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    chat_id,
+                    chat_type,
+                    group_title,
+                    group_username,
+                    public_link,
+                    query_text,
+                    searched_at
+                """,
+                (
+                    safe_user_id,
+                    str(username or "").strip().lstrip("@"),
+                    str(first_name or "").strip(),
+                    str(last_name or "").strip(),
+                    safe_chat_id,
+                    str(chat_type or "").strip(),
+                    str(group_title or "").strip(),
+                    str(group_username or "").strip().lstrip("@"),
+                    str(public_link or "").strip(),
+                    str(query_text or "").strip(),
+                ),
+            )
+            row = cur.fetchone()
+            return dict(row or {})
+
+
+def get_guest_user_audit_stats(limit: int = 10) -> dict[str, Any]:
+    safe_limit = max(1, min(25, int(limit or 10)))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_searches,
+                    COUNT(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL) AS total_users
+                FROM guest_user_activity
+                """
+            )
+            summary = dict(cur.fetchone() or {})
+            cur.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    COUNT(*) AS searches,
+                    MAX(searched_at) AS last_seen_at
+                FROM guest_user_activity
+                WHERE user_id IS NOT NULL
+                GROUP BY user_id, username, first_name, last_name
+                ORDER BY searches DESC, last_seen_at DESC, user_id DESC
+                LIMIT %s
+                """,
+                (safe_limit,),
+            )
+            top_users = [dict(row or {}) for row in (cur.fetchall() or [])]
+            cur.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    chat_id,
+                    chat_type,
+                    group_title,
+                    group_username,
+                    public_link,
+                    query_text,
+                    searched_at
+                FROM guest_user_activity
+                ORDER BY searched_at DESC, id DESC
+                LIMIT %s
+                """,
+                (safe_limit,),
+            )
+            recent_searches = [dict(row or {}) for row in (cur.fetchall() or [])]
+            return {
+                "total_searches": int(summary.get("total_searches") or 0),
+                "total_users": int(summary.get("total_users") or 0),
+                "top_users": top_users,
+                "recent_searches": recent_searches,
+            }
+
+
+def record_inline_search_activity(
+    user_id: int | None,
+    username: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    query_text: str | None = None,
+) -> dict[str, Any]:
+    try:
+        safe_user_id = int(user_id or 0) or None
+    except Exception:
+        safe_user_id = None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO inline_search_activity (
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    query_text,
+                    searched_at
+                )
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                RETURNING id, user_id, username, first_name, last_name, query_text, searched_at
+                """,
+                (
+                    safe_user_id,
+                    str(username or "").strip().lstrip("@"),
+                    str(first_name or "").strip(),
+                    str(last_name or "").strip(),
+                    str(query_text or "").strip(),
+                ),
+            )
+            row = cur.fetchone()
+            return dict(row or {})
+
+
+def record_inline_chosen_activity(
+    user_id: int | None,
+    username: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    query_text: str | None = None,
+    result_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        safe_user_id = int(user_id or 0) or None
+    except Exception:
+        safe_user_id = None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO inline_chosen_activity (
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    query_text,
+                    result_id,
+                    chosen_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                RETURNING id, user_id, username, first_name, last_name, query_text, result_id, chosen_at
+                """,
+                (
+                    safe_user_id,
+                    str(username or "").strip().lstrip("@"),
+                    str(first_name or "").strip(),
+                    str(last_name or "").strip(),
+                    str(query_text or "").strip(),
+                    str(result_id or "").strip(),
+                ),
+            )
+            row = cur.fetchone()
+            return dict(row or {})
+
+
+def get_inline_audit_stats(limit: int = 10) -> dict[str, Any]:
+    safe_limit = max(1, min(25, int(limit or 10)))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM inline_search_activity) AS total_searches,
+                    (SELECT COUNT(DISTINCT user_id) FROM inline_search_activity WHERE user_id IS NOT NULL) AS total_users,
+                    (SELECT COUNT(*) FROM inline_chosen_activity) AS total_choices
+                """
+            )
+            summary = dict(cur.fetchone() or {})
+            cur.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    COUNT(*) AS searches,
+                    MAX(searched_at) AS last_seen_at
+                FROM inline_search_activity
+                WHERE user_id IS NOT NULL
+                GROUP BY user_id, username, first_name, last_name
+                ORDER BY searches DESC, last_seen_at DESC, user_id DESC
+                LIMIT %s
+                """,
+                (safe_limit,),
+            )
+            top_users = [dict(row or {}) for row in (cur.fetchall() or [])]
+            cur.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    query_text,
+                    searched_at
+                FROM inline_search_activity
+                ORDER BY searched_at DESC, id DESC
+                LIMIT %s
+                """,
+                (safe_limit,),
+            )
+            recent_searches = [dict(row or {}) for row in (cur.fetchall() or [])]
+            cur.execute(
+                """
+                SELECT
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    query_text,
+                    result_id,
+                    chosen_at
+                FROM inline_chosen_activity
+                ORDER BY chosen_at DESC, id DESC
+                LIMIT %s
+                """,
+                (safe_limit,),
+            )
+            recent_choices = [dict(row or {}) for row in (cur.fetchall() or [])]
+            return {
+                "total_searches": int(summary.get("total_searches") or 0),
+                "total_users": int(summary.get("total_users") or 0),
+                "total_choices": int(summary.get("total_choices") or 0),
+                "top_users": top_users,
+                "recent_searches": recent_searches,
+                "recent_choices": recent_choices,
+            }
+
+
+def create_guest_private_handoff(
+    handoff_type: str,
+    creator_user_id: int | None = None,
+    query_text: str | None = None,
+    book_id: str | None = None,
+    source_chat_id: int | None = None,
+    source_chat_type: str | None = None,
+    source_chat_title: str | None = None,
+    source_chat_username: str | None = None,
+    source_public_link: str | None = None,
+    token: str | None = None,
+) -> dict[str, Any]:
+    safe_type = str(handoff_type or "query").strip().lower() or "query"
+    if safe_type not in {"query", "book"}:
+        safe_type = "query"
+    safe_token = str(token or uuid.uuid4().hex[:12]).strip()
+    if not safe_token:
+        safe_token = uuid.uuid4().hex[:12]
+    try:
+        safe_creator_user_id = int(creator_user_id or 0) or None
+    except Exception:
+        safe_creator_user_id = None
+    try:
+        safe_source_chat_id = int(source_chat_id or 0) or None
+    except Exception:
+        safe_source_chat_id = None
+    safe_query_text = str(query_text or "").strip()
+    safe_book_id = str(book_id or "").strip()
+    safe_source_chat_type = str(source_chat_type or "").strip().lower()
+    safe_source_chat_title = str(source_chat_title or "").strip()
+    safe_source_chat_username = str(source_chat_username or "").strip().lstrip("@")
+    safe_source_public_link = str(source_public_link or "").strip()
+
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO guest_private_handoffs (
+                    token,
+                    handoff_type,
+                    creator_user_id,
+                    query_text,
+                    book_id,
+                    source_chat_id,
+                    source_chat_type,
+                    source_chat_title,
+                    source_chat_username,
+                    source_public_link,
+                    created_at,
+                    last_used_at,
+                    use_count
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NULL, 0)
+                ON CONFLICT (token) DO UPDATE SET
+                    handoff_type = EXCLUDED.handoff_type,
+                    creator_user_id = COALESCE(EXCLUDED.creator_user_id, guest_private_handoffs.creator_user_id),
+                    query_text = COALESCE(NULLIF(EXCLUDED.query_text, ''), guest_private_handoffs.query_text),
+                    book_id = COALESCE(NULLIF(EXCLUDED.book_id, ''), guest_private_handoffs.book_id),
+                    source_chat_id = COALESCE(EXCLUDED.source_chat_id, guest_private_handoffs.source_chat_id),
+                    source_chat_type = COALESCE(NULLIF(EXCLUDED.source_chat_type, ''), guest_private_handoffs.source_chat_type),
+                    source_chat_title = COALESCE(NULLIF(EXCLUDED.source_chat_title, ''), guest_private_handoffs.source_chat_title),
+                    source_chat_username = COALESCE(NULLIF(EXCLUDED.source_chat_username, ''), guest_private_handoffs.source_chat_username),
+                    source_public_link = COALESCE(NULLIF(EXCLUDED.source_public_link, ''), guest_private_handoffs.source_public_link)
+                RETURNING token, handoff_type, creator_user_id, query_text, book_id, source_chat_id, source_chat_type, source_chat_title, source_chat_username, source_public_link, created_at, last_used_at, use_count
+                """,
+                (
+                    safe_token,
+                    safe_type,
+                    safe_creator_user_id,
+                    safe_query_text,
+                    safe_book_id,
+                    safe_source_chat_id,
+                    safe_source_chat_type,
+                    safe_source_chat_title,
+                    safe_source_chat_username,
+                    safe_source_public_link,
+                ),
+            )
+            row = cur.fetchone()
+            return dict(row or {})
+
+
+def get_guest_private_handoff_by_token(token: str) -> dict[str, Any] | None:
+    safe_token = str(token or "").strip()
+    if not safe_token:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT token, handoff_type, creator_user_id, query_text, book_id, source_chat_id, source_chat_type, source_chat_title, source_chat_username, source_public_link, created_at, last_used_at, use_count
+                FROM guest_private_handoffs
+                WHERE token = %s
+                LIMIT 1
+                """,
+                (safe_token,),
+            )
+            row = cur.fetchone()
+            return dict(row or {}) if row else None
+
+
+def touch_guest_private_handoff(token: str) -> dict[str, Any] | None:
+    safe_token = str(token or "").strip()
+    if not safe_token:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE guest_private_handoffs
+                SET last_used_at = NOW(),
+                    use_count = use_count + 1
+                WHERE token = %s
+                RETURNING token, handoff_type, creator_user_id, query_text, book_id, source_chat_id, source_chat_type, source_chat_title, source_chat_username, source_public_link, created_at, last_used_at, use_count
+                """,
+                (safe_token,),
+            )
+            row = cur.fetchone()
+            return dict(row or {}) if row else None
+
+
+def get_guest_group_delivery_capability(chat_id: int) -> dict[str, Any]:
+    try:
+        safe_chat_id = int(chat_id or 0)
+    except Exception:
+        safe_chat_id = 0
+    if not safe_chat_id:
+        return {
+            "chat_id": 0,
+            "guest_doc_forbidden_count": 0,
+            "guest_doc_success_count": 0,
+            "guest_doc_skip_until": None,
+            "guest_doc_last_forbidden_at": None,
+            "guest_doc_last_success_at": None,
+            "skip_same_chat_delivery": False,
+        }
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    chat_id,
+                    guest_doc_forbidden_count,
+                    guest_doc_success_count,
+                    guest_doc_skip_until,
+                    guest_doc_last_forbidden_at,
+                    guest_doc_last_success_at,
+                    CASE
+                        WHEN guest_doc_skip_until IS NOT NULL AND guest_doc_skip_until > NOW() THEN TRUE
+                        ELSE FALSE
+                    END AS skip_same_chat_delivery
+                FROM guest_groups
+                WHERE chat_id = %s
+                LIMIT 1
+                """,
+                (safe_chat_id,),
+            )
+            row = cur.fetchone()
+            return dict(row or {
+                "chat_id": safe_chat_id,
+                "guest_doc_forbidden_count": 0,
+                "guest_doc_success_count": 0,
+                "guest_doc_skip_until": None,
+                "guest_doc_last_forbidden_at": None,
+                "guest_doc_last_success_at": None,
+                "skip_same_chat_delivery": False,
+            })
+
+
+def mark_guest_group_delivery_forbidden(chat_id: int) -> dict[str, Any]:
+    try:
+        safe_chat_id = int(chat_id or 0)
+    except Exception:
+        safe_chat_id = 0
+    if not safe_chat_id:
+        return {}
+    threshold = _guest_docs_forbidden_threshold()
+    skip_minutes = _guest_docs_skip_minutes()
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO guest_groups (
+                    chat_id,
+                    first_seen_at,
+                    last_seen_at,
+                    searches
+                )
+                VALUES (%s, NOW(), NOW(), 0)
+                ON CONFLICT (chat_id) DO NOTHING
+                """,
+                (safe_chat_id,),
+            )
+            cur.execute(
+                """
+                UPDATE guest_groups
+                SET guest_doc_forbidden_count = guest_doc_forbidden_count + 1,
+                    guest_doc_last_forbidden_at = NOW(),
+                    guest_doc_skip_until = CASE
+                        WHEN guest_doc_forbidden_count + 1 >= %s
+                            THEN NOW() + (%s * INTERVAL '1 minute')
+                        ELSE guest_doc_skip_until
+                    END,
+                    last_seen_at = NOW()
+                WHERE chat_id = %s
+                RETURNING
+                    chat_id,
+                    guest_doc_forbidden_count,
+                    guest_doc_success_count,
+                    guest_doc_skip_until,
+                    guest_doc_last_forbidden_at,
+                    guest_doc_last_success_at,
+                    CASE
+                        WHEN guest_doc_skip_until IS NOT NULL AND guest_doc_skip_until > NOW() THEN TRUE
+                        ELSE FALSE
+                    END AS skip_same_chat_delivery
+                """,
+                (threshold, skip_minutes, safe_chat_id),
+            )
+            row = cur.fetchone()
+            return dict(row or {})
+
+
+def mark_guest_group_delivery_success(chat_id: int) -> dict[str, Any]:
+    try:
+        safe_chat_id = int(chat_id or 0)
+    except Exception:
+        safe_chat_id = 0
+    if not safe_chat_id:
+        return {}
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO guest_groups (
+                    chat_id,
+                    first_seen_at,
+                    last_seen_at,
+                    searches
+                )
+                VALUES (%s, NOW(), NOW(), 0)
+                ON CONFLICT (chat_id) DO NOTHING
+                """,
+                (safe_chat_id,),
+            )
+            cur.execute(
+                """
+                UPDATE guest_groups
+                SET guest_doc_success_count = guest_doc_success_count + 1,
+                    guest_doc_last_success_at = NOW(),
+                    guest_doc_forbidden_count = 0,
+                    guest_doc_skip_until = NULL,
+                    last_seen_at = NOW()
+                WHERE chat_id = %s
+                RETURNING
+                    chat_id,
+                    guest_doc_forbidden_count,
+                    guest_doc_success_count,
+                    guest_doc_skip_until,
+                    guest_doc_last_forbidden_at,
+                    guest_doc_last_success_at,
+                    FALSE AS skip_same_chat_delivery
+                """,
+                (safe_chat_id,),
+            )
+            row = cur.fetchone()
+            return dict(row or {})
+
+
 def backfill_counters_if_empty() -> bool:
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -1912,6 +2809,32 @@ def get_db_stats():
                 stats["counts"]["books_indexed"] = int(cur.fetchone()[0])
     except Exception as e:
         stats["error"] = str(e)
+    return stats
+
+
+def ping_db():
+    stats = {"ok": False, "error": None, "database": None}
+    if psycopg2 is None:
+        stats["error"] = "psycopg2 unavailable"
+        return stats
+    conn = None
+    try:
+        params = dict(_dsn())
+        params["connect_timeout"] = 3
+        conn = psycopg2.connect(**params)
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_database()")
+            row = cur.fetchone()
+            stats["database"] = row[0] if row else None
+        stats["ok"] = True
+    except Exception as e:
+        stats["error"] = str(e)
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
     return stats
 
 

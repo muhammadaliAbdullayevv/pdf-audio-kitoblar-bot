@@ -14,7 +14,7 @@ from telegram import (
 )
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
-_PUBLIC_PREFERRED_ORDER = ("start", "random", "top_users", "help", "contact_admin", "language", "upload")
+_PUBLIC_PREFERRED_ORDER = ("start", "help", "settings", "random", "request", "top_users", "contact_admin")
 _COMMAND_SYNC_BACKOFF_KEY = "command_sync_backoff_until"
 _USER_COMMANDS_LANG_CACHE_KEY = "user_commands_lang_cache"
 _USER_COMMANDS_LAST_SYNC_KEY = "user_commands_last_sync"
@@ -25,30 +25,30 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
     localized = {
         "en": [
             BotCommand("start", "🚀 Start / choose language"),
+            BotCommand("help", "❓ How to use the bot"),
+            BotCommand("settings", "⚙️ Language and preferences"),
             BotCommand("random", "🎲 Get 10 random books"),
+            BotCommand("request", "📝 Request a missing book"),
             BotCommand("top_users", "🏆 View top users"),
             BotCommand("contact_admin", "📞 Contact the admin"),
-            BotCommand("upload", "⬆️ Upload books to the bot"),
-            BotCommand("language", "🌐 Change language"),
-            BotCommand("help", "❓ How to use the bot"),
         ],
         "ru": [
             BotCommand("start", "🚀 Запуск / выбор языка"),
+            BotCommand("help", "❓ Как пользоваться ботом"),
+            BotCommand("settings", "⚙️ Язык и настройки"),
             BotCommand("random", "🎲 10 случайных книг"),
+            BotCommand("request", "📝 Запросить книгу"),
             BotCommand("top_users", "🏆 Топ пользователей"),
             BotCommand("contact_admin", "📞 Связаться с админом"),
-            BotCommand("upload", "⬆️ Загружать книги в бота"),
-            BotCommand("language", "🌐 Сменить язык"),
-            BotCommand("help", "❓ Как пользоваться ботом"),
         ],
         "uz": [
             BotCommand("start", "🚀 Botni ishga tushirish / til tanlash"),
+            BotCommand("help", "❓ Botdan foydalanish"),
+            BotCommand("settings", "⚙️ Til va sozlamalar"),
             BotCommand("random", "🎲 10 ta tasodifiy kitob"),
+            BotCommand("request", "📝 Yetishmayotgan kitobni so‘rash"),
             BotCommand("top_users", "🏆 Top foydalanuvchilar"),
             BotCommand("contact_admin", "📞 Admin bilan aloqa"),
-            BotCommand("upload", "⬆️ Botga kitob yuklash"),
-            BotCommand("language", "🌐 Tilni o‘zgartirish"),
-            BotCommand("help", "❓ Botdan foydalanish"),
         ],
     }
     return localized.get(lang, localized["en"])
@@ -94,7 +94,7 @@ def _set_sync_backoff(application, seconds: float) -> None:
 def get_group_commands(lang: str = "en") -> list[BotCommand]:
     by_name = {cmd.command: cmd for cmd in get_public_commands(lang)}
     ordered: list[BotCommand] = []
-    for name in ("start", "random", "top_users", "help", "contact_admin", "language", "upload"):
+    for name in ("start", "help", "settings", "random", "top_users", "contact_admin"):
         cmd = by_name.get(name)
         if cmd:
             ordered.append(cmd)
@@ -107,7 +107,45 @@ def get_group_admin_commands(lang: str = "en") -> list[BotCommand]:
 
 
 def get_admin_commands(lang: str = "en") -> list[BotCommand]:
-    return list(get_public_commands_for_menu(lang))
+    localized = {
+        "en": [
+            BotCommand("start", "🚀 Start / choose language"),
+            BotCommand("help", "❓ How to use the bot"),
+            BotCommand("settings", "⚙️ Language and preferences"),
+            BotCommand("admin", "🛠 Open admin control"),
+            BotCommand("upload", "⬆️ Upload books"),
+            BotCommand("audit", "🧾 System audit report"),
+            BotCommand("random", "🎲 Get 10 random books"),
+            BotCommand("request", "📝 Request a missing book"),
+            BotCommand("top_users", "🏆 View top users"),
+            BotCommand("contact_admin", "📞 Contact the admin"),
+        ],
+        "ru": [
+            BotCommand("start", "🚀 Запуск / выбор языка"),
+            BotCommand("help", "❓ Как пользоваться ботом"),
+            BotCommand("settings", "⚙️ Язык и настройки"),
+            BotCommand("admin", "🛠 Открыть админ-панель"),
+            BotCommand("upload", "⬆️ Загрузить книги"),
+            BotCommand("audit", "🧾 Системный аудит"),
+            BotCommand("random", "🎲 10 случайных книг"),
+            BotCommand("request", "📝 Запросить книгу"),
+            BotCommand("top_users", "🏆 Топ пользователей"),
+            BotCommand("contact_admin", "📞 Связаться с админом"),
+        ],
+        "uz": [
+            BotCommand("start", "🚀 Botni ishga tushirish / til tanlash"),
+            BotCommand("help", "❓ Botdan foydalanish"),
+            BotCommand("settings", "⚙️ Til va sozlamalar"),
+            BotCommand("admin", "🛠 Admin boshqaruvi"),
+            BotCommand("upload", "⬆️ Kitob yuklash"),
+            BotCommand("audit", "🧾 Tizim auditi"),
+            BotCommand("random", "🎲 10 ta tasodifiy kitob"),
+            BotCommand("request", "📝 Yetishmayotgan kitobni so‘rash"),
+            BotCommand("top_users", "🏆 Top foydalanuvchilar"),
+            BotCommand("contact_admin", "📞 Admin bilan aloqa"),
+        ],
+    }
+    return localized.get(lang, localized["en"])
 
 
 async def set_bot_commands(

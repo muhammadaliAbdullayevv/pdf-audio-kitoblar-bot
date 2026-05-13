@@ -1,10 +1,10 @@
 # 📚 pdf_audio_kitoblar_bot
 
 A multilingual Telegram digital library platform for discovering, delivering, and
-managing PDF books and audiobooks.
+managing books and audiobooks inside Telegram.
 
 This project is designed as a real-world Telegram product rather than a small demo bot.
-It combines book search, file delivery, audiobook navigation, media utilities, and
+It combines book search, file delivery, audiobook navigation, and
 admin operations into one production-oriented system built with Python,
 PostgreSQL, Elasticsearch, and background job processing.
 
@@ -27,8 +27,7 @@ backend system behind it.
 - Multilingual Telegram UX with dedicated flows for private chats and group chats
 - Ranked search pipeline with Elasticsearch acceleration and database fallbacks
 - PDF book delivery with Telegram `file_id` reuse and local backup handling
-- Audiobook browsing with part navigation and per-user progress tracking
-- Integrated tool suite: Text-to-Speech, PDF tools, audio tools, and sticker tools
+- Audiobook browsing with part navigation and play-all support
 - Admin control panel, request handling, duplicate cleanup, and runtime diagnostics
 - DB-backed background jobs for heavier and restart-safe tasks
 
@@ -80,6 +79,7 @@ This codebase demonstrates engineering work across multiple layers:
 - **Search engine:** Elasticsearch (`books` catalog)
 - **Background work:** PostgreSQL-backed `background_jobs` + async workers
 - **Media processing:** `ffmpeg`
+
 ## Current Feature Scope
 
 Active user-facing features:
@@ -87,7 +87,7 @@ Active user-facing features:
 - Book search and delivery in private chat and inline mode
 - Ranked search results limited to the top 10 best matches per query
 - First-run language selection before private-chat search starts
-- Audiobook listening per book with part navigation and listened-state tracking
+- Audiobook listening per book with part navigation and play-all support
 - Book requests when search misses (`/request`, `/requests`, and no-results actions)
 - Upload access requests for non-owner `/upload` usage
 - Favorites, reactions, top books, top users, and user profile stats
@@ -99,8 +99,10 @@ Removed from the product:
 - Movie search
 - Movie upload
 - Movie analytics
-- Legacy AI chat / translator / grammar / email / quiz / music tools
-- Separate AI Tools menu
+- Legacy AI tools and AI book summarizer
+- Legacy text-to-speech, PDF maker/editor, audio editor, sticker tools, and video downloader
+
+Active admin/operator capabilities:
 
 - Moderate and manage uploads
 - Review operational status inside Telegram
@@ -132,7 +134,6 @@ Operational and support files:
 
 - `README.md` — project overview, setup, commands, and deployment notes
 - `docs/ARCHITECTURE.md` — repository layout, runtime flow, and module guide
-- `docs/worldlibrarybot_menu_map.svg` — visual menu map
 - `UI_UX_RECOMMENDATIONS.md` — UX analysis and future improvement ideas
 
 ## Commands
@@ -297,6 +298,6 @@ Notes:
 - This repository does not track `.env`, live credentials, runtime logs, or local media storage
 - Books are the only indexed search catalog now
 - Public command menus are synced dynamically per chat/language
-- Sticker conversion and some heavy tasks run through the DB-backed background job queue
+- DB-backed background jobs now cover search indexing, local backup refresh, and cleanup work
 - Legacy removed feature tables and counters are cleaned by schema migration
 - Group chat usage has a separate onboarding path: users must start the bot once in private chat, then choose a group reply language

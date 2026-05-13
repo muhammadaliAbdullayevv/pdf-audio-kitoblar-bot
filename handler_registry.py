@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from telegram import Update
 from telegram.ext import (
     CallbackQueryHandler,
+    ChosenInlineResultHandler,
     CommandHandler,
     InlineQueryHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -18,6 +21,8 @@ REQUIRED_DEP_KEYS = (
     "_touch_user_activity_callback",
     "start",
     "upload_command_wrapper",
+    "settings_command",
+    "handle_guest_message_update",
     "handle_channel_post",
     "handle_photo_message",
     "handle_abook_audio",
@@ -62,6 +67,7 @@ REQUIRED_DEP_KEYS = (
     "mystats_command",
     "myprofile_command",
     "inlinequery",
+    "chosen_inline_result",
     "audit_command",
     "prune_command",
     "missing_command",
@@ -100,6 +106,7 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["_touch_user_activity_callback"]), group=-1)
     app.add_handler(CommandHandler("start", d["start"]))
     app.add_handler(CommandHandler("upload", d["upload_command_wrapper"]))
+    app.add_handler(CommandHandler("settings", d["settings_command"]))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, d["handle_channel_post"]))
     app.add_handler(MessageHandler(filters.PHOTO, d["handle_photo_message"]))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | (filters.Document.ALL & filters.Document.MimeType("audio/")), d["handle_abook_audio"]))
@@ -145,6 +152,7 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CommandHandler("mystats", d["mystats_command"]))
     app.add_handler(CommandHandler("myprofile", d["myprofile_command"]))
     app.add_handler(InlineQueryHandler(d["inlinequery"]))
+    app.add_handler(ChosenInlineResultHandler(d["chosen_inline_result"]))
     app.add_handler(CommandHandler("audit", d["audit_command"]))
     app.add_handler(CommandHandler("prune", d["prune_command"]))
     app.add_handler(CommandHandler("missing", d["missing_command"]))
@@ -163,5 +171,14 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_delete_callback"], pattern=r"^abdel:"))
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_add_callback"], pattern=r"^abadd:"))
     app.add_handler(CallbackQueryHandler(d["handle_book_rename_callback"], pattern=r"^bookrename:"))
-    app.add_handler(CallbackQueryHandler(d["handle_book_selection"], pattern=r"^(book:)?[0-9a-fA-F-]{32,36}$"))
+    app.add_handler(
+        CallbackQueryHandler(
+            d["handle_book_selection"],
+            pattern=r"^(?:(book:)?[0-9a-fA-F-]{32,36}|gbook:[0-9a-fA-F-]{32,36}:[0-9a-f]{8,32})$",
+        )
+    )
+    # PTB 20.x does not expose guest_message as a native update type.
+    # Keep the raw Update catch-all in a very late group so it only handles
+    # guest-mode traffic and does not swallow normal bot updates.
+    app.add_handler(TypeHandler(Update, d["handle_guest_message_update"]), group=100)
     app.add_error_handler(d["handle_error"])

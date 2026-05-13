@@ -4,9 +4,12 @@ from typing import Any
 
 
 SUPPORTED_JOB_TYPES = {
-    "book_summary",
     "SEARCH_INDEX_BOOK",
     "SEARCH_REINDEX_ALL",
+}
+
+LEGACY_DISABLED_JOB_TYPES = {
+    "book_summary",
 }
 
 TODO_JOB_TYPES = {
@@ -24,8 +27,9 @@ TODO_JOB_TYPES = {
 async def process_background_job(job_type: str, payload: dict[str, Any], app) -> dict | None:
     import bot as bot_runtime
 
-    if job_type == "book_summary":
-        return await bot_runtime._process_book_summary_job(payload, app)
+    if job_type in LEGACY_DISABLED_JOB_TYPES:
+        bot_runtime.logger.info("Ignoring legacy disabled background job type: %s", job_type)
+        return {"suppress_send": True, "disabled": True}
     if job_type == "SEARCH_INDEX_BOOK":
         return await bot_runtime._process_search_index_book_job(payload)
     if job_type == "SEARCH_REINDEX_ALL":

@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,32 @@ except Exception:
 import uuid
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_int_id_list(raw: Any) -> list[int]:
+    values: list[Any]
+    if raw is None:
+        values = []
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = str(raw).split(",")
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in values:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            value = int(text)
+        except Exception:
+            continue
+        if value == 0 or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
 
 
 def _shared_pdf_watermark_blocking(pdf_bytes: bytes, watermark_text: str) -> bytes:
@@ -305,6 +332,37 @@ def _safe_asyncio_current_task():
         return asyncio.current_task()
     except RuntimeError:
         return None
+
+
+_UPLOAD_LOCAL_ACTIVITY_KEY = "upload_local_backup_activity"
+
+
+def _set_upload_local_activity(app, worker_id: str, **fields: Any) -> None:
+    try:
+        bot_data = getattr(app, "bot_data", None)
+        if not isinstance(bot_data, dict):
+            return
+        state = bot_data.setdefault(_UPLOAD_LOCAL_ACTIVITY_KEY, {})
+        if not isinstance(state, dict):
+            state = {}
+            bot_data[_UPLOAD_LOCAL_ACTIVITY_KEY] = state
+        payload = dict(fields)
+        payload["updated_at"] = time.time()
+        state[str(worker_id or "worker")] = payload
+    except Exception:
+        pass
+
+
+def _clear_upload_local_activity(app, worker_id: str) -> None:
+    try:
+        bot_data = getattr(app, "bot_data", None)
+        state = bot_data.get(_UPLOAD_LOCAL_ACTIVITY_KEY) if isinstance(bot_data, dict) else None
+        if isinstance(state, dict):
+            state.pop(str(worker_id or "worker"), None)
+            if not state:
+                bot_data.pop(_UPLOAD_LOCAL_ACTIVITY_KEY, None)
+    except Exception:
+        pass
 
 
 def _get_book_storage_send_guard(channel_id: int):
@@ -587,7 +645,14 @@ async def _upload_local_retry(call, *, desc: str):
             delay = min(delay * 2, 60.0)
 
 
-async def _save_uploaded_book_local(bot, book: dict[str, Any], file_id: str, file_name: str) -> dict[str, Any]:
+async def _save_uploaded_book_local(
+    bot,
+    book: dict[str, Any],
+    file_id: str,
+    file_name: str,
+    *,
+    status_update=None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "book_id": str(book.get("id") or ""),
         "path": None,
@@ -616,9 +681,13 @@ async def _save_uploaded_book_local(bot, book: dict[str, Any], file_id: str, fil
         _UPLOAD_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
         target_path = _upload_local_target_path(book, file_name)
         if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
+            if callable(status_update):
+                status_update(stage="reusing local file", title=str(book.get("display_name") or book.get("book_name") or file_name or book_id))
             result["path"] = str(target_path)
             result["source_kind"] = "reused-existing"
         else:
+            if callable(status_update):
+                status_update(stage="downloading file", title=str(book.get("display_name") or book.get("book_name") or file_name or book_id))
             get_file_kwargs = {
                 "read_timeout": _UPLOAD_LOCAL_GET_FILE_READ_TIMEOUT_SEC,
                 "connect_timeout": _UPLOAD_LOCAL_CONNECT_TIMEOUT_SEC,
@@ -675,6 +744,8 @@ async def _save_uploaded_book_local(bot, book: dict[str, Any], file_id: str, fil
                     result["source_kind"] = "telegram-file-watermark-skipped"
             else:
                 result["source_kind"] = "telegram-file"
+            if callable(status_update):
+                status_update(stage="saving local file", title=str(book.get("display_name") or book.get("book_name") or file_name or book_id))
             await asyncio.to_thread(tmp_path.replace, target_path)
             result["path"] = str(target_path)
 
@@ -692,6 +763,8 @@ async def _save_uploaded_book_local(bot, book: dict[str, Any], file_id: str, fil
         book["path"] = result["path"]
 
         if result["path"] and _UPLOAD_LOCAL_REFRESH_FILE_ID:
+            if callable(status_update):
+                status_update(stage="uploading to storage channel", title=str(book.get("display_name") or book.get("book_name") or file_name or book_id))
             refresh_info = await _refresh_uploaded_book_file_id(bot, book_id, result["path"])
             if refresh_info.get("file_id"):
                 new_file_id = str(refresh_info.get("file_id") or "").strip()
@@ -715,6 +788,8 @@ async def _save_uploaded_book_local(bot, book: dict[str, Any], file_id: str, fil
                     db_get_book_by_id_fn = globals().get("db_get_book_by_id")
                     if callable(db_get_book_by_id_fn) and es_available():
                         try:
+                            if callable(status_update):
+                                status_update(stage="reindexing search", title=str(book.get("display_name") or book.get("book_name") or file_name or book_id))
                             refreshed_book = await run_blocking(db_get_book_by_id_fn, book_id)
                             if refreshed_book:
                                 await run_blocking(
@@ -937,6 +1012,16 @@ async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
                     attempts,
                     max_attempts,
                 )
+                _set_upload_local_activity(
+                    app,
+                    worker_id,
+                    worker="book_local_backup",
+                    worker_index=worker_index,
+                    job_id=job_id,
+                    book_id=book_id,
+                    title=file_name or book_id,
+                    stage="queued payload loaded",
+                )
 
                 if not job_id or not book_id or not file_id or not file_name:
                     error = "missing local backup job payload"
@@ -951,10 +1036,34 @@ async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
                         await asyncio.sleep(_UPLOAD_LOCAL_JOB_COOLDOWN_SECONDS)
                     continue
 
-                result = await _save_uploaded_book_local(app.bot, {"id": book_id}, file_id, file_name)
+                result = await _save_uploaded_book_local(
+                    app.bot,
+                    {"id": book_id},
+                    file_id,
+                    file_name,
+                    status_update=lambda **fields: _set_upload_local_activity(
+                        app,
+                        worker_id,
+                        worker="book_local_backup",
+                        worker_index=worker_index,
+                        job_id=job_id,
+                        book_id=book_id,
+                        **fields,
+                    ),
+                )
                 refresh_required = bool(_UPLOAD_LOCAL_REFRESH_FILE_ID)
                 refresh_ok = bool(result.get("file_id_refreshed")) or not refresh_required
                 if result.get("path") and result.get("db_updated") and refresh_ok:
+                    _set_upload_local_activity(
+                        app,
+                        worker_id,
+                        worker="book_local_backup",
+                        worker_index=worker_index,
+                        job_id=job_id,
+                        book_id=book_id,
+                        title=file_name or book_id,
+                        stage="completed",
+                    )
                     logger.info("Local backup job done: job_id=%s book_id=%s path=%s", job_id, book_id, result["path"])
                     await run_blocking(complete_fn, job_id)
                     released = True
@@ -1007,6 +1116,7 @@ async def _upload_local_backup_worker(app, worker_index: int = 1) -> None:
                 logger.error("Local backup worker loop failed: %s", e, exc_info=True)
                 await asyncio.sleep(5.0)
     finally:
+        _clear_upload_local_activity(app, worker_id)
         current_task = _safe_asyncio_current_task()
         workers = app.bot_data.get(_UPLOAD_LOCAL_WORKER_KEY)
         if current_task is not None and isinstance(workers, list):

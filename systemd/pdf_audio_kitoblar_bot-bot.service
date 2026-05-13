@@ -1,7 +1,7 @@
 [Unit]
 Description=pdf_audio_kitoblar_bot - Main Bot Application
-Wants=network-online.target pdf_audio_kitoblar_bot.service
-After=network-online.target pdf_audio_kitoblar_bot.service
+Wants=network-online.target postgresql.service elasticsearch.service pdf_audio_kitoblar_bot.service
+After=network-online.target postgresql.service elasticsearch.service pdf_audio_kitoblar_bot.service
 
 [Service]
 Type=simple

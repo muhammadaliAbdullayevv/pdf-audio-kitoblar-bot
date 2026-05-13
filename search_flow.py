@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaDocument, Update
 from telegram.ext import ContextTypes
 from book_thumbnail import get_book_thumbnail_input, get_book_thumbnail_payload
 from language import get_language_keyboard
@@ -420,6 +420,49 @@ def _safe_asyncio_current_task():
         return None
 
 
+_ABOOK_ADD_FLOW_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_abook_add_flow_lock(audio_book_id: str, user_id: int | None = None) -> asyncio.Lock:
+    key = f"{str(audio_book_id or '').strip()}:{int(user_id or 0)}"
+    lock = _ABOOK_ADD_FLOW_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ABOOK_ADD_FLOW_LOCKS[key] = lock
+    return lock
+
+
+_AUDIOBOOK_LOCAL_ACTIVITY_KEY = "audiobook_local_backup_activity"
+
+
+def _set_audiobook_local_activity(app, worker_id: str, **fields: Any) -> None:
+    try:
+        bot_data = getattr(app, "bot_data", None)
+        if not isinstance(bot_data, dict):
+            return
+        state = bot_data.setdefault(_AUDIOBOOK_LOCAL_ACTIVITY_KEY, {})
+        if not isinstance(state, dict):
+            state = {}
+            bot_data[_AUDIOBOOK_LOCAL_ACTIVITY_KEY] = state
+        payload = dict(fields)
+        payload["updated_at"] = time.time()
+        state[str(worker_id or "worker")] = payload
+    except Exception:
+        pass
+
+
+def _clear_audiobook_local_activity(app, worker_id: str) -> None:
+    try:
+        bot_data = getattr(app, "bot_data", None)
+        state = bot_data.get(_AUDIOBOOK_LOCAL_ACTIVITY_KEY) if isinstance(bot_data, dict) else None
+        if isinstance(state, dict):
+            state.pop(str(worker_id or "worker"), None)
+            if not state:
+                bot_data.pop(_AUDIOBOOK_LOCAL_ACTIVITY_KEY, None)
+    except Exception:
+        pass
+
+
 def _audiobook_storage_clean_title(value: str | None, default: str = "audio") -> str:
     text = Path(str(value or "").strip()).stem
     if not text:
@@ -772,7 +815,15 @@ async def _refresh_audiobook_part_file_id(
         return result
 
 
-async def _save_audiobook_part_local(bot, audio_book: dict | None, book: dict | None, part: dict, *, app=None) -> dict[str, Any]:
+async def _save_audiobook_part_local(
+    bot,
+    audio_book: dict | None,
+    book: dict | None,
+    part: dict,
+    *,
+    app=None,
+    status_update=None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "part_id": str(part.get("id") or ""),
         "audio_book_id": str((audio_book or {}).get("id") or part.get("audio_book_id") or ""),
@@ -805,11 +856,15 @@ async def _save_audiobook_part_local(bot, audio_book: dict | None, book: dict | 
         output_media_kind = "audio"
 
         if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
+            if callable(status_update):
+                status_update(stage="reusing local audio", title=clean_title)
             result["path"] = str(target_path)
             result["source_kind"] = "reused-existing"
             result["media_kind"] = output_media_kind
             result["duration_seconds"] = source_duration
         else:
+            if callable(status_update):
+                status_update(stage="downloading source audio", title=clean_title)
             source_bytes = await _download_audiobook_source_bytes(bot, file_id, part_id)
             if not source_bytes:
                 result["error"] = "empty source audio"
@@ -819,6 +874,8 @@ async def _save_audiobook_part_local(bot, audio_book: dict | None, book: dict | 
             output_ext = source_ext
             output_media_kind = _audiobook_part_media_kind(part)
             try:
+                if callable(status_update):
+                    status_update(stage="converting to mp3", title=clean_title)
                 output_bytes = await run_blocking(
                     _audio_conv_transform_blocking,
                     source_bytes,
@@ -840,6 +897,8 @@ async def _save_audiobook_part_local(bot, audio_book: dict | None, book: dict | 
                 cover_payload = get_book_thumbnail_payload()
                 if cover_payload:
                     try:
+                        if callable(status_update):
+                            status_update(stage="embedding cover image", title=clean_title)
                         cover_bytes, _ = cover_payload
                         output_bytes = await run_blocking(_audio_conv_apply_cover_blocking, output_bytes, cover_bytes)
                         result["source_kind"] = "telegram-file-covered-mp3"
@@ -859,6 +918,8 @@ async def _save_audiobook_part_local(bot, audio_book: dict | None, book: dict | 
                     tmp_path.unlink()
             except Exception:
                 pass
+            if callable(status_update):
+                status_update(stage="saving local audio", title=clean_title)
             await asyncio.to_thread(tmp_path.write_bytes, output_bytes)
             await asyncio.to_thread(tmp_path.replace, target_path)
             result["path"] = str(target_path)
@@ -876,6 +937,8 @@ async def _save_audiobook_part_local(bot, audio_book: dict | None, book: dict | 
         result["db_updated"] = True
 
         if result["path"] and _AUDIOBOOK_LOCAL_REFRESH_FILE_ID:
+            if callable(status_update):
+                status_update(stage="uploading to storage channel", title=clean_title)
             refreshed_part = dict(part or {})
             refreshed_part["path"] = result["path"]
             refreshed_part["media_kind"] = str(result["media_kind"] or output_media_kind)
@@ -989,6 +1052,17 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
                     attempts,
                     max_attempts,
                 )
+                _set_audiobook_local_activity(
+                    app,
+                    worker_id,
+                    worker="audiobook_local_backup",
+                    worker_index=worker_index,
+                    job_id=job_id,
+                    audio_book_id=audio_book_id,
+                    part_id=part_id,
+                    stage="queued payload loaded",
+                    title=part_id,
+                )
 
                 if not job_id or not audio_book_id or not part_id:
                     error = "missing audiobook local backup job payload"
@@ -1026,10 +1100,37 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
                     except Exception as e:
                         logger.warning("Failed to load parent book %s for audiobook local backup: %s", book_id, e)
 
-                result = await _save_audiobook_part_local(app.bot, audio_book, book, part, app=app)
+                result = await _save_audiobook_part_local(
+                    app.bot,
+                    audio_book,
+                    book,
+                    part,
+                    app=app,
+                    status_update=lambda **fields: _set_audiobook_local_activity(
+                        app,
+                        worker_id,
+                        worker="audiobook_local_backup",
+                        worker_index=worker_index,
+                        job_id=job_id,
+                        audio_book_id=audio_book_id,
+                        part_id=part_id,
+                        **fields,
+                    ),
+                )
                 refresh_required = bool(_AUDIOBOOK_LOCAL_REFRESH_FILE_ID)
                 refresh_ok = bool(result.get("file_id_refreshed")) or not refresh_required
                 if result.get("path") and result.get("db_updated") and refresh_ok:
+                    _set_audiobook_local_activity(
+                        app,
+                        worker_id,
+                        worker="audiobook_local_backup",
+                        worker_index=worker_index,
+                        job_id=job_id,
+                        audio_book_id=audio_book_id,
+                        part_id=part_id,
+                        title=str((part or {}).get("title") or part_id),
+                        stage="completed",
+                    )
                     logger.info(
                         "Audiobook local backup job done: job_id=%s part_id=%s path=%s",
                         job_id,
@@ -1109,6 +1210,7 @@ async def _audiobook_local_backup_worker(app, worker_index: int = 1) -> None:
                 logger.error("Audiobook local backup worker loop failed: %s", e, exc_info=True)
                 await asyncio.sleep(5.0)
     finally:
+        _clear_audiobook_local_activity(app, worker_id)
         current_task = _safe_asyncio_current_task()
         workers = app.bot_data.get(_AUDIOBOOK_LOCAL_WORKER_KEY)
         if current_task is not None and isinstance(workers, list):
@@ -1603,6 +1705,15 @@ def set_cached_audit_report(context: ContextTypes.DEFAULT_TYPE, lang: str, text:
 
     cache = context.application.bot_data.setdefault("audit_cache", {})
     cache[lang] = {"text": text, "ts": time.time()}
+
+
+def invalidate_audit_caches(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if REDIS_CACHE_AVAILABLE:
+        cache_clear_pattern("audit:report:*")
+    try:
+        context.application.bot_data.pop("audit_cache", None)
+    except Exception:
+        pass
 
 
 def build_results_text(query: str, entries: list, page: int, lang: str):
@@ -2519,9 +2630,7 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     lang = ensure_user_language(update, context)
-    audio_book_id = pending.get("audio_book_id")
-    part_index = pending.get("next_part_index", 1)
-    is_insert_mode = "insert_max" in pending and not pending.get("awaiting_insert_index", False)
+    audio_book_id = str(pending.get("audio_book_id") or "").strip()
     title = getattr(file, "file_name", None)
     file_id = file.file_id
     file_unique = getattr(file, "file_unique_id", None)
@@ -2529,108 +2638,120 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     media_kind = "audio" if getattr(msg, "audio", None) else "voice" if getattr(msg, "voice", None) else "document"
     stored_channel_id = None
     stored_channel_message_id = None
+    lock = _get_abook_add_flow_lock(audio_book_id, update.effective_user.id if update.effective_user else None)
+    pending_snapshot = dict(pending)
+    async with lock:
+        pending = context.user_data.get("pending_abook")
+        if not pending or str(pending.get("audio_book_id") or "").strip() != audio_book_id:
+            logger.debug("handle_abook_audio: audiobook flow changed before save, aborting")
+            raise ApplicationHandlerStop()
 
-    # Check if this audio part already exists in THIS audiobook (duplicate prevention within same audiobook)
-    duplicate_part = None
-    if file_unique:
-        try:
-            duplicate_part = await run_blocking(
-                get_audio_book_part_by_file_unique_id_and_audio_book,
-                file_unique,
-                audio_book_id,
-            )
-        except Exception as e:
-            logger.debug(
-                "Duplicate check by file_unique_id failed for audiobook=%s, file_unique_id=%s: %s",
-                audio_book_id,
-                file_unique,
-                e,
-            )
-    elif file_id:
-        # Fallback for rare payloads without file_unique_id.
-        try:
-            existing_parts = await run_blocking(list_audio_book_parts, audio_book_id)
-            duplicate_part = next((p for p in (existing_parts or []) if p.get("file_id") == file_id), None)
-        except Exception as e:
-            logger.debug(
-                "Fallback duplicate check by file_id failed for audiobook=%s, file_id=%s: %s",
-                audio_book_id,
-                file_id,
-                e,
-            )
+        part_index = int(pending.get("next_part_index", 1) or 1)
+        is_insert_mode = "insert_max" in pending and not pending.get("awaiting_insert_index", False)
 
-    if duplicate_part:
-        try:
-            await msg.reply_text(
-                MESSAGES[lang].get(
-                    "audiobook_duplicate_part",
-                    "❌ This audio is already added to this book. Delete it first if you want to re-add it.",
+        # Check if this audio part already exists in THIS audiobook (duplicate prevention within same audiobook)
+        duplicate_part = None
+        if file_unique:
+            try:
+                duplicate_part = await run_blocking(
+                    get_audio_book_part_by_file_unique_id_and_audio_book,
+                    file_unique,
+                    audio_book_id,
                 )
-            )
-        except Exception:
-            pass
-        raise ApplicationHandlerStop()
-
-    # Keep the original incoming file_id for now. The background local-backup worker
-    # will download it, clean the name, apply the cover, and upload the processed
-    # file to the storage channel once, producing the fresh final file_id.
-    logger.info(
-        "Audiobook part queued for local processing before storage upload: audiobook=%s part_index=%s media_kind=%s",
-        audio_book_id,
-        part_index,
-        media_kind,
-    )
-
-    # In insert mode: shift existing parts >= part_index up by 1 to make room
-    if is_insert_mode:
-        try:
-            await run_blocking(shift_audio_book_parts_from, audio_book_id, part_index)
-        except Exception as e:
-            logger.error(f"Failed to shift audiobook parts: {e}")
+            except Exception as e:
+                logger.debug(
+                    "Duplicate check by file_unique_id failed for audiobook=%s, file_unique_id=%s: %s",
+                    audio_book_id,
+                    file_unique,
+                    e,
+                )
+        elif file_id:
+            # Fallback for rare payloads without file_unique_id.
             try:
-                await msg.reply_text(MESSAGES[lang]["audiobook_insert_prepare_failed"])
+                existing_parts = await run_blocking(list_audio_book_parts, audio_book_id)
+                duplicate_part = next((p for p in (existing_parts or []) if p.get("file_id") == file_id), None)
+            except Exception as e:
+                logger.debug(
+                    "Fallback duplicate check by file_id failed for audiobook=%s, file_id=%s: %s",
+                    audio_book_id,
+                    file_id,
+                    e,
+                )
+
+        if duplicate_part:
+            try:
+                await msg.reply_text(
+                    MESSAGES[lang].get(
+                        "audiobook_duplicate_part",
+                        "❌ This audio is already added to this book. Delete it first if you want to re-add it.",
+                    )
+                )
             except Exception:
                 pass
             raise ApplicationHandlerStop()
 
-    try:
-        part_id = await run_blocking(
-            insert_audio_book_part,
-            audio_book_id=audio_book_id,
-            part_index=part_index,
-            title=title,
-            media_kind=media_kind,
-            file_id=file_id,
-            file_unique_id=file_unique,
-            path=None,
-            duration_seconds=duration,
-            channel_id=stored_channel_id,
-            channel_message_id=stored_channel_message_id,
+        # Keep the original incoming file_id for now. The background local-backup worker
+        # will download it, clean the name, apply the cover, and upload the processed
+        # file to the storage channel once, producing the fresh final file_id.
+        logger.info(
+            "Audiobook part queued for local processing before storage upload: audiobook=%s part_index=%s media_kind=%s",
+            audio_book_id,
+            part_index,
+            media_kind,
         )
-    except Exception as e:
-        # With the global unique index removed, "duplicate/unique" here typically means
-        # a part_index collision (or other constraint). Don't block reuse across books.
-        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+
+        # In insert mode: shift existing parts >= part_index up by 1 to make room
+        if is_insert_mode:
             try:
-                await msg.reply_text(MESSAGES[lang]["audiobook_part_save_constraint"])
+                await run_blocking(shift_audio_book_parts_from, audio_book_id, part_index)
+            except Exception as e:
+                logger.error(f"Failed to shift audiobook parts: {e}")
+                try:
+                    await msg.reply_text(MESSAGES[lang]["audiobook_insert_prepare_failed"])
+                except Exception:
+                    pass
+                raise ApplicationHandlerStop()
+
+        try:
+            part_id = await run_blocking(
+                insert_audio_book_part,
+                audio_book_id=audio_book_id,
+                part_index=part_index,
+                title=title,
+                media_kind=media_kind,
+                file_id=file_id,
+                file_unique_id=file_unique,
+                path=None,
+                duration_seconds=duration,
+                channel_id=stored_channel_id,
+                channel_message_id=stored_channel_message_id,
+            )
+        except Exception as e:
+            # With the global unique index removed, "duplicate/unique" here typically means
+            # a part_index collision (or other constraint). Don't block reuse across books.
+            if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+                try:
+                    await msg.reply_text(MESSAGES[lang]["audiobook_part_save_constraint"])
+                except Exception:
+                    pass
+                logger.warning(f"Audio part insertion failed (constraint): {e}")
+                raise ApplicationHandlerStop()
+            error_text = str(e).strip()[:200] or "unknown error"
+            failure_text = MESSAGES[lang]["audiobook_part_save_failed"].format(error=error_text)
+            logger.error("Audio part insertion failed for audiobook=%s part_index=%s: %s", audio_book_id, part_index, e, exc_info=True)
+            try:
+                await msg.reply_text(failure_text)
             except Exception:
                 pass
-            logger.warning(f"Audio part insertion failed (constraint): {e}")
             raise ApplicationHandlerStop()
-        error_text = str(e).strip()[:200] or "unknown error"
-        failure_text = MESSAGES[lang]["audiobook_part_save_failed"].format(error=error_text)
-        logger.error("Audio part insertion failed for audiobook=%s part_index=%s: %s", audio_book_id, part_index, e, exc_info=True)
-        try:
-            await msg.reply_text(failure_text)
-        except Exception:
-            pass
-        raise ApplicationHandlerStop()
 
-    if is_insert_mode:
-        # Single-file insert: clear the flow after insertion
-        context.user_data.pop("pending_abook", None)
-    else:
-        pending["next_part_index"] = part_index + 1
+        if is_insert_mode:
+            # Single-file insert: clear the flow after insertion
+            context.user_data.pop("pending_abook", None)
+        else:
+            pending["next_part_index"] = part_index + 1
+            context.user_data["pending_abook"] = pending
+        pending_snapshot = dict(pending)
     try:
         await msg.reply_text(MESSAGES[lang].get("audiobook_part_saved", "✅ Part #{index} saved.").format(index=part_index))
     except Exception:
@@ -2979,9 +3100,20 @@ async def handle_audiobook_listen_callback(update: Update, context: ContextTypes
         logger.debug("handle_audiobook_listen_callback: no query")
         return
     lang = ensure_user_language(update, context)
+    guest_inline_delivery = bool(getattr(query, "inline_message_id", None) and not query.message)
     limited, wait_s = spam_check_callback(update, context)
     if limited:
         await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
+        return
+    if guest_inline_delivery:
+        await safe_answer(
+            query,
+            MESSAGES[lang].get(
+                "guest_audiobook_private_only",
+                MESSAGES["en"].get("guest_audiobook_private_only", "Audiobooks can't be sent from guest mode yet."),
+            ),
+            show_alert=True,
+        )
         return
     data = query.data or ""
     logger.debug("audiobook callback data=%s", data)
@@ -3034,9 +3166,20 @@ async def handle_audiobook_play_all_callback(update: Update, context: ContextTyp
     if not query:
         return
     lang = ensure_user_language(update, context)
+    guest_inline_delivery = bool(getattr(query, "inline_message_id", None) and not query.message)
     limited, wait_s = spam_check_callback(update, context)
     if limited:
         await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
+        return
+    if guest_inline_delivery:
+        await safe_answer(
+            query,
+            MESSAGES[lang].get(
+                "guest_audiobook_private_only",
+                MESSAGES["en"].get("guest_audiobook_private_only", "Audiobooks can't be sent from guest mode yet."),
+            ),
+            show_alert=True,
+        )
         return
     data = query.data or ""
     if not data.startswith("abplayall:"):
@@ -3173,9 +3316,20 @@ async def handle_audiobook_part_play_callback(update: Update, context: ContextTy
     if not query:
         return
     lang = ensure_user_language(update, context)
+    guest_inline_delivery = bool(getattr(query, "inline_message_id", None) and not query.message)
     limited, wait_s = spam_check_callback(update, context)
     if limited:
         await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
+        return
+    if guest_inline_delivery:
+        await safe_answer(
+            query,
+            MESSAGES[lang].get(
+                "guest_audiobook_private_only",
+                MESSAGES["en"].get("guest_audiobook_private_only", "Audiobooks can't be sent from guest mode yet."),
+            ),
+            show_alert=True,
+        )
         return
     data = query.data or ""
     if not data.startswith("abplay:"):
@@ -3598,6 +3752,70 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 return
 
+        pending_request = context.user_data.get("pending_request_reply")
+        if pending_request and _is_admin_user(update.effective_user.id):
+            if time.time() > pending_request.get("expires_at", 0):
+                context.user_data.pop("pending_request_reply", None)
+            else:
+                admin_text = update.message.text.strip()
+                if admin_text.lower() in {"cancel", "stop"}:
+                    context.user_data.pop("pending_request_reply", None)
+                    await update.message.reply_text(MESSAGES[lang]["request_admin_cancelled"])
+                    return
+
+                record = await run_blocking(
+                    update_request_status,
+                    pending_request["request_id"],
+                    pending_request["status"],
+                    update.effective_user,
+                    admin_text,
+                )
+                if not record:
+                    await update.message.reply_text(MESSAGES[lang]["page_expired"])
+                    context.user_data.pop("pending_request_reply", None)
+                    return
+
+                req_lang = str(record.get("language") or "en").strip() or "en"
+                query_text = str(record.get("query") or "").strip()
+                base_template = MESSAGES[req_lang].get(
+                    f"request_reply_{record.get('status')}",
+                    MESSAGES[req_lang].get("request_reply_seen_auto", ""),
+                )
+                msg = base_template.format(query=query_text)
+                if admin_text:
+                    msg += "\n\n" + MESSAGES[req_lang]["request_reply_note"].format(note=admin_text)
+
+                notified_ok = True
+                try:
+                    await context.bot.send_message(chat_id=record["user_id"], text=msg)
+                except Exception as e:
+                    notified_ok = False
+                    logger.error(
+                        "Failed to notify user %s for request %s: %s",
+                        record.get("user_id"),
+                        record.get("id"),
+                        e,
+                        exc_info=True,
+                    )
+
+                try:
+                    keyboard = build_request_admin_keyboard(record.get("status", "open"), record.get("id"))
+                    await context.bot.edit_message_text(
+                        chat_id=pending_request["admin_chat_id"],
+                        message_id=pending_request["admin_message_id"],
+                        text=format_request_admin_text(record),
+                        reply_markup=keyboard,
+                    )
+                except Exception:
+                    pass
+
+                context.user_data.pop("pending_request_reply", None)
+                admin_reply_text = MESSAGES[lang]["request_status_updated_admin"].format(status=record.get("status"))
+                if not notified_ok:
+                    admin_reply_text += "\n" + MESSAGES[lang]["request_user_notify_failed_admin"]
+                await update.message.reply_text(admin_reply_text)
+                return
+
         # Admin reply to upload access request
         pending_upload = context.user_data.get("pending_upload_reply")
         if pending_upload and _is_admin_user(update.effective_user.id):
@@ -3783,10 +4001,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_search_command_fn=user_search_command,
         ):
             return
-
-        if callable(globals().get("_video_dl_handle_text_input")):
-            if await _video_dl_handle_text_input(update, context, lang):
-                return
 
         # Simple thanks replies
         thanks_lang = _detect_thanks_reply_lang(update.message.text)
@@ -4059,12 +4273,70 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             await safe_answer(query, MESSAGES[lang]["spam_wait"].format(seconds=wait_s), show_alert=True)
             return
         data = str(query.data).strip()
-        if data.startswith("book:"):
+        guest_inline_delivery = bool(getattr(query, "inline_message_id", None) and query.message is None)
+        guest_handoff_token = None
+        guest_handoff = None
+        source_guest_chat_id = None
+        if data.startswith("gbook:"):
+            parts = data.split(":", 2)
+            if len(parts) < 3:
+                await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+                return
+            book_id = parts[1].strip()
+            guest_handoff_token = str(parts[2] or "").strip() or None
+        elif data.startswith("book:"):
             book_id = data.split(":", 1)[1].strip()
         else:
             book_id = data  # backward compatibility for old buttons
-        await safe_answer(query)
-
+        if guest_inline_delivery and guest_handoff_token:
+            handoff_lookup_fn = globals().get("db_get_guest_private_handoff_by_token")
+            capability_lookup_fn = globals().get("db_get_guest_group_delivery_capability")
+            if callable(handoff_lookup_fn):
+                try:
+                    guest_handoff = await run_blocking(handoff_lookup_fn, guest_handoff_token)
+                except Exception as e:
+                    logger.warning("Failed to load guest handoff %s before delivery: %s", guest_handoff_token, e, exc_info=True)
+                    guest_handoff = None
+            if guest_handoff:
+                try:
+                    source_guest_chat_id = int((guest_handoff or {}).get("source_chat_id") or 0) or None
+                except Exception:
+                    source_guest_chat_id = None
+            if source_guest_chat_id and callable(capability_lookup_fn):
+                try:
+                    delivery_capability = await run_blocking(capability_lookup_fn, source_guest_chat_id)
+                except Exception as e:
+                    logger.warning("Failed to load guest delivery capability for group %s: %s", source_guest_chat_id, e, exc_info=True)
+                    delivery_capability = {}
+                if bool((delivery_capability or {}).get("skip_same_chat_delivery")):
+                    markup_builder = globals().get("build_guest_private_handoff_reply_markup")
+                    if callable(markup_builder):
+                        try:
+                            new_markup = await markup_builder(
+                                context,
+                                handoff_token=guest_handoff_token,
+                                selected_book_id=book_id,
+                                actor_user_id=query.from_user.id,
+                                lang=lang,
+                            )
+                            if new_markup is not None:
+                                await context.bot.edit_message_reply_markup(
+                                    inline_message_id=query.inline_message_id,
+                                    reply_markup=new_markup,
+                                )
+                        except Exception as markup_error:
+                            logger.warning(
+                                "Failed to rebuild remembered guest private handoff markup for %s: %s",
+                                book_id,
+                                markup_error,
+                                exc_info=True,
+                            )
+                    await safe_answer(query, MESSAGES[lang].get("guest_delivery_forbidden", MESSAGES["en"].get("guest_delivery_forbidden", "Guest delivery is not allowed in this chat.")), show_alert=True)
+                    return
+        if guest_inline_delivery:
+            await safe_answer(query, MESSAGES[lang].get("guest_sending", MESSAGES["en"].get("guest_sending", "Sending book...")))
+        else:
+            await safe_answer(query)
         # --- Lookup book by UUID in DB ---
         book = await run_blocking(db_get_book_by_id, book_id)
 
@@ -4086,7 +4358,10 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         # --- If still not found ---
         if not book:
             logger.debug(f"Book not found for UUID {book_id}")
-            await query.message.reply_text(MESSAGES[lang]["book_not_found"])
+            if guest_inline_delivery:
+                await safe_answer(query, MESSAGES[lang]["book_not_found"], show_alert=True)
+            else:
+                await query.message.reply_text(MESSAGES[lang]["book_not_found"])
             return
 
         async def _load_delivery_snapshot() -> dict:
@@ -4111,11 +4386,12 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         file_id = book.get("file_id")
 
         status_msg = None
-        try:
-            await context.bot.send_chat_action(chat_id=query.message.chat_id, action="upload_document")
-            status_msg = await query.message.reply_text(MESSAGES[lang]["sending"])
-        except Exception:
-            pass
+        if not guest_inline_delivery:
+            try:
+                await context.bot.send_chat_action(chat_id=query.message.chat_id, action="upload_document")
+                status_msg = await query.message.reply_text(MESSAGES[lang]["sending"])
+            except Exception:
+                pass
 
         # --- Helper: update file_id and reindex ---
         async def update_file_id(new_file_id: str, new_file_unique_id: str | None):
@@ -4142,9 +4418,14 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         caption = build_book_caption(book, downloads, fav_count, counts)
         is_fav_now = bool(book.get("is_favorited"))
         user_reaction = book.get("user_reaction")
-        can_delete = await _can_show_delete_button(update, query.from_user.id)
-        is_group_chat = _is_group_chat(update)
-        allow_management_buttons = not is_group_chat
+        if guest_inline_delivery:
+            can_delete = False
+            is_group_chat = True
+            allow_management_buttons = False
+        else:
+            can_delete = await _can_show_delete_button(update, query.from_user.id)
+            is_group_chat = _is_group_chat(update)
+            allow_management_buttons = not is_group_chat
         # Audiobook flags: show listen if audiobook exists; allow add for admins
         has_ab = bool(book.get("has_audiobook"))
         can_add_ab = False
@@ -4154,7 +4435,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 can_add_ab = False
         is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
-        show_listen_btn = has_ab if (is_group_chat or is_owner_user) else True
+        show_listen_btn = False if guest_inline_delivery else (has_ab if (is_group_chat or is_owner_user) else True)
         ab_request_count = 0
         if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
             try:
@@ -4163,6 +4444,11 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                 ab_request_count = 0
         can_rename_books_fn = globals().get("can_rename_books")
         can_rename_book = bool(callable(can_rename_books_fn) and can_rename_books_fn(query.from_user.id) and not is_group_chat)
+        more_books_url = None
+        if guest_inline_delivery:
+            username = (getattr(context.bot, "username", None) or "pdf_audio_kitoblar_bot").strip("@")
+            if username:
+                more_books_url = f"https://t.me/{username}"
         reactions_kb = build_book_keyboard(
             book_id,
             counts,
@@ -4176,10 +4462,65 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             show_listen_button=show_listen_btn,
             audiobook_request_count=ab_request_count,
             show_personal_state=not is_group_chat,
+            show_favorite_button=not is_group_chat,
+            more_books_url=more_books_url,
         )
 
+        if guest_inline_delivery:
+            if file_id:
+                try:
+                    sent = await context.bot.edit_message_media(
+                        inline_message_id=query.inline_message_id,
+                        media=InputMediaDocument(media=file_id, caption=caption),
+                        reply_markup=None,
+                    )
+                    sent_ok = bool(sent)
+                except Exception as e:
+                    logger.error(f"Failed guest inline delivery by file_id {file_id}: {e}")
+                    text = str(e or "")
+                    if "Chat_send_docs_forbidden" in text or "CHAT_SEND_DOCS_FORBIDDEN" in text:
+                        if source_guest_chat_id:
+                            mark_forbidden_fn = globals().get("db_mark_guest_group_delivery_forbidden")
+                            if callable(mark_forbidden_fn):
+                                try:
+                                    await _run_db_retry(mark_forbidden_fn, source_guest_chat_id)
+                                except Exception as capability_error:
+                                    logger.warning(
+                                        "Failed to remember guest delivery forbidden state for group %s: %s",
+                                        source_guest_chat_id,
+                                        capability_error,
+                                        exc_info=True,
+                                    )
+                        markup_builder = globals().get("build_guest_private_handoff_reply_markup")
+                        if callable(markup_builder) and guest_handoff_token:
+                            try:
+                                new_markup = await markup_builder(
+                                    context,
+                                    handoff_token=guest_handoff_token,
+                                    selected_book_id=book_id,
+                                    actor_user_id=query.from_user.id,
+                                    lang=lang,
+                                )
+                                if new_markup is not None:
+                                    await context.bot.edit_message_reply_markup(
+                                        inline_message_id=query.inline_message_id,
+                                        reply_markup=new_markup,
+                                    )
+                            except Exception as markup_error:
+                                logger.warning(
+                                    "Failed to rebuild guest private handoff markup for %s: %s",
+                                    book_id,
+                                    markup_error,
+                                    exc_info=True,
+                                )
+                        error_key = "guest_delivery_forbidden"
+                    else:
+                        error_key = "book_unavailable_send_failed"
+            else:
+                error_key = "book_unavailable_no_file"
+
         # --- Case 1: File ID available (prefer cache) ---
-        if file_id:
+        elif file_id:
             try:
                 sent = await context.bot.send_document(
                     chat_id=query.message.chat_id,
@@ -4246,7 +4587,9 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
         if not sent_ok and error_key:
             message = MESSAGES[lang].get(error_key, MESSAGES[lang]["book_unavailable"])
-            if status_msg:
+            if guest_inline_delivery:
+                await safe_answer(query, message, show_alert=True)
+            elif status_msg:
                 try:
                     await status_msg.edit_text(message)
                 except Exception:
@@ -4268,6 +4611,24 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             logger.debug(f"Button download logged for {get_display_name(book)} on {_today_str()}")
 
             _schedule_bg_task(context, _run_db_retry(add_recent_download, query.from_user.id, book_id, get_result_title(book)))
+            if guest_inline_delivery:
+                try:
+                    await _run_db_retry(db_increment_counter, "guest_download_total", 1)
+                except Exception as e:
+                    logger.warning("guest download counter update failed: %s", e)
+                if source_guest_chat_id:
+                    mark_success_fn = globals().get("db_mark_guest_group_delivery_success")
+                    if callable(mark_success_fn):
+                        try:
+                            await _run_db_retry(mark_success_fn, source_guest_chat_id)
+                        except Exception as capability_error:
+                            logger.warning(
+                                "Failed to remember guest delivery success state for group %s: %s",
+                                source_guest_chat_id,
+                                capability_error,
+                                exc_info=True,
+                            )
+                invalidate_audit_caches(context)
 
             # Update downloads count + refresh caption/keyboard
             try:
@@ -4277,7 +4638,35 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                 new_downloads = int(book.get("downloads") or 0)
                 fav_count = int(book.get("fav_count", 0) or 0)
                 counts = _snapshot_reaction_counts(book)
-                if sent:
+                if guest_inline_delivery:
+                    is_fav_now = bool(book.get("is_favorited"))
+                    user_reaction = book.get("user_reaction")
+                    has_ab2 = bool(book.get("has_audiobook"))
+                    can_add_ab2 = False
+                    is_owner_user2 = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
+                    show_listen_btn2 = False
+                    ab_request_count2 = 0
+                    await context.bot.edit_message_caption(
+                        inline_message_id=query.inline_message_id,
+                        caption=build_book_caption(book, new_downloads, fav_count, counts),
+                        reply_markup=build_book_keyboard(
+                            book_id,
+                            counts,
+                            is_fav_now,
+                            user_reaction,
+                            can_delete,
+                            False,
+                            lang,
+                            has_audiobook=has_ab2,
+                            can_add_audiobook=False,
+                            show_listen_button=show_listen_btn2,
+                            audiobook_request_count=0,
+                            show_personal_state=not is_group_chat,
+                            show_favorite_button=False,
+                            more_books_url=more_books_url,
+                        ),
+                    )
+                elif sent:
                     is_fav_now = bool(book.get("is_favorited"))
                     user_reaction = book.get("user_reaction")
                     # Recompute audiobook flags for refreshed keyboard
@@ -4311,6 +4700,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             show_listen_button=show_listen_btn2,
                             audiobook_request_count=ab_request_count2,
                             show_personal_state=not is_group_chat,
+                            show_favorite_button=not is_group_chat,
                         ),
                     )
             except Exception as e:
@@ -4325,7 +4715,11 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"handle_book_selection failed: {e}", exc_info=True)
         lang = ensure_user_language(update, context)
-        await update.callback_query.message.reply_text(MESSAGES[lang]["error"])
+        query = update.callback_query
+        if query and getattr(query, "message", None) is not None:
+            await query.message.reply_text(MESSAGES[lang]["error"])
+        elif query:
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
         raise
 
 

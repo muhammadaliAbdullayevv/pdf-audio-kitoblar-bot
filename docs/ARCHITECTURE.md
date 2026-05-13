@@ -110,7 +110,7 @@ The project uses two async/background patterns:
 
 Examples of DB-backed or restart-safe work in the repo include:
 
-- sticker/background media processing
+- search indexing / reindexing
 - some long-running content preparation tasks
 - local backup download queues for books/audiobooks
 

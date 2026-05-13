@@ -45,12 +45,16 @@ def build_main_menu_keyboard(
             labels["admin_user_search"],
             labels["admin_upload"],
             labels["admin_audit"],
+            labels["admin_guest_audit"],
+            labels["admin_inline_audit"],
             labels["admin_prune"],
             labels["admin_broadcast"],
             labels["admin_missing"],
             labels["admin_pause"],
             labels["admin_resume"],
             labels["admin_cancel_task"],
+            labels["admin_worker_status"],
+            labels["admin_live_activity"],
             labels["admin_dupes_status"],
             labels["admin_db_dupes"],
             labels["admin_es_dupes"],
@@ -72,7 +76,8 @@ def build_main_menu_keyboard(
         ]
     elif section == "admin_tasks":
         keyboard = [
-            [labels["admin_cancel_task"]],
+            [labels["admin_cancel_task"], labels["admin_worker_status"]],
+            [labels["admin_live_activity"]],
             [m.get("menu_back", "⬅️ Back")],
         ]
     else:

@@ -9,6 +9,23 @@ import bot as bot_runtime
 
 
 async def main() -> None:
+    bot_api_base_url = bot_runtime._normalize_bot_api_base_url(
+        bot_runtime.os.getenv("TELEGRAM_BOT_API_BASE_URL", "")
+    )
+    bot_api_base_file_url = bot_runtime._normalize_bot_api_base_file_url(
+        bot_runtime.os.getenv("TELEGRAM_BOT_API_BASE_FILE_URL", ""),
+        bot_api_base_url,
+    )
+    bot_api_local_mode = bot_runtime._env_bool("TELEGRAM_BOT_API_LOCAL_MODE", False)
+
+    bot_runtime.wait_for_runtime_dependencies(
+        "Background worker",
+        require_db=True,
+        require_es=bot_runtime.ENABLE_ELASTICSEARCH,
+        bot_api_base_url=bot_api_base_url,
+        require_bot_api=bool(bot_api_base_url or bot_api_local_mode),
+        bot_api_local_mode=bot_api_local_mode,
+    )
     bot_runtime.init_db()
 
     builder = (
@@ -21,15 +38,6 @@ async def main() -> None:
         .connection_pool_size(bot_runtime.BOT_CONNECTION_POOL_SIZE)
         .concurrent_updates(bot_runtime.BOT_CONCURRENT_UPDATES)
     )
-
-    bot_api_base_url = bot_runtime._normalize_bot_api_base_url(
-        bot_runtime.os.getenv("TELEGRAM_BOT_API_BASE_URL", "")
-    )
-    bot_api_base_file_url = bot_runtime._normalize_bot_api_base_file_url(
-        bot_runtime.os.getenv("TELEGRAM_BOT_API_BASE_FILE_URL", ""),
-        bot_api_base_url,
-    )
-    bot_api_local_mode = bot_runtime._env_bool("TELEGRAM_BOT_API_LOCAL_MODE", False)
 
     if bot_api_base_url:
         builder = builder.base_url(bot_api_base_url)
@@ -59,7 +67,10 @@ async def main() -> None:
         bot_runtime.start_background_job_workers(app)
         while not stop_event.is_set():
             bot_runtime.start_background_job_workers(app)
-            await asyncio.sleep(30)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
     finally:
         workers = list(app.bot_data.get(bot_runtime._BACKGROUND_JOB_WORKERS_KEY) or [])
         for task in workers:

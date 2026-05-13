@@ -10,12 +10,14 @@ import shutil
 import time
 import math
 import asyncio
+import socket
 import fcntl
 import atexit
 import html
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from logging.handlers import RotatingFileHandler
+from typing import Any
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
@@ -30,7 +32,7 @@ try:
     from telegram import InlineQueryResultCachedVideo
 except Exception:
     InlineQueryResultCachedVideo = None  # type: ignore
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, InputFile
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, InputFile, Message
 from book_thumbnail import get_book_thumbnail_input
 
 from urllib3.exceptions import InsecureRequestWarning
@@ -114,6 +116,7 @@ from db import (
     backfill_counters_if_empty as db_backfill_counters_if_empty,
     backfill_user_awards_if_empty as db_backfill_user_awards_if_empty,
     get_analytics_map,
+    ping_db as db_ping,
     get_db_stats,
     get_book_totals as db_get_book_totals,
     get_favorites_total as db_get_favorites_total,
@@ -130,6 +133,16 @@ from db import (
     get_user_reaction_awards_count as db_get_user_reaction_awards_count,
     get_daily_analytics as db_get_daily_analytics,
     get_user_daily_counts as db_get_user_daily_counts,
+    upsert_guest_group as db_upsert_guest_group,
+    get_guest_group_audit_stats as db_get_guest_group_audit_stats,
+    get_guest_group_delivery_capability as db_get_guest_group_delivery_capability,
+    mark_guest_group_delivery_forbidden as db_mark_guest_group_delivery_forbidden,
+    mark_guest_group_delivery_success as db_mark_guest_group_delivery_success,
+    record_guest_user_activity as db_record_guest_user_activity,
+    get_guest_user_audit_stats as db_get_guest_user_audit_stats,
+    record_inline_search_activity as db_record_inline_search_activity,
+    record_inline_chosen_activity as db_record_inline_chosen_activity,
+    get_inline_audit_stats as db_get_inline_audit_stats,
     list_books as db_list_books,
     get_random_books as db_get_random_books,
     get_random_book as db_get_random_book,
@@ -221,6 +234,9 @@ from db import (
     get_group_private_start_prompt_by_token as db_get_group_private_start_prompt_by_token,
     get_latest_pending_group_private_start_prompt as db_get_latest_pending_group_private_start_prompt,
     set_group_private_start_prompt_status as db_set_group_private_start_prompt_status,
+    create_guest_private_handoff as db_create_guest_private_handoff,
+    get_guest_private_handoff_by_token as db_get_guest_private_handoff_by_token,
+    touch_guest_private_handoff as db_touch_guest_private_handoff,
 )
 from elasticsearch import Elasticsearch, NotFoundError
 
@@ -411,11 +427,11 @@ _SEARCH_FLOW_DEP_KEYS = (
     "_main_menu_text_action",
     "_reply_search_menu_click_hint",
     "_today_str",
-    "_video_dl_handle_text_input",
     "add_recent_download",
     "broadcast",
     "build_book_caption",
     "build_book_keyboard",
+    "build_guest_private_handoff_reply_markup",
     "build_upload_admin_keyboard",
     "can_delete_books",
     "apply_book_rename",
@@ -426,6 +442,8 @@ _SEARCH_FLOW_DEP_KEYS = (
     "db_get_book_by_id",
     "db_get_book_delivery_snapshot",
     "db_get_book_stats",
+    "db_get_guest_group_delivery_capability",
+    "db_get_guest_private_handoff_by_token",
     "db_get_user_reaction",
     "db_increment_book_download",
     "db_increment_book_searches",
@@ -438,6 +456,8 @@ _SEARCH_FLOW_DEP_KEYS = (
     "db_retry_book_local_download_job",
     "db_fail_book_local_download_job",
     "db_get_book_local_download_job_status_counts",
+    "db_mark_guest_group_delivery_forbidden",
+    "db_mark_guest_group_delivery_success",
     "ensure_user_language",
     "es_available",
     "format_upload_request_admin_text",
@@ -705,6 +725,8 @@ _ADMIN_RUNTIME_OPTIONAL_DEP_KEYS = (
     "_update_dupes_status",
     "asyncio",
     "audit_command",
+    "guest_audit_command",
+    "inline_audit_command",
     "build_user_results_keyboard",
     "build_user_results_text",
     "cache_user_results",
@@ -872,6 +894,561 @@ async def contact_admin_command(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id if update.effective_user else None
     reply_markup = _build_contact_admin_reply_markup(lang, user_id)
     await safe_reply(update, info_text, reply_markup=reply_markup)
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await language_command_handler(update, context)
+
+
+def _bot_public_handle() -> str:
+    handle = str(BOT_PUBLIC_USERNAME or "").strip()
+    if not handle:
+        return "@pdf_audio_kitoblar_bot"
+    return handle if handle.startswith("@") else f"@{handle}"
+
+
+def _bot_public_url() -> str:
+    handle = _bot_public_handle().lstrip("@")
+    return f"https://t.me/{handle}" if handle else "https://t.me/pdf_audio_kitoblar_bot"
+
+
+def _parse_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[Message | None, dict[str, Any] | None]:
+    raw = getattr(update, "api_kwargs", {}).get("guest_message")
+    if not isinstance(raw, dict):
+        return None, None
+    try:
+        return Message.de_json(raw, context.bot), raw
+    except Exception:
+        logger.warning("Failed to parse guest_message update", exc_info=True)
+        return None, raw
+
+
+def _guest_message_language(guest_message: Message | None, raw: dict[str, Any] | None) -> str:
+    lang_code = None
+    try:
+        lang_code = getattr(getattr(guest_message, "from_user", None), "language_code", None)
+    except Exception:
+        lang_code = None
+    if not lang_code and isinstance(raw, dict):
+        caller = raw.get("guest_bot_caller_user")
+        if isinstance(caller, dict):
+            lang_code = caller.get("language_code")
+    return detect_language_code(lang_code)
+
+
+def _guest_chat_info(guest_message: Message | None, raw: dict[str, Any] | None) -> dict[str, Any]:
+    chat = getattr(guest_message, "chat", None)
+    chat_id = getattr(chat, "id", None) if chat else None
+    chat_type = getattr(chat, "type", None) if chat else None
+    title = getattr(chat, "title", None) if chat else None
+    username = getattr(chat, "username", None) if chat else None
+
+    if isinstance(raw, dict):
+        raw_chat = raw.get("chat")
+        if isinstance(raw_chat, dict):
+            if chat_id is None:
+                chat_id = raw_chat.get("id")
+            if chat_type is None:
+                chat_type = raw_chat.get("type")
+            if title is None:
+                title = raw_chat.get("title")
+            if username is None:
+                username = raw_chat.get("username")
+
+    safe_username = str(username or "").strip().lstrip("@")
+    public_link = f"https://t.me/{safe_username}" if safe_username else ""
+    try:
+        safe_chat_id = int(chat_id or 0)
+    except Exception:
+        safe_chat_id = 0
+    return {
+        "chat_id": safe_chat_id,
+        "chat_type": str(chat_type or "").strip().lower(),
+        "title": str(title or "").strip(),
+        "username": safe_username,
+        "public_link": public_link,
+    }
+
+
+def _invalidate_audit_report_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        clear_pattern = globals().get("cache_clear_pattern")
+        if callable(clear_pattern):
+            clear_pattern("audit:report:*")
+    except Exception:
+        logger.debug("Failed to clear audit report cache", exc_info=True)
+    try:
+        context.application.bot_data.pop("audit_cache", None)
+    except Exception:
+        pass
+
+
+def _extract_guest_query_text(text: str, bot_username: str) -> tuple[str | None, str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None, ""
+    first_token = raw.split(None, 1)[0]
+    command_match = re.match(r"^/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?$", first_token)
+    if command_match:
+        cmd = str(command_match.group(1) or "").lower()
+        target = str(command_match.group(2) or "").lower()
+        if not target or target == bot_username.lower():
+            rest = raw[len(first_token):].strip()
+            return cmd, rest
+    mention_pattern = re.compile(rf"@{re.escape(bot_username)}\b", re.IGNORECASE)
+    stripped = mention_pattern.sub(" ", raw)
+    stripped = re.sub(r"\s+", " ", stripped).strip(" ,:-")
+    return None, stripped
+
+
+def _search_guest_books(query: str, limit: int = 5) -> list[dict[str, str]]:
+    cleaned_query = normalize(query).lower()
+    if not cleaned_query:
+        return []
+    variants: list[str] = []
+    for candidate in (cleaned_query, cleaned_query.replace("ʻ", "")):
+        candidate = str(candidate or "").strip()
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+
+    results: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+
+    for variant in variants:
+        for source, _score, book_id in search_es(variant, size=max(limit, MAX_SEARCH_RESULTS)):
+            bid = str(book_id or source.get("id") or "").strip()
+            if not bid or bid in seen_ids:
+                continue
+            title = (
+                str(source.get("display_name") or "").strip()
+                or str(source.get("book_name") or "").strip()
+                or bid
+            )
+            results.append({"id": bid, "title": title})
+            seen_ids.add(bid)
+            if len(results) >= limit:
+                return results
+
+    books = load_books()
+    suggestions = suggest_books(books, variants[0], limit=limit)
+    if not suggestions and len(variants) > 1:
+        suggestions = suggest_books(books, variants[1], limit=limit)
+    for item in suggestions:
+        bid = str(item.get("id") or "").strip()
+        if not bid or bid in seen_ids:
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        results.append({"id": bid, "title": title})
+        seen_ids.add(bid)
+        if len(results) >= limit:
+            break
+    return results
+
+
+async def _answer_guest_query(
+    context: ContextTypes.DEFAULT_TYPE,
+    guest_query_id: str,
+    text: str,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> None:
+    message_text = str(text or "").strip() or "Open the bot in a private chat."
+    result_title = str(title or message_text.splitlines()[0].strip() or "Message from bot").strip()
+    result_description = str(description or re.sub(r"\s+", " ", message_text).strip()).strip()
+    result = {
+        "type": "article",
+        "id": uuid.uuid4().hex[:32],
+        "title": result_title[:64],
+        "description": result_description[:128],
+        "input_message_content": {
+            "message_text": message_text[:4096],
+        },
+    }
+    if reply_markup:
+        result["reply_markup"] = reply_markup
+    payload = {
+        "guest_query_id": guest_query_id,
+        "result": json.dumps(result, ensure_ascii=False),
+    }
+    await context.bot._post("answerGuestQuery", payload)
+
+
+def _guest_open_button_text(lang: str) -> str:
+    return {
+        "uz": "📥 Botni ochish",
+        "ru": "📥 Открыть бота",
+        "en": "📥 Open Bot",
+    }.get(lang, "📥 Open Bot")
+
+
+def _guest_open_bot_inline_keyboard(lang: str, bot_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(_guest_open_button_text(lang), url=bot_url)]]
+    )
+
+
+def _guest_open_bot_markup(lang: str, bot_url: str) -> dict[str, Any]:
+    return _guest_open_bot_inline_keyboard(lang, bot_url).to_dict()
+
+
+def _guest_results_inline_keyboard(
+    entries: list[dict[str, str]],
+    lang: str,
+    bot_url: str,
+    *,
+    query_token: str | None = None,
+    open_url: str | None = None,
+) -> InlineKeyboardMarkup:
+    number_row: list[dict[str, str]] = []
+    for idx, entry in enumerate(entries, start=1):
+        book_id = str(entry.get("id") or "").strip()
+        if not book_id:
+            continue
+        callback_data = f"gbook:{book_id}:{query_token}" if query_token else f"book:{book_id}"
+        number_row.append({"text": str(idx), "callback_data": callback_data})
+    rows: list[list[InlineKeyboardButton]] = []
+    if number_row:
+        rows.append([InlineKeyboardButton(button["text"], callback_data=button["callback_data"]) for button in number_row])
+    rows.append([InlineKeyboardButton(_guest_open_button_text(lang), url=open_url or bot_url)])
+    return InlineKeyboardMarkup(rows)
+
+
+def _guest_results_markup(
+    entries: list[dict[str, str]],
+    lang: str,
+    bot_url: str,
+    *,
+    query_token: str | None = None,
+    open_url: str | None = None,
+) -> dict[str, Any]:
+    return _guest_results_inline_keyboard(
+        entries,
+        lang,
+        bot_url,
+        query_token=query_token,
+        open_url=open_url,
+    ).to_dict()
+
+
+def parse_guest_private_handoff_payload(payload: str | None) -> str | None:
+    if not payload:
+        return None
+    token = str(payload or "").strip()
+    if not token.startswith("gh_"):
+        return None
+    handoff_token = token[len("gh_") :].strip()
+    return handoff_token or None
+
+
+async def _create_guest_private_handoff_start(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    handoff_type: str,
+    creator_user_id: int | None = None,
+    query_text: str | None = None,
+    book_id: str | None = None,
+    source_chat_id: int | None = None,
+    source_chat_type: str | None = None,
+    source_chat_title: str | None = None,
+    source_chat_username: str | None = None,
+    source_public_link: str | None = None,
+) -> tuple[str | None, str | None]:
+    try:
+        record = await run_blocking_db_retry(
+            db_create_guest_private_handoff,
+            handoff_type,
+            creator_user_id,
+            query_text,
+            book_id,
+            source_chat_id,
+            source_chat_type,
+            source_chat_title,
+            source_chat_username,
+            source_public_link,
+            retries=DB_RETRY_ATTEMPTS,
+            base_delay=DB_RETRY_BASE_DELAY_SEC,
+        )
+    except Exception as e:
+        logger.warning("Failed to create guest private handoff: %s", e, exc_info=True)
+        return None, None
+    token = str((record or {}).get("token") or "").strip()
+    if not token:
+        return None, None
+    start_url = await _build_private_start_url(context, payload=f"gh_{token}")
+    return start_url, token
+
+
+def _guest_private_handoff_context_text(lang: str, handoff_type: str) -> str:
+    key = "guest_private_handoff_book_context" if str(handoff_type or "").strip().lower() == "book" else "guest_private_handoff_query_context"
+    return MESSAGES.get(lang, MESSAGES["en"]).get(
+        key,
+        MESSAGES["en"].get(key, "🔓 Opened from guest search."),
+    )
+
+
+async def build_guest_private_handoff_reply_markup(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    handoff_token: str,
+    selected_book_id: str,
+    actor_user_id: int | None,
+    lang: str,
+) -> InlineKeyboardMarkup | None:
+    try:
+        handoff = await run_blocking_db_retry(
+            db_get_guest_private_handoff_by_token,
+            handoff_token,
+            retries=DB_RETRY_ATTEMPTS,
+            base_delay=DB_RETRY_BASE_DELAY_SEC,
+        )
+    except Exception as e:
+        logger.warning("Failed to load guest private handoff %s: %s", handoff_token, e, exc_info=True)
+        return None
+    query_text = str((handoff or {}).get("query_text") or "").strip()
+    if not query_text:
+        return None
+    try:
+        entries = await run_blocking(_search_guest_books, query_text, 5)
+    except Exception as e:
+        logger.warning("Failed to rebuild guest search results for handoff %s: %s", handoff_token, e, exc_info=True)
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    number_row: list[InlineKeyboardButton] = []
+    query_open_url = await _build_private_start_url(context, payload=f"gh_{handoff_token}")
+    fallback_query_url = query_open_url or _bot_public_url()
+    for idx, entry in enumerate(entries, start=1):
+        entry_book_id = str(entry.get("id") or "").strip()
+        if not entry_book_id:
+            continue
+        entry_open_url, _ = await _create_guest_private_handoff_start(
+            context,
+            handoff_type="book",
+            creator_user_id=actor_user_id,
+            query_text=query_text,
+            book_id=entry_book_id,
+            source_chat_id=(handoff or {}).get("source_chat_id"),
+            source_chat_type=(handoff or {}).get("source_chat_type"),
+            source_chat_title=(handoff or {}).get("source_chat_title"),
+            source_chat_username=(handoff or {}).get("source_chat_username"),
+            source_public_link=(handoff or {}).get("source_public_link"),
+        )
+        number_row.append(
+            InlineKeyboardButton(
+                str(idx),
+                url=entry_open_url or fallback_query_url,
+            )
+        )
+    if number_row:
+        rows.append(number_row)
+    rows.append([InlineKeyboardButton(_guest_open_button_text(lang), url=fallback_query_url)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def handle_guest_message_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    guest_message, raw = _parse_guest_message(update, context)
+    if not guest_message:
+        return
+
+    guest_query_id = str(
+        (raw or {}).get("guest_query_id")
+        or getattr(guest_message, "api_kwargs", {}).get("guest_query_id")
+        or ""
+    ).strip()
+    if not guest_query_id:
+        return
+
+    lang = _guest_message_language(guest_message, raw)
+    guest_chat = _guest_chat_info(guest_message, raw)
+    text = str(getattr(guest_message, "text", None) or getattr(guest_message, "caption", None) or "").strip()
+    bot_handle = _bot_public_handle()
+    bot_url = _bot_public_url()
+    bot_username = bot_handle.lstrip("@")
+
+    if guest_chat.get("chat_id") and guest_chat.get("chat_type") in {"group", "supergroup"}:
+        try:
+            await run_blocking(
+                db_upsert_guest_group,
+                int(guest_chat["chat_id"]),
+                guest_chat.get("chat_type"),
+                guest_chat.get("title"),
+                guest_chat.get("username"),
+                guest_chat.get("public_link"),
+                None,
+                False,
+            )
+            _invalidate_audit_report_cache(context)
+        except Exception as e:
+            logger.warning("Failed to record guest group presence: %s", e)
+
+    try:
+        command_name, query_text = _extract_guest_query_text(text, bot_username)
+
+        if command_name in {"start", "help"} or (not command_name and not query_text):
+            body = MESSAGES[lang].get("guest_help", MESSAGES["en"]["guest_help"]).format(bot=bot_handle)
+            await _answer_guest_query(
+                context,
+                guest_query_id,
+                body,
+                title=MESSAGES[lang].get("guest_help_title", MESSAGES["en"].get("guest_help_title", "Guest mode")),
+                description=MESSAGES[lang].get("guest_help_description", MESSAGES["en"].get("guest_help_description", "Open the bot for full search and downloads")),
+                reply_markup=_guest_open_bot_markup(lang, bot_url),
+            )
+            return
+
+        if command_name in {"settings", "language"}:
+            body = MESSAGES[lang].get("guest_settings", MESSAGES["en"]["guest_settings"]).format(bot=bot_handle)
+            await _answer_guest_query(
+                context,
+                guest_query_id,
+                body,
+                title=MESSAGES[lang].get("guest_settings_title", MESSAGES["en"].get("guest_settings_title", "Settings")),
+                description=MESSAGES[lang].get("guest_settings_description", MESSAGES["en"].get("guest_settings_description", "Open the bot in private chat")),
+                reply_markup=_guest_open_bot_markup(lang, bot_url),
+            )
+            return
+
+        if command_name == "request":
+            body = (
+                MESSAGES[lang].get("guest_open_private_hint", MESSAGES["en"]["guest_open_private_hint"]).format(bot=bot_handle)
+            )
+            await _answer_guest_query(
+                context,
+                guest_query_id,
+                body,
+                title=MESSAGES[lang].get("guest_request_title", MESSAGES["en"].get("guest_request_title", "Open the bot")),
+                description=MESSAGES[lang].get("guest_request_description", MESSAGES["en"].get("guest_request_description", "Requests work in private chat")),
+                reply_markup=_guest_open_bot_markup(lang, bot_url),
+            )
+            return
+
+        effective_query = query_text if query_text else text
+        effective_query = str(effective_query or "").strip()
+        if not effective_query:
+            body = MESSAGES[lang].get("guest_help", MESSAGES["en"]["guest_help"]).format(bot=bot_handle)
+            await _answer_guest_query(
+                context,
+                guest_query_id,
+                body,
+                title=MESSAGES[lang].get("guest_help_title", MESSAGES["en"].get("guest_help_title", "Guest mode")),
+                description=MESSAGES[lang].get("guest_help_description", MESSAGES["en"].get("guest_help_description", "Open the bot for full search and downloads")),
+                reply_markup=_guest_open_bot_markup(lang, bot_url),
+            )
+            return
+
+        try:
+            await run_blocking(db_increment_counter, "guest_search_total", 1)
+            if guest_chat.get("chat_id") and guest_chat.get("chat_type") in {"group", "supergroup"}:
+                await run_blocking(
+                    db_upsert_guest_group,
+                    int(guest_chat["chat_id"]),
+                    guest_chat.get("chat_type"),
+                    guest_chat.get("title"),
+                    guest_chat.get("username"),
+                    guest_chat.get("public_link"),
+                    effective_query,
+                    True,
+                )
+            await run_blocking(
+                db_record_guest_user_activity,
+                getattr(guest_message.from_user, "id", None),
+                getattr(guest_message.from_user, "username", None),
+                getattr(guest_message.from_user, "first_name", None),
+                getattr(guest_message.from_user, "last_name", None),
+                guest_chat.get("chat_id"),
+                guest_chat.get("chat_type"),
+                guest_chat.get("title"),
+                guest_chat.get("username"),
+                guest_chat.get("public_link"),
+                effective_query,
+            )
+            _invalidate_audit_report_cache(context)
+        except Exception as e:
+            logger.warning("Failed to record guest search stats: %s", e)
+
+        entries = await run_blocking(_search_guest_books, effective_query, 5)
+        if not entries:
+            not_found_url, _ = await _create_guest_private_handoff_start(
+                context,
+                handoff_type="query",
+                creator_user_id=getattr(guest_message.from_user, "id", None),
+                query_text=effective_query,
+                source_chat_id=guest_chat.get("chat_id"),
+                source_chat_type=guest_chat.get("chat_type"),
+                source_chat_title=guest_chat.get("title"),
+                source_chat_username=guest_chat.get("username"),
+                source_public_link=guest_chat.get("public_link"),
+            )
+            body = MESSAGES[lang].get("guest_not_found", MESSAGES["en"]["guest_not_found"]).format(
+                query=effective_query,
+                bot=bot_handle,
+            )
+            await _answer_guest_query(
+                context,
+                guest_query_id,
+                body,
+                title=MESSAGES[lang].get("guest_not_found_title", MESSAGES["en"].get("guest_not_found_title", "No results")),
+                description=effective_query,
+                reply_markup=_guest_open_bot_markup(lang, not_found_url or bot_url),
+            )
+            return
+
+        open_url, query_token = await _create_guest_private_handoff_start(
+            context,
+            handoff_type="query",
+            creator_user_id=getattr(guest_message.from_user, "id", None),
+            query_text=effective_query,
+            source_chat_id=guest_chat.get("chat_id"),
+            source_chat_type=guest_chat.get("chat_type"),
+            source_chat_title=guest_chat.get("title"),
+            source_chat_username=guest_chat.get("username"),
+            source_public_link=guest_chat.get("public_link"),
+        )
+        lines = [
+            MESSAGES[lang].get("guest_results_header", MESSAGES["en"]["guest_results_header"]).format(query=effective_query),
+            "",
+        ]
+        for idx, entry in enumerate(entries, start=1):
+            lines.append(f"{idx}. {entry['title']}")
+        lines.extend(
+            [
+                "",
+                MESSAGES[lang].get("guest_choose_result", MESSAGES["en"]["guest_choose_result"]),
+            ]
+        )
+        await _answer_guest_query(
+            context,
+            guest_query_id,
+            "\n".join(lines).strip(),
+            title=MESSAGES[lang].get("guest_results_title", MESSAGES["en"].get("guest_results_title", "Search results")),
+            description=MESSAGES[lang].get("guest_results_description", MESSAGES["en"].get("guest_results_description", "{count} matches")).format(count=len(entries)),
+            reply_markup=_guest_results_markup(
+                entries,
+                lang,
+                bot_url,
+                query_token=query_token,
+                open_url=open_url or bot_url,
+            ),
+        )
+    except Exception as e:
+        logger.error("Guest message handling failed: %s", e, exc_info=True)
+        fallback = MESSAGES[lang].get("guest_open_private_hint", MESSAGES["en"]["guest_open_private_hint"]).format(
+            bot=bot_handle,
+        )
+        try:
+            await _answer_guest_query(
+                context,
+                guest_query_id,
+                fallback,
+                title=MESSAGES[lang].get("guest_error_title", MESSAGES["en"].get("guest_error_title", "Open the bot")),
+                description=MESSAGES[lang].get("guest_error_description", MESSAGES["en"].get("guest_error_description", "Continue in private chat")),
+                reply_markup=_guest_open_bot_markup(lang, bot_url),
+            )
+        except Exception:
+            pass
 
 
 
@@ -1092,6 +1669,37 @@ def _safe_asyncio_current_task():
         return None
 
 
+_BACKGROUND_JOB_ACTIVITY_KEY = "background_job_activity"
+
+
+def _set_background_job_activity(app, worker_id: str, **fields: Any) -> None:
+    try:
+        bot_data = getattr(app, "bot_data", None)
+        if not isinstance(bot_data, dict):
+            return
+        state = bot_data.setdefault(_BACKGROUND_JOB_ACTIVITY_KEY, {})
+        if not isinstance(state, dict):
+            state = {}
+            bot_data[_BACKGROUND_JOB_ACTIVITY_KEY] = state
+        payload = dict(fields)
+        payload["updated_at"] = time.time()
+        state[str(worker_id or "worker")] = payload
+    except Exception:
+        pass
+
+
+def _clear_background_job_activity(app, worker_id: str) -> None:
+    try:
+        bot_data = getattr(app, "bot_data", None)
+        state = bot_data.get(_BACKGROUND_JOB_ACTIVITY_KEY) if isinstance(bot_data, dict) else None
+        if isinstance(state, dict):
+            state.pop(str(worker_id or "worker"), None)
+            if not state:
+                bot_data.pop(_BACKGROUND_JOB_ACTIVITY_KEY, None)
+    except Exception:
+        pass
+
+
 def _safe_filename(name: str, default: str = "book") -> str:
     if not name:
         return default
@@ -1165,6 +1773,172 @@ def parse_group_private_start_payload(payload: str | None) -> tuple[int | None, 
             return None, None
         return user_id, prompt_token
     return None, None
+
+
+async def _load_book_for_private_handoff(book_id: str) -> dict[str, Any] | None:
+    safe_book_id = str(book_id or "").strip()
+    if not safe_book_id:
+        return None
+    book = await run_blocking(db_get_book_by_id, safe_book_id)
+    if book:
+        return dict(book)
+    if not es_available():
+        return None
+    try:
+        es = get_es()
+        if not es:
+            return None
+        res = await run_blocking(lambda: es.get(index="books", id=safe_book_id))
+        source = (res or {}).get("_source") or {}
+        if not source:
+            return None
+        restored = dict(source)
+        restored["id"] = safe_book_id
+        await run_blocking(db_insert_book, restored)
+        return restored
+    except Exception as e:
+        logger.warning("Private handoff ES lookup failed for %s: %s", safe_book_id, e)
+        return None
+
+
+async def _send_private_handoff_results(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    lang: str,
+    query_text: str,
+) -> bool:
+    effective_query = str(query_text or "").strip()
+    if not effective_query:
+        return False
+    entries = await run_blocking(_search_guest_books, effective_query, 5)
+    if not entries:
+        await safe_reply(update, MESSAGES[lang]["not_found"])
+        return True
+    query_id = cache_search_results(context, effective_query, entries)
+    result_text, page_entries, pages = build_results_text(effective_query, entries, 0, lang)
+    reply_markup = build_results_keyboard(page_entries, 0, pages, query_id)
+    target_message = update.message or update.effective_message
+    if target_message:
+        await _send_with_retry(lambda: target_message.reply_text(result_text, reply_markup=reply_markup))
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=result_text,
+            reply_markup=reply_markup,
+        )
+    return True
+
+
+async def _handle_guest_private_start_payload(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    payload_token: str,
+    user_record: dict[str, Any],
+) -> bool:
+    try:
+        handoff = await run_blocking_db_retry(
+            db_get_guest_private_handoff_by_token,
+            payload_token,
+            retries=DB_RETRY_ATTEMPTS,
+            base_delay=DB_RETRY_BASE_DELAY_SEC,
+        )
+    except Exception as e:
+        logger.warning("Failed to load guest handoff payload %s: %s", payload_token, e, exc_info=True)
+        return False
+    if not handoff:
+        return False
+
+    selected_lang = str(user_record.get("language") or "").strip()
+    language_selected = bool(user_record.get("language_selected")) and bool(selected_lang)
+    lang = detect_language_code(selected_lang) if language_selected else "uz"
+
+    if not language_selected:
+        context.user_data["language"] = lang
+        try:
+            await run_blocking_db_retry(
+                set_user_language,
+                update.effective_user.id,
+                lang,
+                retries=DB_RETRY_ATTEMPTS,
+                base_delay=DB_RETRY_BASE_DELAY_SEC,
+            )
+        except Exception as e:
+            logger.warning("Failed to auto-set guest handoff language for %s: %s", update.effective_user.id, e, exc_info=True)
+
+    handled = False
+    context_line_sent = False
+    handoff_type = str(handoff.get("handoff_type") or "query").strip().lower() or "query"
+    query_text = str(handoff.get("query_text") or "").strip()
+    book_id = str(handoff.get("book_id") or "").strip()
+    context_line = _guest_private_handoff_context_text(lang, handoff_type)
+
+    if language_selected and handoff_type == "book" and book_id:
+        book = await _load_book_for_private_handoff(book_id)
+        if book:
+            if context_line:
+                await safe_reply(update, context_line)
+                context_line_sent = True
+            sent = await send_book(
+                context.bot,
+                update.effective_chat.id,
+                book,
+                lang=lang,
+                user_id=update.effective_user.id,
+            )
+            handled = bool(sent)
+            if handled:
+                try:
+                    await run_blocking_db_retry(db_increment_book_download, book_id, retries=DB_RETRY_ATTEMPTS, base_delay=DB_RETRY_BASE_DELAY_SEC)
+                    await run_blocking_db_retry(add_recent_download, update.effective_user.id, book_id, get_result_title(book), retries=DB_RETRY_ATTEMPTS, base_delay=DB_RETRY_BASE_DELAY_SEC)
+                    await run_blocking_db_retry(db_increment_counter, "download_total", 1, retries=DB_RETRY_ATTEMPTS, base_delay=DB_RETRY_BASE_DELAY_SEC)
+                    await run_blocking_db_retry(increment_analytics, "buttons", 1, retries=DB_RETRY_ATTEMPTS, base_delay=DB_RETRY_BASE_DELAY_SEC)
+                    await run_blocking_db_retry(increment_user_analytics, update.effective_user.id, "buttons", 1, retries=DB_RETRY_ATTEMPTS, base_delay=DB_RETRY_BASE_DELAY_SEC)
+                except Exception as e:
+                    logger.warning("Failed to record guest private handoff book analytics for %s: %s", book_id, e, exc_info=True)
+
+    if not handled and query_text:
+        if context_line and not context_line_sent:
+            await safe_reply(update, context_line)
+            context_line_sent = True
+        handled = await _send_private_handoff_results(update, context, lang=lang, query_text=query_text)
+
+    if not handled and book_id:
+        book = await _load_book_for_private_handoff(book_id)
+        if book:
+            if context_line and not context_line_sent:
+                await safe_reply(update, context_line)
+                context_line_sent = True
+            handled = bool(
+                await send_book(
+                    context.bot,
+                    update.effective_chat.id,
+                    book,
+                    lang=lang,
+                    user_id=update.effective_user.id,
+                )
+            )
+
+    if handled:
+        try:
+            await run_blocking_db_retry(
+                db_touch_guest_private_handoff,
+                payload_token,
+                retries=DB_RETRY_ATTEMPTS,
+                base_delay=DB_RETRY_BASE_DELAY_SEC,
+            )
+        except Exception as e:
+            logger.debug("Failed to touch guest private handoff %s: %s", payload_token, e, exc_info=True)
+        _set_main_menu_ready_state(context)
+        try:
+            _schedule_application_task(
+                context.application,
+                _sync_user_commands_if_needed(context, update.effective_user.id, lang, force=True),
+            )
+        except Exception as e:
+            logger.debug("Failed to sync commands after guest handoff for %s: %s", update.effective_user.id, e, exc_info=True)
+    return handled
 
 
 def format_user_name(user: dict) -> str:
@@ -1312,6 +2086,8 @@ def build_book_keyboard(
     show_listen_button: bool = True,
     audiobook_request_count: int = 0,
     show_personal_state: bool = True,
+    show_favorite_button: bool = True,
+    more_books_url: str | None = None,
 ) -> InlineKeyboardMarkup:
     like = counts.get("like", 0)
     dislike = counts.get("dislike", 0)
@@ -1341,7 +2117,8 @@ def build_book_keyboard(
         listen_label = m.get("audiobook_listen_button", "🎧 Listen Audiobook")
         rows.append([InlineKeyboardButton(listen_label, callback_data=f"abook:{book_id}")])
 
-    rows.append([InlineKeyboardButton(fav_label, callback_data=f"fav:toggle:{book_id}")])
+    if show_favorite_button:
+        rows.append([InlineKeyboardButton(fav_label, callback_data=f"fav:toggle:{book_id}")])
 
     if can_rename_book:
         rows.append([InlineKeyboardButton(m.get("book_action_rename", "✏️ Edit name"), callback_data=f"bookrename:{book_id}")])
@@ -1364,6 +2141,9 @@ def build_book_keyboard(
     if can_delete:
         rows.append([InlineKeyboardButton(m.get("book_action_delete", "🗑️ Delete book"), callback_data=f"delbook:{book_id}")])
 
+    if more_books_url:
+        rows.append([InlineKeyboardButton(m.get("inline_more_books_button", "📚 More books"), url=more_books_url)])
+
     return InlineKeyboardMarkup(rows)
 
 
@@ -1379,7 +2159,7 @@ def build_book_caption(book, downloads: int, fav_count: int, counts: dict) -> st
     return "\n".join(lines)
 
 
-async def send_book(bot, chat_id, book):
+async def send_book(bot, chat_id, book, *, lang: str = "en", user_id: int | None = None):
     """
     Send a book to the user:
     - Prefer Telegram cache if available
@@ -1405,7 +2185,8 @@ async def send_book(bot, chat_id, book):
         "whale": stats.get("whale", 0),
     }
     caption = build_book_caption(book, downloads, fav_count, counts)
-    user_id = chat_id if isinstance(chat_id, int) else None
+    if user_id is None:
+        user_id = chat_id if isinstance(chat_id, int) else None
     is_fav = False
     user_reaction = None
     if user_id and book_id:
@@ -1447,7 +2228,7 @@ async def send_book(bot, chat_id, book):
             user_reaction,
             can_delete,
             can_rename_book,
-            "en",
+            lang,
             has_audiobook=has_ab,
             can_add_audiobook=can_add_ab,
             show_listen_button=show_listen_btn,
@@ -1460,13 +2241,13 @@ async def send_book(bot, chat_id, book):
     if book.get("file_id"):
         # Prefer Telegram cache
         try:
-            await bot.send_document(
+            sent_message = await bot.send_document(
                 chat_id=chat_id,
                 document=book["file_id"],
                 caption=caption,
                 reply_markup=reactions_kb,
             )
-            return
+            return sent_message
         except Exception as e:
             logger.error("send_book failed by file_id for %s: %s", book_id, e)
 
@@ -1520,8 +2301,10 @@ async def send_book(bot, chat_id, book):
                     )
                 except Exception as e:
                     logger.warning("Failed to index book in ES for %s: %s", book.get("id"), e)
+            return sent_message
     else:
-        await bot.send_message(chat_id=chat_id, text=MESSAGES["en"]["book_unavailable"])
+        await bot.send_message(chat_id=chat_id, text=MESSAGES[lang]["book_unavailable"])
+    return None
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -1548,9 +2331,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _parse_background_job_type_limits(raw: str | None) -> dict[str, int]:
-    limits = {
-        "book_summary": 1,
-    }
+    limits: dict[str, int] = {}
     text = str(raw or "").strip()
     if not text:
         return limits
@@ -1748,9 +2529,10 @@ except Exception:
 BACKGROUND_JOB_TYPE_LIMITS = _parse_background_job_type_limits(
     os.getenv(
         "BACKGROUND_JOB_TYPE_LIMITS",
-        "book_summary:1",
+        "",
     )
 )
+BACKGROUND_JOB_TYPE_LIMITS.pop("book_summary", None)
 try:
     DB_RETRY_ATTEMPTS = max(0, int(os.getenv("DB_RETRY_ATTEMPTS", "2")))
 except Exception:
@@ -1763,7 +2545,104 @@ try:
     ES_HEALTH_CACHE_TTL_SEC = max(3, int(os.getenv("ES_HEALTH_CACHE_TTL_SEC", "15")))
 except Exception:
     ES_HEALTH_CACHE_TTL_SEC = 15
+try:
+    STARTUP_DEPENDENCY_TIMEOUT_SEC = max(5.0, float(os.getenv("STARTUP_DEPENDENCY_TIMEOUT_SEC", "90") or "90"))
+except Exception:
+    STARTUP_DEPENDENCY_TIMEOUT_SEC = 90.0
+try:
+    STARTUP_DEPENDENCY_RETRY_SEC = max(0.5, float(os.getenv("STARTUP_DEPENDENCY_RETRY_SEC", "2") or "2"))
+except Exception:
+    STARTUP_DEPENDENCY_RETRY_SEC = 2.0
 _ES_HEALTH_CACHE = {"ok": None, "checked_at": 0.0, "error": None}
+
+
+def _check_db_startup_ready() -> tuple[bool, str | None]:
+    try:
+        stats = db_ping()
+    except Exception as e:
+        return False, str(e)
+    if stats.get("ok"):
+        return True, None
+    return False, str(stats.get("error") or "database unavailable")
+
+
+def _check_es_startup_ready() -> tuple[bool, str | None]:
+    if not ENABLE_ELASTICSEARCH:
+        return True, None
+    try:
+        es = get_es()
+        if es is None:
+            return False, "elasticsearch client unavailable"
+        es.info()
+        ensure_index()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _check_bot_api_startup_ready(bot_api_base_url: str, *, local_mode: bool = False) -> tuple[bool, str | None]:
+    base = str(bot_api_base_url or "").strip()
+    if not base and not local_mode:
+        return True, None
+    target = base or "http://127.0.0.1:8081"
+    try:
+        parsed = urlparse(target if "://" in target else f"http://{target}")
+        host = parsed.hostname or "127.0.0.1"
+        if ":" in host and not parsed.hostname:
+            host = host.strip("[]")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=2.0):
+            return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def wait_for_runtime_dependencies(
+    service_name: str,
+    *,
+    require_db: bool = True,
+    require_es: bool = False,
+    bot_api_base_url: str = "",
+    require_bot_api: bool = False,
+    bot_api_local_mode: bool = False,
+) -> None:
+    checks: list[tuple[str, Any]] = []
+    if require_db:
+        checks.append(("PostgreSQL", _check_db_startup_ready))
+    if require_es:
+        checks.append(("Elasticsearch", _check_es_startup_ready))
+    if require_bot_api:
+        checks.append(("Telegram Bot API", lambda: _check_bot_api_startup_ready(bot_api_base_url, local_mode=bot_api_local_mode)))
+    if not checks:
+        return
+
+    deadline = time.time() + STARTUP_DEPENDENCY_TIMEOUT_SEC
+    pending = {name for name, _ in checks}
+    last_errors: dict[str, str] = {}
+    logger.info(
+        "%s waiting for dependencies: %s",
+        service_name,
+        ", ".join(name for name, _ in checks),
+    )
+    while pending:
+        ready_now: list[str] = []
+        for name, checker in checks:
+            if name not in pending:
+                continue
+            ok, err = checker()
+            if ok:
+                ready_now.append(name)
+            elif err:
+                last_errors[name] = str(err)
+        for name in ready_now:
+            pending.discard(name)
+            logger.info("%s dependency ready: %s", service_name, name)
+        if not pending:
+            return
+        if time.time() >= deadline:
+            detail = "; ".join(f"{name}={last_errors.get(name, 'not ready')}" for name in pending)
+            raise RuntimeError(f"{service_name} dependency wait timed out: {detail}")
+        time.sleep(STARTUP_DEPENDENCY_RETRY_SEC)
 
 
 def _derive_group_handle(url: str) -> str:
@@ -4007,9 +4886,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_payload = context.args[0] if context.args else None
         referrer_id = parse_referral_payload(start_payload)
         group_prompt_user_id, group_prompt_token = parse_group_private_start_payload(start_payload)
+        guest_handoff_token = parse_guest_private_handoff_payload(start_payload)
         prompt_lang = _language_picker_prompt_lang(user_record, update.effective_user)
         selected_lang = str(user_record.get("language") or "").strip()
         language_selected = bool(user_record.get("language_selected")) and bool(selected_lang)
+        if guest_handoff_token:
+            handled = await _handle_guest_private_start_payload(
+                update,
+                context,
+                payload_token=guest_handoff_token,
+                user_record=user_record,
+            )
+            if handled:
+                _schedule_application_task(
+                    context.application,
+                    _post_start_background_sync(update, context, referrer_id),
+                )
+                return
         if language_selected:
             await _send_animated_start_greeting(update, context, detect_language_code(selected_lang))
         else:
@@ -4325,12 +5218,16 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         pause_bot_command_fn=pause_bot_command,
         resume_bot_command_fn=resume_bot_command,
         audit_command_fn=audit_command,
+        guest_audit_command_fn=guest_audit_command,
+        inline_audit_command_fn=inline_audit_command,
         prune_command_fn=prune_command,
         missing_command_fn=missing_command,
         db_dupes_command_fn=db_dupes_command,
         es_dupes_command_fn=es_dupes_command,
         dupes_status_command_fn=dupes_status_command,
         cancel_task_command_fn=cancel_task_command,
+        worker_status_command_fn=worker_status_command,
+        live_activity_command_fn=live_activity_command,
     )
     if handled_admin:
         return True
@@ -4536,6 +5433,164 @@ def _format_bytes(bytes_count: int) -> str:
         return f"{int(bytes_count)} {units[unit_index]}"
     else:
         return f"{bytes_count:.1f} {units[unit_index]}"
+
+
+def _audit_display_user(row: dict[str, Any] | None) -> str:
+    item = row or {}
+    user_id = item.get("user_id")
+    username = str(item.get("username") or "").strip().lstrip("@")
+    full_name = " ".join(
+        part for part in [str(item.get("first_name") or "").strip(), str(item.get("last_name") or "").strip()] if part
+    ).strip()
+    label = full_name or (f"@{username}" if username else (str(user_id) if user_id else "unknown"))
+    extras: list[str] = []
+    if username and f"@{username}" != label:
+        extras.append(f"@{username}")
+    if user_id:
+        extras.append(str(user_id))
+    return f"{label} ({' | '.join(extras)})" if extras else label
+
+
+def _audit_shorten(value: str | None, limit: int = 64) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _audit_format_dt(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    return str(value or "-")
+
+
+async def _build_guest_audit_report(lang: str) -> str:
+    guest_group_stats = await run_blocking(db_get_guest_group_audit_stats, 10)
+    guest_user_stats = await run_blocking(db_get_guest_user_audit_stats, 10)
+    lines = [
+        "👥 Guest Audit",
+        "──────────",
+        f"- Guest searches: {guest_user_stats.get('total_searches', 0)}",
+        f"- Guest users: {guest_user_stats.get('total_users', 0)}",
+        f"- Guest groups: {guest_group_stats.get('total_groups', 0)}",
+        f"- Group searches: {guest_group_stats.get('total_group_searches', 0)}",
+    ]
+
+    top_users = guest_user_stats.get("top_users") or []
+    if top_users:
+        lines.append("──────────")
+        lines.append("Top guest users")
+        for row in top_users:
+            lines.append(
+                f"- {_audit_display_user(row)} | searches={int(row.get('searches') or 0)} | last={_audit_format_dt(row.get('last_seen_at'))}"
+            )
+
+    recent_searches = guest_user_stats.get("recent_searches") or []
+    if recent_searches:
+        lines.append("──────────")
+        lines.append("Recent guest searches")
+        for row in recent_searches:
+            group_title = str(row.get("group_title") or row.get("group_username") or row.get("chat_id") or "-").strip()
+            query_text = _audit_shorten(row.get("query_text"), 70)
+            lines.append(
+                f"- {_audit_display_user(row)} | {group_title} | {_audit_format_dt(row.get('searched_at'))} | {query_text or '—'}"
+            )
+
+    groups = guest_group_stats.get("groups") or []
+    if groups:
+        lines.append("──────────")
+        lines.append("Recent guest groups")
+        for group in groups:
+            group_title = str(group.get("title") or group.get("username") or group.get("chat_id") or "-").strip()
+            public_link = str(group.get("public_link") or "").strip()
+            if not public_link:
+                username = str(group.get("username") or "").strip().lstrip("@")
+                public_link = f"https://t.me/{username}" if username else "no public link"
+            lines.append(
+                f"- {group_title} | {group.get('chat_id') or '-'} | searches={int(group.get('searches') or 0)} | {public_link}"
+            )
+
+    return "\n".join(lines)
+
+
+async def _build_inline_audit_report(lang: str) -> str:
+    inline_stats = await run_blocking(db_get_inline_audit_stats, 10)
+    lines = [
+        "🔎 Inline Audit",
+        "──────────",
+        f"- Inline searches: {inline_stats.get('total_searches', 0)}",
+        f"- Inline users: {inline_stats.get('total_users', 0)}",
+        f"- Chosen inline results: {inline_stats.get('total_choices', 0)}",
+    ]
+
+    top_users = inline_stats.get("top_users") or []
+    if top_users:
+        lines.append("──────────")
+        lines.append("Top inline users")
+        for row in top_users:
+            lines.append(
+                f"- {_audit_display_user(row)} | searches={int(row.get('searches') or 0)} | last={_audit_format_dt(row.get('last_seen_at'))}"
+            )
+
+    recent_searches = inline_stats.get("recent_searches") or []
+    if recent_searches:
+        lines.append("──────────")
+        lines.append("Recent inline searches")
+        for row in recent_searches:
+            lines.append(
+                f"- {_audit_display_user(row)} | {_audit_format_dt(row.get('searched_at'))} | {_audit_shorten(row.get('query_text'), 80) or '—'}"
+            )
+
+    recent_choices = inline_stats.get("recent_choices") or []
+    if recent_choices:
+        lines.append("──────────")
+        lines.append("Recent chosen inline results")
+        for row in recent_choices:
+            lines.append(
+                f"- {_audit_display_user(row)} | {_audit_format_dt(row.get('chosen_at'))} | result={row.get('result_id') or '-'} | {_audit_shorten(row.get('query_text'), 60) or '—'}"
+            )
+
+    return "\n".join(lines)
+
+
+async def guest_audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await target_message.reply_text(MESSAGES[lang]["admin_only"])
+        return
+    limited, wait_s = spam_check_message(update, context)
+    if limited:
+        await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+        return
+    try:
+        report = await _build_guest_audit_report(lang)
+        await target_message.reply_text(report)
+    except Exception as e:
+        logger.error("Guest audit command failed: %s", e, exc_info=True)
+        await target_message.reply_text(MESSAGES[lang]["audit_failed"])
+
+
+async def inline_audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await target_message.reply_text(MESSAGES[lang]["admin_only"])
+        return
+    limited, wait_s = spam_check_message(update, context)
+    if limited:
+        await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+        return
+    try:
+        report = await _build_inline_audit_report(lang)
+        await target_message.reply_text(report)
+    except Exception as e:
+        logger.error("Inline audit command failed: %s", e, exc_info=True)
+        await target_message.reply_text(MESSAGES[lang]["audit_failed"])
 
 
 async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4801,30 +5856,6 @@ top_command = _engagement_handlers.top_command
 handle_top_page_callback = _engagement_handlers.handle_top_page_callback
 handle_favorite_callback = _engagement_handlers.handle_favorite_callback
 handle_reaction_callback = _engagement_handlers.handle_reaction_callback
-SUMMARY_MODES = _engagement_handlers.SUMMARY_MODES
-_summary_mode_label = _engagement_handlers._summary_mode_label
-_summary_mode_keyboard = _engagement_handlers._summary_mode_keyboard
-_summary_lang_name = _engagement_handlers._summary_lang_name
-_summary_stage_text = _engagement_handlers._summary_stage_text
-_summary_progress_render = _engagement_handlers._summary_progress_render
-_summary_progress_set = _engagement_handlers._summary_progress_set
-_summary_telegram_split = _engagement_handlers._summary_telegram_split
-_summary_chunk_text = _engagement_handlers._summary_chunk_text
-_summary_tesseract_lang_candidates = _engagement_handlers._summary_tesseract_lang_candidates
-_summary_ocr_pdf_text_blocking = _engagement_handlers._summary_ocr_pdf_text_blocking
-_summary_extract_text_blocking = _engagement_handlers._summary_extract_text_blocking
-_summary_text_hash = _engagement_handlers._summary_text_hash
-_summary_ollama_generate_blocking = _engagement_handlers._summary_ollama_generate_blocking
-_summary_prompt_for_mode = _engagement_handlers._summary_prompt_for_mode
-_summary_chunk_prompt = _engagement_handlers._summary_chunk_prompt
-_summary_cleanup_output = _engagement_handlers._summary_cleanup_output
-_summary_output_looks_invalid = _engagement_handlers._summary_output_looks_invalid
-_summary_summarize_text_blocking = _engagement_handlers._summary_summarize_text_blocking
-_summary_send_text = _engagement_handlers._summary_send_text
-_summary_edit_progress_message = _engagement_handlers._summary_edit_progress_message
-_summary_progress_loop = _engagement_handlers._summary_progress_loop
-_summary_prepare_text_for_book = _engagement_handlers._summary_prepare_text_for_book
-_run_book_summary_job = _engagement_handlers._run_book_summary_job
 handle_summary_placeholder_callback = _engagement_handlers.handle_summary_placeholder_callback
 handle_delete_book_callback = _engagement_handlers.handle_delete_book_callback
 
@@ -4944,6 +5975,20 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     try:
+        if update.effective_user:
+            await run_blocking(
+                db_record_inline_search_activity,
+                update.effective_user.id,
+                update.effective_user.username,
+                update.effective_user.first_name,
+                update.effective_user.last_name,
+                query,
+            )
+            _invalidate_audit_report_cache(context)
+    except Exception as e:
+        logger.warning("Failed to record inline search activity: %s", e, exc_info=True)
+
+    try:
         books = await run_blocking(_inline_search_books, query, 10)
 
         for book in books:
@@ -4999,6 +6044,26 @@ async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.inline_query.answer(results, cache_time=inline_cache_time, is_personal=True)
+
+
+async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chosen = getattr(update, "chosen_inline_result", None)
+    user = getattr(chosen, "from_user", None)
+    if not chosen or not user:
+        return
+    try:
+        await run_blocking(
+            db_record_inline_chosen_activity,
+            user.id,
+            user.username,
+            user.first_name,
+            user.last_name,
+            getattr(chosen, "query", None),
+            getattr(chosen, "result_id", None),
+        )
+        _invalidate_audit_report_cache(context)
+    except Exception as e:
+        logger.warning("Failed to record chosen inline result: %s", e, exc_info=True)
 
 
 
@@ -5496,6 +6561,8 @@ admin_panel_command = _admin_runtime.admin_panel_command
 handle_admin_panel_callback = _admin_runtime.handle_admin_panel_callback
 smoke_check_command = _admin_runtime.smoke_check_command
 cancel_task_command = _admin_runtime.cancel_task_command
+worker_status_command = _admin_runtime.worker_status_command
+live_activity_command = _admin_runtime.live_activity_command
 handle_background_task_callback = _admin_runtime.handle_background_task_callback
 _ensure_dupes_pdf_font = _admin_runtime._ensure_dupes_pdf_font
 _build_dupes_preview_pdf = _admin_runtime._build_dupes_preview_pdf
@@ -5646,6 +6713,17 @@ async def _process_background_jobs(app: Application, worker_index: int = 1) -> N
                     int(job.get("attempts", 0) or 0),
                     int(job.get("max_attempts", 0) or 0),
                 )
+                _set_background_job_activity(
+                    app,
+                    worker_id,
+                    worker="background_job",
+                    worker_index=worker_index,
+                    job_id=job_id,
+                    job_type=job_type,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    stage="processing payload",
+                )
                 _job_workspace_dir(job_id)
                 await run_blocking(db_update_background_job_progress, job_id, 5, {"stage": "started"})
 
@@ -5659,6 +6737,17 @@ async def _process_background_jobs(app: Application, worker_index: int = 1) -> N
 
                     if result_data:
                         success = True
+                        _set_background_job_activity(
+                            app,
+                            worker_id,
+                            worker="background_job",
+                            worker_index=worker_index,
+                            job_id=job_id,
+                            job_type=job_type,
+                            user_id=user_id,
+                            chat_id=chat_id,
+                            stage="sending result",
+                        )
                         await run_blocking(db_update_background_job_progress, job_id, 90, {"stage": "sending_result"})
                         await _send_job_result(app, job, data, job_type, result_data)
                     else:
@@ -5677,6 +6766,17 @@ async def _process_background_jobs(app: Application, worker_index: int = 1) -> N
                     )
 
                 if success:
+                    _set_background_job_activity(
+                        app,
+                        worker_id,
+                        worker="background_job",
+                        worker_index=worker_index,
+                        job_id=job_id,
+                        job_type=job_type,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        stage="completed",
+                    )
                     await run_blocking(db_complete_background_job, job_id, result_data if isinstance(result_data, dict) else None)
                     released = True
                     _clear_job_failed_workspace(job_id)
@@ -5736,6 +6836,7 @@ async def _process_background_jobs(app: Application, worker_index: int = 1) -> N
                 if job_type:
                     await _finish_background_job_for_worker(app, job_type)
     finally:
+        _clear_background_job_activity(app, worker_id)
         current_task = _safe_asyncio_current_task()
         workers = app.bot_data.get(_BACKGROUND_JOB_WORKERS_KEY)
         if current_task is not None and isinstance(workers, list):
@@ -5747,76 +6848,11 @@ async def _process_background_jobs(app: Application, worker_index: int = 1) -> N
 
 
 async def _process_book_summary_job(data: dict, app: Application) -> dict | None:
-    """Process book summary job."""
-    book_id = data.get("book_id")
-    lang = data.get("lang", "en")
-    mode = data.get("mode")
-    chat_id = data.get("chat_id")
-    reply_to_message_id = data.get("reply_to_message_id")
-
-    if not book_id or not mode or not chat_id:
-        return None
-
-    from engagement_handlers import (
-        _run_book_summary_job, MESSAGES, _summary_send_text, _summary_progress_set, _summary_prepare_text_for_book,
-        _summary_summarize_text_blocking, get_result_title, _summary_mode_label, db_get_book_by_id, db_get_book_summary, db_upsert_book_summary
+    logger.info(
+        "Ignoring legacy disabled background job: book_summary payload_keys=%s",
+        sorted((data or {}).keys()),
     )
-    m = MESSAGES.get(lang, MESSAGES["en"])
-
-    try:
-        # Check cache first
-        cached = await run_blocking(db_get_book_summary, book_id, lang, mode)
-        if cached and cached.get("summary_text"):
-            book = await run_blocking(db_get_book_by_id, book_id)
-            if book:
-                title = get_result_title(book)
-                mode_label = _summary_mode_label(lang, mode)
-                header = m["summary_ready_title"].format(mode=mode_label)
-                body = f"{header}\n📘 {title}\n{m['summary_cached_note']}\n\n{cached['summary_text']}"
-                return {"text": body, "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
-
-        # Prepare text
-        book = await run_blocking(db_get_book_by_id, book_id)
-        if not book:
-            return {"text": m["summary_book_missing"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
-
-        extracted_text, source_hash = await _summary_prepare_text_for_book(None, book, lang, None)
-        if not extracted_text or len(extracted_text.strip()) < 80:
-            return {"text": m["summary_empty_text"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
-
-        title = get_result_title(book)
-        summary_text, model_name = await run_blocking(
-            _summary_summarize_text_blocking,
-            extracted_text,
-            lang,
-            mode,
-            title,
-            None,
-        )
-
-        summary_text = summary_text.strip()
-        if not summary_text:
-            return {"text": m["summary_ai_unavailable"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
-
-        # Save to DB
-        await run_blocking(
-            db_upsert_book_summary,
-            book_id,
-            lang,
-            mode,
-            summary_text,
-            model_name,
-            source_hash,
-        )
-
-        mode_label = _summary_mode_label(lang, mode)
-        header = m["summary_ready_title"].format(mode=mode_label)
-        body = f"{header}\n📘 {title}\n\n{summary_text}"
-        return {"text": body, "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
-
-    except Exception as e:
-        logger.error(f"Book summary job failed: {e}", exc_info=True)
-        return {"text": m["summary_error"], "chat_id": chat_id, "reply_to_message_id": reply_to_message_id}
+    return {"suppress_send": True, "disabled": True}
 
 
 async def _process_search_index_book_job(data: dict) -> dict | None:
@@ -6040,6 +7076,22 @@ def main():
             return
         logger.debug("Runtime configuration validated")
 
+        bot_api_base_url = _normalize_bot_api_base_url(os.getenv("TELEGRAM_BOT_API_BASE_URL", ""))
+        bot_api_base_file_url = _normalize_bot_api_base_file_url(
+            os.getenv("TELEGRAM_BOT_API_BASE_FILE_URL", ""),
+            bot_api_base_url,
+        )
+        bot_api_local_mode = _env_bool("TELEGRAM_BOT_API_LOCAL_MODE", False)
+
+        wait_for_runtime_dependencies(
+            "Main bot",
+            require_db=True,
+            require_es=ENABLE_ELASTICSEARCH,
+            bot_api_base_url=bot_api_base_url,
+            require_bot_api=bool(bot_api_base_url or bot_api_local_mode),
+            bot_api_local_mode=bot_api_local_mode,
+        )
+
         # Initialize DB
         init_db()
         logger.debug("DB connected")
@@ -6067,12 +7119,6 @@ def main():
             ",".join(str(x) for x in audio_channels_for_log) or "none",
             str(book_storage_channel) if book_storage_channel else "none",
         )
-        logger.info(
-            "Ollama config: url=%s summary_model=%s",
-            os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/"),
-            os.getenv("PDF_MAKER_OLLAMA_MODEL", "qwen2.5:7b"),
-        )
-
         es_status = "down"
         es_health = "down"
         es_count = 0
@@ -6103,13 +7149,6 @@ def main():
             .concurrent_updates(BOT_CONCURRENT_UPDATES)
         )
 
-        bot_api_base_url = _normalize_bot_api_base_url(os.getenv("TELEGRAM_BOT_API_BASE_URL", ""))
-        bot_api_base_file_url = _normalize_bot_api_base_file_url(
-            os.getenv("TELEGRAM_BOT_API_BASE_FILE_URL", ""),
-            bot_api_base_url,
-        )
-        bot_api_local_mode = _env_bool("TELEGRAM_BOT_API_LOCAL_MODE", False)
-
         if bot_api_base_url:
             builder = builder.base_url(bot_api_base_url)
         if bot_api_base_file_url:
@@ -6138,8 +7177,11 @@ def main():
             asyncio.get_running_loop()
         except RuntimeError:
             asyncio.set_event_loop(asyncio.new_event_loop())
+        allowed_updates = list(Update.ALL_TYPES)
+        if "guest_message" not in allowed_updates:
+            allowed_updates.append("guest_message")
         app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
+            allowed_updates=allowed_updates,
             drop_pending_updates=drop_pending_updates,
             bootstrap_retries=bootstrap_retries,
         )

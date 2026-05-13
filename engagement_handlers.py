@@ -209,6 +209,12 @@ def _is_group_chat(update: Update) -> bool:
     return chat_type in {"group", "supergroup"}
 
 
+def _guest_more_books_url(context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    bot = getattr(context, "bot", None)
+    username = (getattr(bot, "username", None) or "pdf_audio_kitoblar_bot").strip("@") if bot else "pdf_audio_kitoblar_bot"
+    return f"https://t.me/{username}" if username else None
+
+
 def _invalidate_top_caches(context: ContextTypes.DEFAULT_TYPE) -> None:
     cache_delete_fn = globals().get("cache_delete")
     cache_clear_pattern_fn = globals().get("cache_clear_pattern")
@@ -659,6 +665,9 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
     _invalidate_top_caches(context)
 
     try:
+        inline_message_id = getattr(query, "inline_message_id", None)
+        guest_inline_delivery = bool(inline_message_id and not query.message)
+        more_books_url = _guest_more_books_url(context) if guest_inline_delivery else None
         if book and query.message:
             stats = await run_blocking(db_get_book_stats, book_id)
             downloads = stats.get("downloads", 0)
@@ -684,7 +693,7 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                 except Exception:
                     can_add_ab = False
             is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
-            show_listen_btn = has_ab if (is_group_chat or is_owner_user) else True
+            show_listen_btn = False if guest_inline_delivery else (has_ab if (is_group_chat or is_owner_user) else True)
             ab_request_count = 0
             if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
                 try:
@@ -708,6 +717,48 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     show_listen_button=show_listen_btn,
                     audiobook_request_count=ab_request_count,
                     show_personal_state=not is_group_chat,
+                    show_favorite_button=not is_group_chat,
+                    more_books_url=more_books_url,
+                ),
+            )
+        elif book and inline_message_id:
+            stats = await run_blocking(db_get_book_stats, book_id)
+            downloads = stats.get("downloads", 0)
+            fav_count = stats.get("fav_count", 0)
+            counts = {
+                "like": stats.get("like", 0),
+                "dislike": stats.get("dislike", 0),
+                "berry": stats.get("berry", 0),
+                "whale": stats.get("whale", 0),
+            }
+            user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
+            is_fav_now = await run_blocking(is_favorited, query.from_user.id, book_id)
+            can_delete = False
+            is_group_chat = True
+            allow_management_buttons = False
+            audio_book = await run_blocking(get_audio_book_for_book, book_id)
+            has_ab = bool(audio_book)
+            can_add_ab = False
+            is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
+            show_listen_btn = False
+            await context.bot.edit_message_caption(
+                inline_message_id=inline_message_id,
+                caption=build_book_caption(book, downloads, fav_count, counts),
+                reply_markup=build_book_keyboard(
+                    book_id,
+                    counts,
+                    is_fav_now,
+                    user_reaction,
+                    can_delete,
+                    False,
+                    lang,
+                    has_audiobook=has_ab,
+                    can_add_audiobook=False,
+                    show_listen_button=show_listen_btn,
+                    audiobook_request_count=0,
+                    show_personal_state=not is_group_chat,
+                    show_favorite_button=False,
+                    more_books_url=more_books_url,
                 ),
             )
     except Exception:
@@ -746,6 +797,7 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
     reaction_state_key, reaction_state_seq = _reserve_callback_reaction_seq(query, context)
 
     try:
+        guest_inline_delivery = bool(getattr(query, "inline_message_id", None) and not query.message)
         old_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
         if old_reaction == reaction:
             await _send_callback_reaction_with_fallbacks(
@@ -755,7 +807,10 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                 state_key=reaction_state_key,
                 state_seq=reaction_state_seq,
             )
-            await safe_answer(query)
+            if guest_inline_delivery:
+                await safe_answer(query, MESSAGES[lang].get("guest_reaction_saved", MESSAGES["en"].get("guest_reaction_saved", "Reaction saved")))
+            else:
+                await safe_answer(query)
             return
 
         await run_blocking(db_set_book_reaction, query.from_user.id, book_id, reaction)
@@ -779,6 +834,9 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
             "whale": stats.get("whale", 0),
         }
         book = await run_blocking(db_get_book_by_id, book_id)
+        inline_message_id = getattr(query, "inline_message_id", None)
+        guest_inline_delivery = bool(inline_message_id and not query.message)
+        more_books_url = _guest_more_books_url(context) if guest_inline_delivery else None
         if book and query.message:
             user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
             is_fav_now = await run_blocking(is_favorited, query.from_user.id, book_id)
@@ -795,7 +853,7 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                 except Exception:
                     can_add_ab = False
             is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
-            show_listen_btn = has_ab if (is_group_chat or is_owner_user) else True
+            show_listen_btn = False if guest_inline_delivery else (has_ab if (is_group_chat or is_owner_user) else True)
             ab_request_count = 0
             if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
                 try:
@@ -819,9 +877,45 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     show_listen_button=show_listen_btn,
                     audiobook_request_count=ab_request_count,
                     show_personal_state=not is_group_chat,
+                    show_favorite_button=not is_group_chat,
+                    more_books_url=more_books_url,
                 ),
             )
-        await safe_answer(query)
+        elif book and inline_message_id:
+            user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
+            is_fav_now = await run_blocking(is_favorited, query.from_user.id, book_id)
+            can_delete = False
+            is_group_chat = True
+            allow_management_buttons = False
+            audio_book = await run_blocking(get_audio_book_for_book, book_id)
+            has_ab = bool(audio_book)
+            can_add_ab = False
+            is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
+            show_listen_btn = False
+            await context.bot.edit_message_caption(
+                inline_message_id=inline_message_id,
+                caption=build_book_caption(book, downloads, fav_count, counts),
+                reply_markup=build_book_keyboard(
+                    book_id,
+                    counts,
+                    is_fav_now,
+                    user_reaction,
+                    can_delete,
+                    False,
+                    lang,
+                    has_audiobook=has_ab,
+                    can_add_audiobook=False,
+                    show_listen_button=show_listen_btn,
+                    audiobook_request_count=0,
+                    show_personal_state=not is_group_chat,
+                    show_favorite_button=False,
+                    more_books_url=more_books_url,
+                ),
+            )
+        if guest_inline_delivery:
+            await safe_answer(query, MESSAGES[lang].get("guest_reaction_saved", MESSAGES["en"].get("guest_reaction_saved", "Reaction saved")))
+        else:
+            await safe_answer(query)
     except Exception as e:
         logger.error(f"Reaction update failed: {e}", exc_info=True)
         await safe_answer(query, "Error", show_alert=True)
@@ -1500,88 +1594,10 @@ async def handle_summary_placeholder_callback(update: Update, context: ContextTy
         return
     await safe_answer(
         query,
-        MESSAGES[lang].get("summary_coming_soon", "🧠 AI book summarizer is coming soon."),
+        MESSAGES[lang].get("feature_temporarily_disabled", "⚠️ This feature is temporarily disabled."),
         show_alert=True,
     )
     return
-    data = query.data or ""
-    parts = data.split(":")
-    if len(parts) >= 2 and parts[1] == "cancel":
-        try:
-            if query.message:
-                await query.message.delete()
-        except Exception:
-            pass
-        await safe_answer(query)
-        return
-
-    if len(parts) == 2:
-        book_id = parts[1]
-        if not book_id:
-            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
-            return
-        if not await run_blocking(db_get_book_by_id, book_id):
-            await safe_answer(query, MESSAGES[lang]["summary_book_missing"], show_alert=True)
-            return
-        if query.message:
-            await _send_with_retry(
-                lambda: query.message.reply_text(
-                    MESSAGES[lang]["summary_choose_mode"],
-                    reply_markup=_summary_mode_keyboard(book_id, lang),
-                )
-            )
-        await safe_answer(query)
-        return
-
-    if len(parts) != 3:
-        await safe_answer(query)
-        return
-
-    _, book_id, mode = parts
-    mode = mode.strip().lower()
-    if mode not in SUMMARY_MODES:
-        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
-        return
-
-    user_id = query.from_user.id if query.from_user else None
-    chat_id = None
-    reply_to_message_id = None
-    if query.message:
-        chat_id = query.message.chat_id
-        reply_to_message_id = query.message.message_id
-    elif user_id:
-        chat_id = user_id
-    if not chat_id:
-        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
-        return
-
-    # Enqueue background job
-    job_data = {
-        "book_id": book_id,
-        "lang": lang,
-        "mode": mode,
-        "chat_id": chat_id,
-        "reply_to_message_id": reply_to_message_id,
-    }
-    job_meta = db_enqueue_background_job(
-        "book_summary",
-        user_id,
-        job_data,
-        chat_id=chat_id,
-        message_id=reply_to_message_id,
-        return_meta=True,
-    )
-    if not job_meta or not job_meta.get("ok"):
-        reason = str((job_meta or {}).get("reason") or "")
-        await safe_answer(
-            query,
-            MESSAGES[lang]["job_limit_wait"] if reason in {"pending_limit", "running_limit"} else MESSAGES[lang]["error"],
-            show_alert=True,
-        )
-        return
-    await safe_answer(query)
-    if query.message:
-        await _send_with_retry(lambda: query.message.reply_text(MESSAGES[lang]["summary_working"]))
 
 
 async def handle_delete_book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

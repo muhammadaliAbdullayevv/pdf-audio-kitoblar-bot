@@ -8,6 +8,12 @@ from jobs import prune_job_dirs
 
 
 async def main() -> None:
+    bot_runtime.wait_for_runtime_dependencies(
+        "Cleanup worker",
+        require_db=True,
+        require_es=False,
+        require_bot_api=False,
+    )
     bot_runtime.init_db()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

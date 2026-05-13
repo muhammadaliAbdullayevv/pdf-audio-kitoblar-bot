@@ -76,6 +76,8 @@ async def _send_main_menu(*args: Any, **kwargs: Any) -> None: raise RuntimeError
 async def pause_bot_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
 async def resume_bot_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
 async def audit_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def guest_audit_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
+async def inline_audit_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
 async def prune_command(*args: Any, **kwargs: Any) -> None: raise RuntimeError("admin_runtime not configured")
 def InlineKeyboardButton(*args: Any, **kwargs: Any): raise RuntimeError("admin_runtime not configured")
 canvas: Any = None
@@ -225,6 +227,40 @@ def _worker_queue_marker(live: int, target: int, pending: int) -> str:
     return "IDLE"
 
 
+def _format_live_activity_section(bot_data: dict[str, Any]) -> list[str]:
+    lines = ["──────────", "Live activity"]
+    groups = [
+        ("background_job_activity", "Generic jobs"),
+        ("upload_local_backup_activity", "Book local worker"),
+        ("audiobook_local_backup_activity", "Audiobook local worker"),
+    ]
+    now_ts = time.time()
+    found = False
+    for key, label in groups:
+        items = bot_data.get(key)
+        if not isinstance(items, dict) or not items:
+            continue
+        found = True
+        lines.append(f"{label}:")
+        for worker_id, payload in sorted(items.items()):
+            if not isinstance(payload, dict):
+                continue
+            stage = str(payload.get("stage") or "running").strip() or "running"
+            title = str(payload.get("title") or payload.get("job_type") or payload.get("book_id") or payload.get("part_id") or "").strip()
+            age_text = ""
+            try:
+                updated_at = float(payload.get("updated_at") or 0.0)
+                if updated_at > 0:
+                    age_text = f" | {max(0, int(now_ts - updated_at))}s ago"
+            except Exception:
+                age_text = ""
+            suffix = f" | {title}" if title else ""
+            lines.append(f"- {worker_id}: {stage}{suffix}{age_text}")
+    if not found:
+        lines.append("No live background activity right now.")
+    return lines
+
+
 async def _build_worker_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     app = context.application
     bot_data = getattr(app, "bot_data", {}) or {}
@@ -319,6 +355,7 @@ async def _build_worker_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- Books: {_worker_queue_marker(book_live, book_target, book_pending)} | workers={book_live}/{book_target or book_live or 1} queued={_safe_int(book_counts.get('queued'))} downloading={_safe_int(book_counts.get('downloading'))} failed={_safe_int(book_counts.get('failed'))}",
         f"- Audiobooks: {_worker_queue_marker(audio_live, audio_target, audio_pending)} | workers={audio_live}/{audio_target or audio_live or 1} queued={_safe_int(audio_counts.get('queued'))} downloading={_safe_int(audio_counts.get('downloading'))} failed={_safe_int(audio_counts.get('failed'))}",
     ]
+    lines.extend(_format_live_activity_section(bot_data))
     return "\n".join(lines)
 
 
@@ -355,6 +392,8 @@ def _admin_panel_keyboard(section: str = "main") -> InlineKeyboardMarkup:
             [InlineKeyboardButton("⏸ Pause bot", callback_data="adminp:act:pause"),
              InlineKeyboardButton("▶ Resume bot", callback_data="adminp:act:resume")],
             [InlineKeyboardButton("🧾 Audit report", callback_data="adminp:act:audit")],
+            [InlineKeyboardButton("👥 Guest audit", callback_data="adminp:act:guest_audit"),
+             InlineKeyboardButton("🔎 Inline audit", callback_data="adminp:act:inline_audit")],
             [InlineKeyboardButton("🔄 Refresh panel", callback_data="adminp:nav:main"),
              InlineKeyboardButton("⬅ Back", callback_data="adminp:nav:main")],
         ]
@@ -369,6 +408,7 @@ def _admin_panel_keyboard(section: str = "main") -> InlineKeyboardMarkup:
         rows = [
             [InlineKeyboardButton("🧵 Show tasks", callback_data="adminp:act:tasks_show")],
             [InlineKeyboardButton("📈 Worker status", callback_data="adminp:act:worker_status")],
+            [InlineKeyboardButton("📡 Live activity", callback_data="adminp:act:activity_status")],
             [InlineKeyboardButton("⬅ Back", callback_data="adminp:nav:main")],
         ]
     elif section == "maint":
@@ -464,7 +504,6 @@ async def smoke_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     es_ok = bool(es_available())
-    ollama_url = str(os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
 
     def mark(ok: bool) -> str:
         return "✅" if ok else "⚠️"
@@ -474,17 +513,16 @@ async def smoke_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "──────────",
         "Runtime snapshot",
         f"{mark(es_ok)} Elasticsearch: {'available' if es_ok else 'unavailable'}",
-        f"🤖 Ollama URL: {ollama_url}",
         "──────────",
         "Manual checks",
         "1. `/start` -> greeting + main menu shows once",
-        "2. `🔎 Search Books` -> search results + paging + book download",
-        "3. `🎙️ Text to Voice` -> wizard -> generate voice/audio",
-        "4. `📄 PDF Maker` -> name/style/paper/orientation -> PDF send",
-        "5. `🤖 AI Tools` -> AI Chat / Translator / Grammar / Email",
-        "6. `🛠️ Other Functions` -> Help / Top / Favorites / Profile",
-        "7. `🛠 Admin Control` -> User search / audit / admin actions",
-        "8. Favorite / reaction buttons update caption counts correctly",
+        "2. `🔎 Search Books` -> search results + paging + book delivery",
+        "3. Inline search -> result list -> send selected book",
+        "4. Audiobook -> parts list -> play single part / play all",
+        "5. `/upload` -> save to DB -> index -> storage refresh queue",
+        "6. `🛠 Admin Control` -> user search / audit / maintenance actions",
+        "7. Favorite / reaction buttons update caption counts correctly",
+        "8. `/help`, `/top_users`, `/contact_admin` commands respond correctly",
         "──────────",
         "Tip: test one feature per menu group after every refactor.",
     ])
@@ -538,6 +576,16 @@ async def handle_admin_panel_callback(update: Update, context: ContextTypes.DEFA
         await audit_command(update, context)
         await _admin_panel_send_or_edit(update, context, "system")
         return
+    if value == "guest_audit":
+        context.user_data["_skip_spam_check_once"] = True
+        await guest_audit_command(update, context)
+        await _admin_panel_send_or_edit(update, context, "system")
+        return
+    if value == "inline_audit":
+        context.user_data["_skip_spam_check_once"] = True
+        await inline_audit_command(update, context)
+        await _admin_panel_send_or_edit(update, context, "system")
+        return
     if value == "prune":
         await prune_command(update, context)
         await _admin_panel_send_or_edit(update, context, "maint")
@@ -554,6 +602,15 @@ async def handle_admin_panel_callback(update: Update, context: ContextTypes.DEFA
     if value == "worker_status":
         await safe_answer(query)
         text = await _build_worker_status_text(context)
+        try:
+            await query.message.reply_text(text)
+        except Exception:
+            pass
+        await _admin_panel_send_or_edit(update, context, "tasks")
+        return
+    if value == "activity_status":
+        await safe_answer(query)
+        text = "\n".join(_format_live_activity_section(getattr(context.application, "bot_data", {}) or {}))
         try:
             await query.message.reply_text(text)
         except Exception:
@@ -597,6 +654,37 @@ async def cancel_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = await _build_background_tasks_with_history_text(context, history_limit=6)
     reply_markup = _background_tasks_keyboard(items) if items else None
     await target_message.reply_text(text, reply_markup=reply_markup)
+
+
+async def worker_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await target_message.reply_text(MESSAGES[lang]["admin_only"])
+        return
+    limited, wait_s = spam_check_message(update, context)
+    if limited:
+        await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+        return
+    await target_message.reply_text(await _build_worker_status_text(context))
+
+
+async def live_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await target_message.reply_text(MESSAGES[lang]["admin_only"])
+        return
+    limited, wait_s = spam_check_message(update, context)
+    if limited:
+        await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+        return
+    text = "\n".join(_format_live_activity_section(getattr(context.application, "bot_data", {}) or {}))
+    await target_message.reply_text(text)
 
 
 async def handle_background_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

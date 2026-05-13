@@ -21,12 +21,16 @@ async def handle_admin_menu_action(
     pause_bot_command_fn,
     resume_bot_command_fn,
     audit_command_fn,
+    guest_audit_command_fn,
+    inline_audit_command_fn,
     prune_command_fn,
     missing_command_fn,
     db_dupes_command_fn,
     es_dupes_command_fn,
     dupes_status_command_fn,
     cancel_task_command_fn,
+    worker_status_command_fn,
+    live_activity_command_fn,
 ) -> bool:
     if not update.message:
         return False
@@ -82,13 +86,14 @@ async def handle_admin_menu_action(
         return True
 
     if action in {
-        "admin_pause", "admin_resume", "admin_audit", "admin_prune", "admin_missing", "admin_missing_confirm",
+        "admin_pause", "admin_resume", "admin_audit", "admin_guest_audit", "admin_inline_audit", "admin_prune", "admin_missing", "admin_missing_confirm",
         "admin_db_dupes", "admin_es_dupes", "admin_dupes_status", "admin_cancel_task",
+        "admin_worker_status", "admin_live_activity",
     }:
         if not admin_only():
             await update.message.reply_text(messages[lang]["admin_only"])
             return True
-        if action in {"admin_audit", "admin_db_dupes", "admin_es_dupes", "admin_dupes_status", "admin_cancel_task"}:
+        if action in {"admin_audit", "admin_guest_audit", "admin_inline_audit", "admin_db_dupes", "admin_es_dupes", "admin_dupes_status", "admin_cancel_task"}:
             context.user_data["_skip_spam_check_once"] = True
         if action == "admin_pause":
             await pause_bot_command_fn(update, context)
@@ -96,6 +101,10 @@ async def handle_admin_menu_action(
             await resume_bot_command_fn(update, context)
         elif action == "admin_audit":
             await audit_command_fn(update, context)
+        elif action == "admin_guest_audit":
+            await guest_audit_command_fn(update, context)
+        elif action == "admin_inline_audit":
+            await inline_audit_command_fn(update, context)
         elif action == "admin_prune":
             await prune_command_fn(update, context)
         elif action == "admin_missing":
@@ -120,6 +129,10 @@ async def handle_admin_menu_action(
             await dupes_status_command_fn(update, context)
         elif action == "admin_cancel_task":
             await cancel_task_command_fn(update, context)
+        elif action == "admin_worker_status":
+            await worker_status_command_fn(update, context)
+        elif action == "admin_live_activity":
+            await live_activity_command_fn(update, context)
         return True
 
     return False
