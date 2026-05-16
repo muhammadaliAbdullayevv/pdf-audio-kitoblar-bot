@@ -13,6 +13,7 @@ from telegram import (
     BotCommandScopeDefault,
 )
 from telegram.error import NetworkError, RetryAfter, TimedOut
+from config import ENABLE_WHITE_LABEL
 
 _PUBLIC_PREFERRED_ORDER = ("start", "help", "settings", "my_commands", "my_chats", "random", "request", "top_users", "contact_admin")
 _COMMAND_SYNC_BACKOFF_KEY = "command_sync_backoff_until"
@@ -166,7 +167,42 @@ def get_admin_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("contact_admin", "📞 Admin bilan aloqa"),
         ],
     }
-    return localized.get(lang, localized["en"])
+    commands = list(localized.get(lang, localized["en"]))
+    if ENABLE_WHITE_LABEL:
+        extra = {
+            "en": [
+                BotCommand("wl_add_bot", "🤖 Add a connected bot"),
+                BotCommand("wl_set_cache_channel", "📦 Set connected bot cache channel"),
+                BotCommand("wl_list_bots", "📋 List connected bots"),
+                BotCommand("wl_suspend_bot", "⏸ Suspend a connected bot"),
+                BotCommand("wl_activate_bot", "▶️ Activate a connected bot"),
+                BotCommand("wl_delete_bot", "🗑 Delete a connected bot"),
+                BotCommand("wl_test_bot", "🧪 Verify connected bot token"),
+                BotCommand("wl_test_cache", "🧪 Test connected bot cache seeding"),
+            ],
+            "ru": [
+                BotCommand("wl_add_bot", "🤖 Добавить подключённого бота"),
+                BotCommand("wl_set_cache_channel", "📦 Задать кеш-канал бота"),
+                BotCommand("wl_list_bots", "📋 Список подключённых ботов"),
+                BotCommand("wl_suspend_bot", "⏸ Приостановить бота"),
+                BotCommand("wl_activate_bot", "▶️ Активировать бота"),
+                BotCommand("wl_delete_bot", "🗑 Удалить подключённого бота"),
+                BotCommand("wl_test_bot", "🧪 Проверить токен бота"),
+                BotCommand("wl_test_cache", "🧪 Проверить кеширование файла"),
+            ],
+            "uz": [
+                BotCommand("wl_add_bot", "🤖 Ulangan bot qo‘shish"),
+                BotCommand("wl_set_cache_channel", "📦 Ulangan bot cache kanalini sozlash"),
+                BotCommand("wl_list_bots", "📋 Ulangan botlar ro‘yxati"),
+                BotCommand("wl_suspend_bot", "⏸ Ulangan botni to‘xtatish"),
+                BotCommand("wl_activate_bot", "▶️ Ulangan botni yoqish"),
+                BotCommand("wl_delete_bot", "🗑 Ulangan botni o‘chirish"),
+                BotCommand("wl_test_bot", "🧪 Ulangan bot tokenini tekshirish"),
+                BotCommand("wl_test_cache", "🧪 Cache to‘ldirishni tekshirish"),
+            ],
+        }
+        commands.extend(extra.get(lang, extra["en"]))
+    return commands
 
 
 async def set_bot_commands(

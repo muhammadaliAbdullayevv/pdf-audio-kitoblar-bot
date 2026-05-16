@@ -71,15 +71,19 @@ from config import (
     REQUEST_CHAT_ID,
     BOOK_NEGATIVE_ALERT_THRESHOLD,
     BOOK_STORAGE_CHANNEL_ID,
+    CONNECTED_BOT_TOKEN_ENCRYPTION_KEY,
     COIN_SEARCH,
     COIN_DOWNLOAD,
     COIN_REACTION,
     COIN_FAVORITE,
     COIN_REFERRAL,
+    ENABLE_WHITE_LABEL,
     TOP_USERS_LIMIT,
     AUDIO_UPLOAD_CHANNEL_IDS,
     AUDIO_UPLOAD_CHANNEL_ID,
     validate_runtime_config,
+    validate_white_label_config,
+    WHITE_LABEL_CACHE_WAIT_SECONDS,
 )
 
 
@@ -1316,6 +1320,35 @@ import user_interactions as _user_interactions
 import upload_flow as _upload_flow
 import command_sync as _command_sync
 import handler_registry as _handler_registry
+from white_label import WL_STATUS_ACTIVE, WL_STATUS_ERROR, WL_STATUS_SUSPENDED
+from white_label.cache_seeding import seed_connected_bot_cache
+from white_label.commands import (
+    build_connected_bot_list_text,
+    describe_token_for_owner,
+    format_connected_bot_reference,
+    normalize_connected_bot_identifier,
+)
+from white_label.crypto import (
+    decrypt_bot_token,
+    encrypt_bot_token,
+    fingerprint_bot_token,
+    is_crypto_available as wl_crypto_available,
+    redact_token_like_strings as wl_redact_token_like_strings,
+)
+from white_label.db_helpers import (
+    create_connected_bot_cache_seed_job as db_create_connected_bot_cache_seed_job,
+    delete_connected_bot as db_delete_connected_bot,
+    get_connected_bot_by_id as db_get_connected_bot_by_id,
+    get_connected_bot_by_identifier as db_get_connected_bot_by_identifier,
+    get_connected_bot_cache_seed_job_by_token as db_get_connected_bot_cache_seed_job_by_token,
+    get_connected_bot_file_cache as db_get_connected_bot_file_cache,
+    list_connected_bots as db_list_connected_bots,
+    record_connected_bot_verification as db_record_connected_bot_verification,
+    update_connected_bot_cache_channel as db_update_connected_bot_cache_channel,
+    update_connected_bot_status as db_update_connected_bot_status,
+    upsert_connected_bot as db_upsert_connected_bot,
+)
+from white_label.runtime_utils import build_bot_client as wl_build_bot_client
 
 
 async def run_blocking(func, *args, **kwargs):
@@ -4487,6 +4520,470 @@ async def seedbookstats_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+def _white_label_feature_error() -> str | None:
+    if not ENABLE_WHITE_LABEL:
+        return "⚠️ White-label connected bots are disabled. Set ENABLE_WHITE_LABEL=true first."
+    config_errors = validate_white_label_config()
+    if config_errors:
+        return f"⚠️ White-label config error: {config_errors[0]}"
+    if not wl_crypto_available():
+        return "⚠️ cryptography is not installed. Add the dependency before using white-label bot tokens."
+    return None
+
+
+async def _verify_white_label_bot_token(token: str) -> dict[str, Any]:
+    clean_token = str(token or "").strip()
+    if not clean_token or ":" not in clean_token:
+        raise ValueError("bot token looks invalid")
+    bot_client = wl_build_bot_client(clean_token)
+    try:
+        me = await bot_client.get_me()
+        return {
+            "bot_telegram_id": int(me.id or 0),
+            "bot_username": str(me.username or "").strip(),
+            "bot_first_name": str(me.first_name or "").strip(),
+        }
+    finally:
+        try:
+            await bot_client.shutdown()
+        except Exception:
+            pass
+
+
+async def _perform_white_label_add_bot(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    raw_token: str,
+    lang: str,
+) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    token = str(raw_token or "").strip()
+    if not token or ":" not in token:
+        await target_message.reply_text("⚠️ Send a valid Telegram bot token from BotFather.")
+        return
+    try:
+        verified = await _verify_white_label_bot_token(token)
+        if int(verified.get("bot_telegram_id") or 0) == int(getattr(context.bot, "id", 0) or 0):
+            await target_message.reply_text("⚠️ This token belongs to the main bot. Connect a different bot token.")
+            return
+        encrypted = encrypt_bot_token(token, CONNECTED_BOT_TOKEN_ENCRYPTION_KEY)
+        fingerprint = fingerprint_bot_token(token, CONNECTED_BOT_TOKEN_ENCRYPTION_KEY)
+        row = await run_blocking(
+            db_upsert_connected_bot,
+            owner_telegram_id=int(update.effective_user.id or 0),
+            bot_telegram_id=int(verified.get("bot_telegram_id") or 0),
+            bot_username=str(verified.get("bot_username") or "").strip(),
+            bot_first_name=str(verified.get("bot_first_name") or "").strip() or None,
+            bot_token_encrypted=encrypted,
+            bot_token_fingerprint=fingerprint,
+            status=WL_STATUS_SUSPENDED,
+            plan="MANUAL",
+        )
+        context.user_data.pop("pending_wl_add_bot", None)
+        await target_message.reply_text(
+            "\n".join(
+                [
+                    "✅ Connected bot saved.",
+                    f"Bot: {format_connected_bot_reference(row)}",
+                    f"ID: {row.get('id')}",
+                    f"Token: {describe_token_for_owner(token)}",
+                    f"Status: {row.get('status')}",
+                    "Next: set a private cache channel with /wl_set_cache_channel",
+                ]
+            )
+        )
+    except Exception as exc:
+        logger.error("White-label add bot failed: %s", wl_redact_token_like_strings(str(exc)), exc_info=True)
+        await target_message.reply_text(f"⚠️ Could not add connected bot.\n{wl_redact_token_like_strings(str(exc))}")
+
+
+async def _perform_white_label_set_cache_channel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    identifier: str,
+    channel_id_raw: str,
+    lang: str,
+) -> None:
+    del lang
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    row = await run_blocking(db_get_connected_bot_by_identifier, normalize_connected_bot_identifier(identifier))
+    if not row:
+        await target_message.reply_text("⚠️ Connected bot not found. Use /wl_list_bots first.")
+        return
+    try:
+        cache_channel_id = int(str(channel_id_raw or "").strip())
+    except Exception:
+        await target_message.reply_text("⚠️ Send a valid private cache channel ID, for example -1001234567890.")
+        return
+    try:
+        decrypted_token = decrypt_bot_token(str(row.get("bot_token_encrypted") or ""), CONNECTED_BOT_TOKEN_ENCRYPTION_KEY)
+        connected_bot_client = wl_build_bot_client(decrypted_token)
+        try:
+            main_member = await context.bot.get_chat_member(cache_channel_id, context.bot.id)
+            connected_member = await connected_bot_client.get_chat_member(cache_channel_id, int(row.get("bot_telegram_id") or 0))
+            chat_info = await context.bot.get_chat(cache_channel_id)
+            main_status = str(getattr(main_member, "status", "") or "").lower()
+            connected_status = str(getattr(connected_member, "status", "") or "").lower()
+            if main_status not in {"administrator", "creator"} or connected_status not in {"administrator", "creator"}:
+                await target_message.reply_text(
+                    "⚠️ Both the main bot and the connected bot must be admins in that private cache channel before saving it."
+                )
+                return
+            updated = await run_blocking(
+                db_update_connected_bot_cache_channel,
+                str(row.get("id") or ""),
+                int(cache_channel_id),
+                str(getattr(chat_info, "username", "") or "").strip() or None,
+            )
+            context.user_data.pop("pending_wl_set_cache_channel", None)
+            await target_message.reply_text(
+                "\n".join(
+                    [
+                        "✅ Cache channel saved.",
+                        f"Bot: {format_connected_bot_reference(updated or row)}",
+                        f"Cache channel: {cache_channel_id}",
+                        "Next: run /wl_activate_bot or /wl_test_cache",
+                    ]
+                )
+            )
+        finally:
+            try:
+                await connected_bot_client.shutdown()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.error("White-label cache channel setup failed: %s", wl_redact_token_like_strings(str(exc)), exc_info=True)
+        await target_message.reply_text(f"⚠️ Could not verify the cache channel.\n{wl_redact_token_like_strings(str(exc))}")
+
+
+async def _pick_white_label_test_book() -> dict[str, Any] | None:
+    candidates = await run_blocking(db_get_random_books, 10, True)
+    for book in list(candidates or []):
+        path = str((book or {}).get("path") or "").strip().lower()
+        file_id = str((book or {}).get("file_id") or "").strip()
+        if path and not path.endswith(".pdf"):
+            continue
+        if path or file_id:
+            return dict(book)
+    return None
+
+
+async def process_pending_white_label_owner_input(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> bool:
+    if not update.message or not update.effective_user or not _is_owner_user(update.effective_user.id):
+        return False
+    had_pending = bool(context.user_data.get("pending_wl_add_bot") or context.user_data.get("pending_wl_set_cache_channel"))
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        context.user_data.pop("pending_wl_add_bot", None)
+        context.user_data.pop("pending_wl_set_cache_channel", None)
+        if had_pending:
+            await update.message.reply_text(feature_error)
+            return True
+        return False
+
+    pending_add = context.user_data.get("pending_wl_add_bot")
+    if pending_add:
+        if time.time() > float((pending_add or {}).get("expires_at", 0) or 0):
+            context.user_data.pop("pending_wl_add_bot", None)
+            return False
+        token_text = str(update.message.text or "").strip()
+        if token_text.lower() in {"cancel", "stop", "/cancel"}:
+            context.user_data.pop("pending_wl_add_bot", None)
+            await update.message.reply_text("✖️ White-label bot token input cancelled.")
+            return True
+        await _perform_white_label_add_bot(update, context, raw_token=token_text, lang=lang)
+        return True
+
+    pending_cache = context.user_data.get("pending_wl_set_cache_channel")
+    if pending_cache:
+        if time.time() > float((pending_cache or {}).get("expires_at", 0) or 0):
+            context.user_data.pop("pending_wl_set_cache_channel", None)
+            return False
+        owner_text = str(update.message.text or "").strip()
+        if owner_text.lower() in {"cancel", "stop", "/cancel"}:
+            context.user_data.pop("pending_wl_set_cache_channel", None)
+            await update.message.reply_text("✖️ White-label cache channel input cancelled.")
+            return True
+        identifier = str((pending_cache or {}).get("identifier") or "").strip()
+        if not identifier:
+            parts = owner_text.split(None, 1)
+            if len(parts) < 2:
+                await update.message.reply_text("⚠️ Send: @botusername -1001234567890")
+                return True
+            identifier, channel_id_raw = parts[0], parts[1]
+        else:
+            channel_id_raw = owner_text
+        await _perform_white_label_set_cache_channel(
+            update,
+            context,
+            identifier=identifier,
+            channel_id_raw=channel_id_raw,
+            lang=lang,
+        )
+        return True
+
+    return False
+
+
+async def _white_label_list_bots_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    rows = await run_blocking(db_list_connected_bots)
+    await target_message.reply_text(build_connected_bot_list_text(rows))
+
+
+async def _white_label_add_bot_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    raw_args = " ".join(str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()).strip()
+    if raw_args:
+        await _perform_white_label_add_bot(update, context, raw_token=raw_args, lang=lang)
+        return
+    context.user_data["pending_wl_add_bot"] = {"expires_at": time.time() + 300}
+    await target_message.reply_text("🤖 Send the connected bot token now.\nCancel: /cancel")
+
+
+async def _white_label_set_cache_channel_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if len(args) >= 2:
+        await _perform_white_label_set_cache_channel(update, context, identifier=args[0], channel_id_raw=args[1], lang=lang)
+        return
+    context.user_data["pending_wl_set_cache_channel"] = {
+        "identifier": args[0] if args else "",
+        "expires_at": time.time() + 300,
+    }
+    await target_message.reply_text("📦 Send: @botusername -1001234567890\nBoth the main bot and the connected bot must already be admins there.")
+
+
+async def _white_label_test_bot_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if not args:
+        await target_message.reply_text("⚠️ Usage: /wl_test_bot @botusername")
+        return
+    row = await run_blocking(db_get_connected_bot_by_identifier, normalize_connected_bot_identifier(args[0]))
+    if not row:
+        await target_message.reply_text("⚠️ Connected bot not found.")
+        return
+    try:
+        decrypted_token = decrypt_bot_token(str(row.get("bot_token_encrypted") or ""), CONNECTED_BOT_TOKEN_ENCRYPTION_KEY)
+        verified = await _verify_white_label_bot_token(decrypted_token)
+        await run_blocking(db_record_connected_bot_verification, str(row.get("id") or ""), last_error=None)
+        await target_message.reply_text(
+            "\n".join(
+                [
+                    "✅ Connected bot token is valid.",
+                    f"Bot: @{str(verified.get('bot_username') or '').strip() or row.get('bot_username')}",
+                    f"Telegram ID: {verified.get('bot_telegram_id')}",
+                ]
+            )
+        )
+    except Exception as exc:
+        error_text = wl_redact_token_like_strings(str(exc))
+        await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ERROR, last_error=error_text)
+        await target_message.reply_text(f"⚠️ Token verification failed.\n{error_text}")
+
+
+async def _white_label_activate_bot_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if not args:
+        await target_message.reply_text("⚠️ Usage: /wl_activate_bot @botusername")
+        return
+    row = await run_blocking(db_get_connected_bot_by_identifier, normalize_connected_bot_identifier(args[0]))
+    if not row:
+        await target_message.reply_text("⚠️ Connected bot not found.")
+        return
+    if not int(row.get("cache_channel_id") or 0):
+        await target_message.reply_text("⚠️ Set the cache channel first with /wl_set_cache_channel.")
+        return
+    try:
+        decrypted_token = decrypt_bot_token(str(row.get("bot_token_encrypted") or ""), CONNECTED_BOT_TOKEN_ENCRYPTION_KEY)
+        await _verify_white_label_bot_token(decrypted_token)
+        updated = await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ACTIVE, clear_error=True)
+        await run_blocking(db_record_connected_bot_verification, str(row.get("id") or ""), last_error=None)
+        await target_message.reply_text(f"✅ Connected bot activated: {format_connected_bot_reference(updated or row)}")
+    except Exception as exc:
+        error_text = wl_redact_token_like_strings(str(exc))
+        await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ERROR, last_error=error_text)
+        await target_message.reply_text(f"⚠️ Could not activate the connected bot.\n{error_text}")
+
+
+async def _white_label_suspend_bot_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if not args:
+        await target_message.reply_text("⚠️ Usage: /wl_suspend_bot @botusername")
+        return
+    row = await run_blocking(db_get_connected_bot_by_identifier, normalize_connected_bot_identifier(args[0]))
+    if not row:
+        await target_message.reply_text("⚠️ Connected bot not found.")
+        return
+    updated = await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_SUSPENDED, clear_error=False)
+    await target_message.reply_text(f"⏸️ Connected bot suspended: {format_connected_bot_reference(updated or row)}")
+
+
+async def _white_label_delete_bot_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if not args:
+        await target_message.reply_text("⚠️ Usage: /wl_delete_bot @botusername")
+        return
+    row = await run_blocking(db_get_connected_bot_by_identifier, normalize_connected_bot_identifier(args[0]))
+    if not row:
+        await target_message.reply_text("⚠️ Connected bot not found.")
+        return
+    deleted = await run_blocking(db_delete_connected_bot, str(row.get("id") or ""))
+    if int(deleted or 0) <= 0:
+        await target_message.reply_text("⚠️ Connected bot could not be deleted.")
+        return
+    await target_message.reply_text(f"🗑️ Connected bot deleted: {format_connected_bot_reference(row)}")
+
+
+async def _white_label_test_cache_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message or not update.effective_user:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if not args:
+        await target_message.reply_text("⚠️ Usage: /wl_test_cache @botusername [book_id]")
+        return
+    row = await run_blocking(db_get_connected_bot_by_identifier, normalize_connected_bot_identifier(args[0]))
+    if not row:
+        await target_message.reply_text("⚠️ Connected bot not found.")
+        return
+    if not int(row.get("cache_channel_id") or 0):
+        await target_message.reply_text("⚠️ Cache channel is not configured for this connected bot.")
+        return
+    if len(args) > 1:
+        book = await run_blocking(db_get_book_by_id, str(args[1] or "").strip())
+    else:
+        book = await _pick_white_label_test_book()
+    if not book:
+        await target_message.reply_text("⚠️ No accessible PDF test book was found in the central catalog.")
+        return
+    seed_token = uuid.uuid4().hex
+    seed_job = await run_blocking(
+        db_create_connected_bot_cache_seed_job,
+        connected_bot_id=str(row.get("id") or ""),
+        book_id=str(book.get("id") or ""),
+        requesting_chat_id=int(target_message.chat_id),
+        requesting_user_id=int(update.effective_user.id),
+        requesting_message_id=int(target_message.message_id),
+        cache_channel_id=int(row.get("cache_channel_id") or 0),
+        seed_token=seed_token,
+    )
+    result = await seed_connected_bot_cache(row, dict(book), seed_job, main_bot=context.bot)
+    if not result.get("ok"):
+        await target_message.reply_text(f"⚠️ Cache seed send failed.\n{result.get('error') or 'unknown error'}")
+        return
+    deadline = time.monotonic() + max(5, int(WHITE_LABEL_CACHE_WAIT_SECONDS))
+    while time.monotonic() < deadline:
+        cache_row = await run_blocking(db_get_connected_bot_file_cache, str(row.get("id") or ""), str(book.get("id") or ""), True)
+        if cache_row and str(cache_row.get("telegram_file_id") or "").strip():
+            await target_message.reply_text(
+                "\n".join(
+                    [
+                        "✅ Cache test succeeded.",
+                        f"Bot: {format_connected_bot_reference(row)}",
+                        f"Book: {get_display_name(book)}",
+                        f"Cache message: {cache_row.get('cache_message_id') or '-'}",
+                    ]
+                )
+            )
+            return
+        await asyncio.sleep(1.0)
+    await target_message.reply_text(
+        "⚠️ Cache seed was sent, but the connected bot did not confirm the cached file within the wait window.\n"
+        "Make sure the connected bot runtime is running and both bots are admins in the cache channel."
+    )
+
+
+async def wl_add_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_add_bot_impl)
+
+
+async def wl_set_cache_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_set_cache_channel_impl)
+
+
+async def wl_list_bots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_list_bots_impl)
+
+
+async def wl_suspend_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_suspend_bot_impl)
+
+
+async def wl_activate_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_activate_bot_impl)
+
+
+async def wl_delete_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_delete_bot_impl)
+
+
+async def wl_test_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_test_bot_impl)
+
+
+async def wl_test_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_test_cache_impl)
+
+
 def get_public_commands(lang: str = "en"):
     return _command_sync.get_public_commands(lang)
 
@@ -6096,6 +6593,12 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
         cancelled = True
     if context.user_data.get("pending_seedbookstats"):
         context.user_data.pop("pending_seedbookstats", None)
+        cancelled = True
+    if context.user_data.get("pending_wl_add_bot"):
+        context.user_data.pop("pending_wl_add_bot", None)
+        cancelled = True
+    if context.user_data.get("pending_wl_set_cache_channel"):
+        context.user_data.pop("pending_wl_set_cache_channel", None)
         cancelled = True
     if context.user_data.get("admin_menu_prompt"):
         context.user_data.pop("admin_menu_prompt", None)

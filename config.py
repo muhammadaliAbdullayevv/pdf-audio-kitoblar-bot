@@ -87,6 +87,13 @@ COIN_FAVORITE = _env_int("COIN_FAVORITE", 1)
 COIN_REFERRAL = _env_int("COIN_REFERRAL", 15)
 TOP_USERS_LIMIT = _env_int("TOP_USERS_LIMIT", 10)
 BOOK_NEGATIVE_ALERT_THRESHOLD = max(2, _env_int("BOOK_NEGATIVE_ALERT_THRESHOLD", 2))
+ENABLE_WHITE_LABEL = _env_bool("ENABLE_WHITE_LABEL", False)
+CONNECTED_BOT_TOKEN_ENCRYPTION_KEY = _env_project_first("CONNECTED_BOT_TOKEN_ENCRYPTION_KEY", "")
+WHITE_LABEL_CACHE_WAIT_SECONDS = max(5, _env_int("WHITE_LABEL_CACHE_WAIT_SECONDS", 30))
+WHITE_LABEL_SEARCH_RESULTS_LIMIT = max(1, min(10, _env_int("WHITE_LABEL_SEARCH_RESULTS_LIMIT", 5)))
+WHITE_LABEL_DEFAULT_DAILY_SEARCH_LIMIT = max(1, _env_int("WHITE_LABEL_DEFAULT_DAILY_SEARCH_LIMIT", 1000))
+WHITE_LABEL_DEFAULT_DAILY_SEND_LIMIT = max(1, _env_int("WHITE_LABEL_DEFAULT_DAILY_SEND_LIMIT", 100))
+WHITE_LABEL_DEFAULT_PER_MINUTE_SEND_LIMIT = max(1, _env_int("WHITE_LABEL_DEFAULT_PER_MINUTE_SEND_LIMIT", 10))
 
 
 def validate_runtime_config() -> list[str]:
@@ -109,4 +116,11 @@ def validate_runtime_config() -> list[str]:
         except Exception:
             errors.append("DB_PORT must be a valid integer")
 
+    return errors
+
+
+def validate_white_label_config() -> list[str]:
+    errors: list[str] = []
+    if ENABLE_WHITE_LABEL and not CONNECTED_BOT_TOKEN_ENCRYPTION_KEY:
+        errors.append("CONNECTED_BOT_TOKEN_ENCRYPTION_KEY is required when ENABLE_WHITE_LABEL=true")
     return errors

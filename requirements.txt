@@ -12,3 +12,4 @@ pypdf>=4,<7
 Pillow>=10,<13
 alembic>=1.13,<2
 SQLAlchemy>=2.0,<3
+cryptography>=42,<46

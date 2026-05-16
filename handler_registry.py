@@ -85,6 +85,14 @@ REQUIRED_DEP_KEYS = (
     "negalert_command",
     "seedbookstats_command",
     "forbidden_books_command",
+    "wl_add_bot_command",
+    "wl_set_cache_channel_command",
+    "wl_list_bots_command",
+    "wl_suspend_bot_command",
+    "wl_activate_bot_command",
+    "wl_delete_bot_command",
+    "wl_test_bot_command",
+    "wl_test_cache_command",
     "handle_upload_help_callback",
     "handle_upload_request_status_callback",
     "handle_delete_book_callback",
@@ -198,6 +206,14 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CommandHandler("randbookstats", d["seedbookstats_command"]))
     app.add_handler(CommandHandler("forbidden_books", d["forbidden_books_command"]))
     app.add_handler(CommandHandler("forbiddenbooks", d["forbidden_books_command"]))
+    app.add_handler(CommandHandler("wl_add_bot", d["wl_add_bot_command"]))
+    app.add_handler(CommandHandler("wl_set_cache_channel", d["wl_set_cache_channel_command"]))
+    app.add_handler(CommandHandler("wl_list_bots", d["wl_list_bots_command"]))
+    app.add_handler(CommandHandler("wl_suspend_bot", d["wl_suspend_bot_command"]))
+    app.add_handler(CommandHandler("wl_activate_bot", d["wl_activate_bot_command"]))
+    app.add_handler(CommandHandler("wl_delete_bot", d["wl_delete_bot_command"]))
+    app.add_handler(CommandHandler("wl_test_bot", d["wl_test_bot_command"]))
+    app.add_handler(CommandHandler("wl_test_cache", d["wl_test_cache_command"]))
     app.add_handler(CommandHandler("prune", d["prune_command"]))
     app.add_handler(CommandHandler("missing", d["missing_command"]))
     app.add_handler(CommandHandler("db_dupes", d["db_dupes_command"]))

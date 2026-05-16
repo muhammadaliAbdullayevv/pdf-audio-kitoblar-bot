@@ -4411,6 +4411,14 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
+        pending_white_label_fn = globals().get("process_pending_white_label_owner_input")
+        if callable(pending_white_label_fn):
+            try:
+                if await pending_white_label_fn(update, context, lang):
+                    return
+            except Exception:
+                pass
+
         if await _reply_private_language_picker_again(update, context):
             return
 

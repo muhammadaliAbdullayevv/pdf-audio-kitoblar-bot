@@ -1,0 +1,22 @@
+[Unit]
+Description=pdf_audio_kitoblar_bot - White-label connected bot runtime (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Template unit for public repo use.
+# Replace the generic user/group/path values to match your host before installing.
+User=pdfbot
+Group=pdfbot
+WorkingDirectory=/opt/pdf_audio_kitoblar_bot
+EnvironmentFile=/etc/pdf_audio_kitoblar_bot.env
+ExecStart=/usr/bin/python3 -m white_label.connected_bot_runtime --connected-bot-id %i
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
