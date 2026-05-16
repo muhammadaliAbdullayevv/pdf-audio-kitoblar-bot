@@ -4,6 +4,7 @@ import re
 import json
 import uuid
 import base64
+import random
 from contextlib import contextmanager
 from datetime import datetime, date
 from typing import Any, Iterable
@@ -592,6 +593,264 @@ def _apply_schema_migrations(cur) -> None:
                 "ALTER TABLE guest_groups ADD COLUMN IF NOT EXISTS guest_doc_last_success_at TIMESTAMP;",
             ],
         ),
+        (
+            32,
+            "books: persist forbidden/copyright-restricted titles",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS forbidden_books (
+                    normalized_title TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    created_by_user_id BIGINT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_forbidden_books_updated_at ON forbidden_books (updated_at DESC);",
+            ],
+        ),
+        (
+            33,
+            "books: persist owner reaction display adjustments",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_reaction_adjustments (
+                    book_id TEXT PRIMARY KEY,
+                    like_offset INTEGER NOT NULL DEFAULT 0,
+                    dislike_offset INTEGER NOT NULL DEFAULT 0,
+                    berry_offset INTEGER NOT NULL DEFAULT 0,
+                    whale_offset INTEGER NOT NULL DEFAULT 0,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+            ],
+        ),
+        (
+            34,
+            "books: persist negative reaction alert state",
+            [
+                "ALTER TABLE books ADD COLUMN IF NOT EXISTS negative_reaction_alert_active BOOLEAN NOT NULL DEFAULT FALSE;",
+                "ALTER TABLE books ADD COLUMN IF NOT EXISTS negative_reaction_alert_trigger_dislikes INTEGER;",
+                "ALTER TABLE books ADD COLUMN IF NOT EXISTS negative_reaction_alerted_at TIMESTAMP;",
+                "ALTER TABLE books ADD COLUMN IF NOT EXISTS negative_reaction_alert_chat_id BIGINT;",
+                "ALTER TABLE books ADD COLUMN IF NOT EXISTS negative_reaction_alert_message_id BIGINT;",
+            ],
+        ),
+        (
+            35,
+            "books: persist display adjustments for downloads and favorites",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_counter_adjustments (
+                    book_id TEXT PRIMARY KEY,
+                    downloads_offset INTEGER NOT NULL DEFAULT 0,
+                    favorite_offset INTEGER NOT NULL DEFAULT 0,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+            ],
+        ),
+        (
+            36,
+            "books: persist per-book reaction moderation policy",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_reaction_policies (
+                    book_id TEXT PRIMARY KEY,
+                    reactions_locked BOOLEAN NOT NULL DEFAULT FALSE,
+                    dislikes_disabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+            ],
+        ),
+        (
+            37,
+            "books: store threaded comments",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_comments (
+                    id TEXT PRIMARY KEY,
+                    book_id TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    parent_comment_id TEXT,
+                    root_comment_id TEXT,
+                    text TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    moderated_by_user_id BIGINT,
+                    moderated_at TIMESTAMP,
+                    deleted_reason TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_book_comments_book_status_created ON book_comments (book_id, status, created_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_book_comments_parent_created ON book_comments (parent_comment_id, created_at ASC);",
+                "CREATE INDEX IF NOT EXISTS idx_book_comments_root_created ON book_comments (root_comment_id, created_at ASC);",
+                "CREATE INDEX IF NOT EXISTS idx_book_comments_user_created ON book_comments (user_id, created_at DESC);",
+            ],
+        ),
+        (
+            38,
+            "books: store stable anonymous aliases for commenters per book",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_comment_aliases (
+                    book_id TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    alias_number INTEGER NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (book_id, user_id)
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_aliases_book_alias ON book_comment_aliases (book_id, alias_number ASC);",
+            ],
+        ),
+        (
+            39,
+            "books: store identity reveal requests for comments",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_comment_identity_requests (
+                    id TEXT PRIMARY KEY,
+                    comment_id TEXT NOT NULL,
+                    requester_user_id BIGINT NOT NULL,
+                    commenter_user_id BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    resolved_at TIMESTAMP
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_identity_requests_comment_requester ON book_comment_identity_requests (comment_id, requester_user_id, created_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_identity_requests_commenter_status ON book_comment_identity_requests (commenter_user_id, status, created_at DESC);",
+            ],
+        ),
+        (
+            40,
+            "books: store comment reports",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_comment_reports (
+                    id TEXT PRIMARY KEY,
+                    comment_id TEXT NOT NULL,
+                    reporter_user_id BIGINT NOT NULL,
+                    reason TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE UNIQUE INDEX IF NOT EXISTS uniq_book_comment_reports_comment_reporter ON book_comment_reports (comment_id, reporter_user_id);",
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_reports_status_created ON book_comment_reports (status, created_at DESC);",
+            ],
+        ),
+        (
+            41,
+            "books: store comment bans",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_comment_bans (
+                    user_id BIGINT PRIMARY KEY,
+                    banned_by_user_id BIGINT,
+                    reason TEXT,
+                    until_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+            ],
+        ),
+        (
+            42,
+            "books: store anonymous relay conversations for comment replies",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_comment_relay_conversations (
+                    id TEXT PRIMARY KEY,
+                    book_id TEXT NOT NULL,
+                    comment_id TEXT NOT NULL,
+                    comment_owner_user_id BIGINT NOT NULL,
+                    peer_user_id BIGINT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    UNIQUE (comment_id, peer_user_id)
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_relay_conversations_owner_updated ON book_comment_relay_conversations (comment_owner_user_id, updated_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_relay_conversations_peer_updated ON book_comment_relay_conversations (peer_user_id, updated_at DESC);",
+            ],
+        ),
+        (
+            43,
+            "books: store anonymous relay messages for comment replies",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_comment_relay_messages (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    book_id TEXT NOT NULL,
+                    comment_id TEXT NOT NULL,
+                    sender_user_id BIGINT NOT NULL,
+                    recipient_user_id BIGINT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    text TEXT,
+                    caption TEXT,
+                    media_file_id TEXT,
+                    media_file_unique_id TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_relay_messages_conversation_created ON book_comment_relay_messages (conversation_id, created_at ASC);",
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_relay_messages_recipient_created ON book_comment_relay_messages (recipient_user_id, created_at DESC);",
+            ],
+        ),
+        (
+            44,
+            "books: store recipient-specific blocks for anonymous relay replies",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_comment_peer_blocks (
+                    blocker_user_id BIGINT NOT NULL,
+                    blocked_user_id BIGINT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (blocker_user_id, blocked_user_id)
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_peer_blocks_blocker_updated ON book_comment_peer_blocks (blocker_user_id, updated_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_peer_blocks_blocked_updated ON book_comment_peer_blocks (blocked_user_id, updated_at DESC);",
+            ],
+        ),
+        (
+            45,
+            "books: store participant state for anonymous relay conversations",
+            [
+                """
+                CREATE TABLE IF NOT EXISTS book_comment_relay_participants (
+                    conversation_id TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    muted BOOLEAN NOT NULL DEFAULT FALSE,
+                    last_seen_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (conversation_id, user_id)
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_relay_participants_user_updated ON book_comment_relay_participants (user_id, updated_at DESC);",
+            ],
+        ),
+        (
+            46,
+            "books: support one-sided closure for comment relay conversations",
+            [
+                "ALTER TABLE book_comment_relay_conversations ADD COLUMN IF NOT EXISTS closed_by_user_id BIGINT;",
+                "ALTER TABLE book_comment_relay_conversations ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP;",
+                "ALTER TABLE book_comment_relay_conversations ADD COLUMN IF NOT EXISTS closed_notified_at TIMESTAMP;",
+                "CREATE INDEX IF NOT EXISTS idx_book_comment_relay_conversations_closed_by ON book_comment_relay_conversations (closed_by_user_id, updated_at DESC);",
+            ],
+        ),
     ]
     for version, note, stmts in migrations:
         if version in applied:
@@ -844,6 +1103,18 @@ def init_db():
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_settings_updated_at ON bot_settings (updated_at DESC);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS forbidden_books (
+                    normalized_title TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    created_by_user_id BIGINT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_forbidden_books_updated_at ON forbidden_books (updated_at DESC);")
             cur.execute("DROP TABLE IF EXISTS movie_reactions;")
             cur.execute("DROP TABLE IF EXISTS movies;")
             cur.execute("DROP TABLE IF EXISTS name_meanings;")
@@ -897,6 +1168,19 @@ def init_db():
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_book_reactions_book ON book_reactions (book_id);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS book_reaction_adjustments (
+                    book_id TEXT PRIMARY KEY,
+                    like_offset INTEGER NOT NULL DEFAULT 0,
+                    dislike_offset INTEGER NOT NULL DEFAULT 0,
+                    berry_offset INTEGER NOT NULL DEFAULT 0,
+                    whale_offset INTEGER NOT NULL DEFAULT 0,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_favorites (
@@ -3268,7 +3552,28 @@ def get_book_delivery_snapshot(book_id: str, user_id: int | None = None):
                 """,
                 (user_id, user_id, book_id),
             )
-            return cur.fetchone()
+            row = cur.fetchone()
+            if not row:
+                return None
+            adjusted_downloads, adjusted_favorites = _apply_book_counter_adjustments(
+                int(row.get("downloads") or 0),
+                int(row.get("fav_count") or 0),
+                get_book_counter_adjustments(book_id),
+            )
+            row["downloads"] = adjusted_downloads
+            row["fav_count"] = adjusted_favorites
+            base_counts = {
+                "like": int(row.get("like_count") or 0),
+                "dislike": int(row.get("dislike_count") or 0),
+                "berry": int(row.get("berry_count") or 0),
+                "whale": int(row.get("whale_count") or 0),
+            }
+            adjusted_counts = _apply_book_reaction_adjustments(base_counts, get_book_reaction_adjustments(book_id))
+            row["like_count"] = adjusted_counts["like"]
+            row["dislike_count"] = adjusted_counts["dislike"]
+            row["berry_count"] = adjusted_counts["berry"]
+            row["whale_count"] = adjusted_counts["whale"]
+            return row
 
 
 def get_book_summary(book_id: str, lang: str, mode: str):
@@ -3532,7 +3837,1920 @@ def set_book_reaction(user_id: int, book_id: str, reaction: str):
             )
 
 
-def get_book_reaction_counts(book_id: str) -> dict[str, int]:
+def get_book_negative_reaction_alert_state(book_id: str) -> dict[str, Any] | None:
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    negative_reaction_alert_active,
+                    negative_reaction_alert_trigger_dislikes,
+                    negative_reaction_alerted_at,
+                    negative_reaction_alert_chat_id,
+                    negative_reaction_alert_message_id
+                FROM books
+                WHERE id=%s
+                LIMIT 1
+                """,
+                (book_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def mark_book_negative_reaction_alert_sent(
+    book_id: str,
+    dislike_count: int,
+    chat_id: int | None = None,
+    message_id: int | None = None,
+) -> int:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE books
+                SET
+                    negative_reaction_alert_active = TRUE,
+                    negative_reaction_alert_trigger_dislikes = %s,
+                    negative_reaction_alerted_at = NOW(),
+                    negative_reaction_alert_chat_id = %s,
+                    negative_reaction_alert_message_id = %s
+                WHERE id=%s
+                """,
+                (
+                    int(dislike_count or 0),
+                    int(chat_id) if chat_id else None,
+                    int(message_id) if message_id else None,
+                    book_id,
+                ),
+            )
+            return int(cur.rowcount or 0)
+
+
+def clear_book_negative_reaction_alert(book_id: str) -> int:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE books
+                SET
+                    negative_reaction_alert_active = FALSE,
+                    negative_reaction_alert_trigger_dislikes = NULL,
+                    negative_reaction_alerted_at = NULL,
+                    negative_reaction_alert_chat_id = NULL,
+                    negative_reaction_alert_message_id = NULL
+                WHERE id=%s
+                """,
+                (book_id,),
+            )
+            return int(cur.rowcount or 0)
+
+
+def get_book_counter_adjustments(book_id: str) -> dict[str, int]:
+    adjustments = {"downloads": 0, "favorite": 0}
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT downloads_offset, favorite_offset
+                    FROM book_counter_adjustments
+                    WHERE book_id=%s
+                    """,
+                    (book_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return adjustments
+                adjustments["downloads"] = int(row.get("downloads_offset") or 0)
+                adjustments["favorite"] = int(row.get("favorite_offset") or 0)
+            except Exception as e:
+                if "book_counter_adjustments" in str(e):
+                    return adjustments
+                raise
+    return adjustments
+
+
+def _apply_book_counter_adjustments(
+    downloads: int,
+    favorite_count: int,
+    adjustments: dict[str, int] | None,
+) -> tuple[int, int]:
+    if not adjustments:
+        return max(0, int(downloads or 0)), max(0, int(favorite_count or 0))
+    adj_downloads = max(0, int(downloads or 0) + int(adjustments.get("downloads", 0) or 0))
+    adj_favorites = max(0, int(favorite_count or 0) + int(adjustments.get("favorite", 0) or 0))
+    return adj_downloads, adj_favorites
+
+
+def set_book_counter_display_counts(
+    book_id: str,
+    target_downloads: int,
+    target_favorites: int,
+    editor_user_id: int | None = None,
+) -> dict[str, int]:
+    raw_downloads = get_book_downloads(book_id)
+    raw_favorites = get_book_favorite_count(book_id)
+    download_offset = max(0, int(target_downloads or 0)) - int(raw_downloads or 0)
+    favorite_offset = max(0, int(target_favorites or 0)) - int(raw_favorites or 0)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS book_counter_adjustments (
+                    book_id TEXT PRIMARY KEY,
+                    downloads_offset INTEGER NOT NULL DEFAULT 0,
+                    favorite_offset INTEGER NOT NULL DEFAULT 0,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            if int(download_offset or 0) == 0 and int(favorite_offset or 0) == 0:
+                cur.execute("DELETE FROM book_counter_adjustments WHERE book_id=%s", (book_id,))
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO book_counter_adjustments (
+                        book_id, downloads_offset, favorite_offset, updated_by, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (book_id) DO UPDATE SET
+                        downloads_offset = EXCLUDED.downloads_offset,
+                        favorite_offset = EXCLUDED.favorite_offset,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    """,
+                    (
+                        book_id,
+                        int(download_offset),
+                        int(favorite_offset),
+                        int(editor_user_id) if editor_user_id else None,
+                    ),
+                )
+    adj_downloads, adj_favorites = _apply_book_counter_adjustments(
+        raw_downloads,
+        raw_favorites,
+        {"downloads": download_offset, "favorite": favorite_offset},
+    )
+    return {"downloads": adj_downloads, "favorite": adj_favorites}
+
+
+def get_book_reaction_adjustments(book_id: str) -> dict[str, int]:
+    adjustments = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT like_offset, dislike_offset, berry_offset, whale_offset
+                    FROM book_reaction_adjustments
+                    WHERE book_id=%s
+                    """,
+                    (book_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return adjustments
+                adjustments["like"] = int(row.get("like_offset") or 0)
+                adjustments["dislike"] = int(row.get("dislike_offset") or 0)
+                adjustments["berry"] = int(row.get("berry_offset") or 0)
+                adjustments["whale"] = int(row.get("whale_offset") or 0)
+            except Exception as e:
+                if "book_reaction_adjustments" in str(e):
+                    return adjustments
+                raise
+    return adjustments
+
+
+def get_book_reaction_policy(book_id: str) -> dict[str, bool | int | None]:
+    policy: dict[str, bool | int | None] = {
+        "reactions_locked": False,
+        "dislikes_disabled": False,
+        "updated_by": None,
+        "updated_at": None,
+    }
+    book_key = str(book_id or "").strip()
+    if not book_key:
+        return policy
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT reactions_locked, dislikes_disabled, updated_by, updated_at
+                    FROM book_reaction_policies
+                    WHERE book_id=%s
+                    """,
+                    (book_key,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return policy
+                policy["reactions_locked"] = bool(row.get("reactions_locked"))
+                policy["dislikes_disabled"] = bool(row.get("dislikes_disabled"))
+                policy["updated_by"] = row.get("updated_by")
+                policy["updated_at"] = row.get("updated_at")
+            except Exception as e:
+                if "book_reaction_policies" in str(e):
+                    return policy
+                raise
+    return policy
+
+
+def set_book_reaction_policy(
+    book_id: str,
+    *,
+    reactions_locked: bool | None = None,
+    dislikes_disabled: bool | None = None,
+    updated_by: int | None = None,
+) -> dict[str, bool | int | None]:
+    book_key = str(book_id or "").strip()
+    if not book_key:
+        return {
+            "reactions_locked": False,
+            "dislikes_disabled": False,
+            "updated_by": None,
+            "updated_at": None,
+        }
+    current = get_book_reaction_policy(book_key)
+    next_locked = bool(current.get("reactions_locked")) if reactions_locked is None else bool(reactions_locked)
+    next_dislikes_disabled = bool(current.get("dislikes_disabled")) if dislikes_disabled is None else bool(dislikes_disabled)
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS book_reaction_policies (
+                    book_id TEXT PRIMARY KEY,
+                    reactions_locked BOOLEAN NOT NULL DEFAULT FALSE,
+                    dislikes_disabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            if not next_locked and not next_dislikes_disabled:
+                cur.execute("DELETE FROM book_reaction_policies WHERE book_id=%s", (book_key,))
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO book_reaction_policies (
+                        book_id, reactions_locked, dislikes_disabled, updated_by, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (book_id) DO UPDATE SET
+                        reactions_locked = EXCLUDED.reactions_locked,
+                        dislikes_disabled = EXCLUDED.dislikes_disabled,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    """,
+                    (
+                        book_key,
+                        next_locked,
+                        next_dislikes_disabled,
+                        int(updated_by) if updated_by is not None else None,
+                    ),
+                )
+    updated = get_book_reaction_policy(book_key)
+    updated["reactions_locked"] = bool(updated.get("reactions_locked"))
+    updated["dislikes_disabled"] = bool(updated.get("dislikes_disabled"))
+    return updated
+
+
+def _book_comment_alias_number(cur, book_id: str, user_id: int) -> int:
+    cur.execute(
+        """
+        SELECT alias_number
+        FROM book_comment_aliases
+        WHERE book_id=%s AND user_id=%s
+        LIMIT 1
+        """,
+        (book_id, int(user_id)),
+    )
+    row = cur.fetchone()
+    if row:
+        try:
+            if isinstance(row, dict):
+                return int(row.get("alias_number") or 0) or 1
+            return int(row[0] or 0) or 1
+        except Exception:
+            return 1
+    cur.execute(
+        """
+        SELECT COALESCE(MAX(alias_number), 0) + 1
+        FROM book_comment_aliases
+        WHERE book_id=%s
+        """,
+        (book_id,),
+    )
+    row = cur.fetchone()
+    try:
+        if isinstance(row, dict):
+            alias_number = int(next(iter(row.values())) or 0)
+        else:
+            alias_number = int(row[0] or 0)
+    except Exception:
+        alias_number = 0
+    alias_number = max(1, alias_number)
+    cur.execute(
+        """
+        INSERT INTO book_comment_aliases (book_id, user_id, alias_number, created_at)
+        VALUES (%s, %s, %s, NOW())
+        ON CONFLICT (book_id, user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+        RETURNING alias_number
+        """,
+        (book_id, int(user_id), alias_number),
+    )
+    row = cur.fetchone()
+    try:
+        if isinstance(row, dict):
+            return int(row.get("alias_number") or alias_number)
+        return int(row[0] or alias_number)
+    except Exception:
+        return alias_number
+
+
+def is_book_comment_banned(user_id: int) -> bool:
+    if not user_id:
+        return False
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM book_comment_bans
+                    WHERE user_id=%s
+                      AND (until_at IS NULL OR until_at > NOW())
+                    LIMIT 1
+                    """,
+                    (int(user_id),),
+                )
+                return bool(cur.fetchone())
+            except Exception as e:
+                if "book_comment_bans" in str(e):
+                    return False
+                raise
+
+
+def set_book_comment_ban(user_id: int, banned_by_user_id: int | None = None, reason: str | None = None) -> dict[str, Any]:
+    safe_user_id = int(user_id or 0)
+    if not safe_user_id:
+        return {}
+    safe_banned_by = int(banned_by_user_id or 0) or None
+    safe_reason = str(reason or "").strip() or None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO book_comment_bans (
+                    user_id,
+                    banned_by_user_id,
+                    reason,
+                    until_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, NULL, NOW(), NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    banned_by_user_id = EXCLUDED.banned_by_user_id,
+                    reason = EXCLUDED.reason,
+                    until_at = NULL,
+                    updated_at = NOW()
+                RETURNING
+                    user_id,
+                    banned_by_user_id,
+                    reason,
+                    until_at,
+                    created_at,
+                    updated_at
+                """,
+                (safe_user_id, safe_banned_by, safe_reason),
+            )
+            row = cur.fetchone()
+            return dict(row or {})
+
+
+def clear_book_comment_ban(user_id: int) -> bool:
+    safe_user_id = int(user_id or 0)
+    if not safe_user_id:
+        return False
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    DELETE FROM book_comment_bans
+                    WHERE user_id=%s
+                    """,
+                    (safe_user_id,),
+                )
+                return cur.rowcount > 0
+            except Exception as e:
+                if "book_comment_bans" in str(e):
+                    return False
+                raise
+
+
+def is_book_comment_peer_blocked(blocker_user_id: int, blocked_user_id: int) -> bool:
+    safe_blocker = int(blocker_user_id or 0)
+    safe_blocked = int(blocked_user_id or 0)
+    if not safe_blocker or not safe_blocked or safe_blocker == safe_blocked:
+        return False
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM book_comment_peer_blocks
+                    WHERE blocker_user_id=%s AND blocked_user_id=%s
+                    LIMIT 1
+                    """,
+                    (safe_blocker, safe_blocked),
+                )
+                return bool(cur.fetchone())
+            except Exception as e:
+                if "book_comment_peer_blocks" in str(e):
+                    return False
+                raise
+
+
+def set_book_comment_peer_block(blocker_user_id: int, blocked_user_id: int) -> dict[str, Any]:
+    safe_blocker = int(blocker_user_id or 0)
+    safe_blocked = int(blocked_user_id or 0)
+    if not safe_blocker or not safe_blocked or safe_blocker == safe_blocked:
+        return {}
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_peer_blocks (
+                        blocker_user_id,
+                        blocked_user_id,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, NOW(), NOW())
+                    ON CONFLICT (blocker_user_id, blocked_user_id) DO UPDATE
+                    SET updated_at = NOW()
+                    RETURNING blocker_user_id, blocked_user_id, created_at, updated_at
+                    """,
+                    (safe_blocker, safe_blocked),
+                )
+                row = cur.fetchone()
+                return dict(row or {})
+            except Exception as e:
+                if "book_comment_peer_blocks" in str(e):
+                    return {}
+                raise
+
+
+def clear_book_comment_peer_block(blocker_user_id: int, blocked_user_id: int) -> bool:
+    safe_blocker = int(blocker_user_id or 0)
+    safe_blocked = int(blocked_user_id or 0)
+    if not safe_blocker or not safe_blocked or safe_blocker == safe_blocked:
+        return False
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    DELETE FROM book_comment_peer_blocks
+                    WHERE blocker_user_id=%s AND blocked_user_id=%s
+                    """,
+                    (safe_blocker, safe_blocked),
+                )
+                return cur.rowcount > 0
+            except Exception as e:
+                if "book_comment_peer_blocks" in str(e):
+                    return False
+                raise
+
+
+def get_book_comment_count(book_id: str) -> int:
+    book_key = str(book_id or "").strip()
+    if not book_key:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM book_comments
+                    WHERE book_id=%s AND status='active'
+                    """,
+                    (book_key,),
+                )
+                row = cur.fetchone()
+                return int((row[0] if row else 0) or 0)
+            except Exception as e:
+                if "book_comments" in str(e):
+                    return 0
+                raise
+
+
+def get_user_book_comment_summary(user_id: int) -> dict[str, int]:
+    safe_user_id = int(user_id or 0)
+    if not safe_user_id:
+        return {
+            "total_comments": 0,
+            "top_level_comments": 0,
+            "reply_comments": 0,
+            "distinct_books": 0,
+            "relay_people": 0,
+            "relay_conversations": 0,
+        }
+    default = {
+        "total_comments": 0,
+        "top_level_comments": 0,
+        "reply_comments": 0,
+        "distinct_books": 0,
+        "relay_people": 0,
+        "relay_conversations": 0,
+    }
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*)::INT AS total_comments,
+                        COUNT(*) FILTER (WHERE parent_comment_id IS NULL)::INT AS top_level_comments,
+                        COUNT(*) FILTER (WHERE parent_comment_id IS NOT NULL)::INT AS reply_comments,
+                        COUNT(DISTINCT book_id)::INT AS distinct_books
+                    FROM book_comments
+                    WHERE user_id=%s AND status='active'
+                    """,
+                    (safe_user_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    default["total_comments"] = int(row[0] or 0)
+                    default["top_level_comments"] = int(row[1] or 0)
+                    default["reply_comments"] = int(row[2] or 0)
+                    default["distinct_books"] = int(row[3] or 0)
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*)::INT AS relay_conversations,
+                        COUNT(DISTINCT counterpart_user_id)::INT AS relay_people
+                    FROM (
+                        SELECT
+                            id,
+                            CASE
+                                WHEN comment_owner_user_id=%s THEN peer_user_id
+                                WHEN peer_user_id=%s THEN comment_owner_user_id
+                                ELSE NULL
+                            END AS counterpart_user_id
+                        FROM book_comment_relay_conversations
+                        WHERE comment_owner_user_id=%s OR peer_user_id=%s
+                          AND (
+                              closed_by_user_id IS NULL
+                              OR (closed_notified_at IS NULL AND closed_by_user_id <> %s)
+                          )
+                    ) q
+                    WHERE counterpart_user_id IS NOT NULL
+                    """,
+                    (safe_user_id, safe_user_id, safe_user_id, safe_user_id, safe_user_id),
+                )
+                relay_row = cur.fetchone()
+                if relay_row:
+                    default["relay_conversations"] = int(relay_row[0] or 0)
+                    default["relay_people"] = int(relay_row[1] or 0)
+                return default
+            except Exception as e:
+                text = str(e)
+                if "book_comments" in text or "book_comment_relay_conversations" in text:
+                    return default
+                raise
+
+
+def get_book_comment_thread_count(book_id: str) -> int:
+    book_key = str(book_id or "").strip()
+    if not book_key:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM book_comments
+                    WHERE book_id=%s
+                      AND status='active'
+                      AND parent_comment_id IS NULL
+                    """,
+                    (book_key,),
+                )
+                row = cur.fetchone()
+                return int((row[0] if row else 0) or 0)
+            except Exception as e:
+                if "book_comments" in str(e):
+                    return 0
+                raise
+
+
+def get_book_comment_by_id(comment_id: str) -> dict | None:
+    comment_key = str(comment_id or "").strip()
+    if not comment_key:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        c.*,
+                        a.alias_number,
+                        u.username,
+                        u.first_name,
+                        u.last_name,
+                        COALESCE(
+                            (
+                                SELECT COUNT(*)
+                                FROM book_comments r
+                                WHERE r.root_comment_id = c.id
+                                  AND r.status = 'active'
+                            ),
+                            0
+                        ) AS reply_count
+                    FROM book_comments c
+                    LEFT JOIN book_comment_aliases a
+                        ON a.book_id = c.book_id AND a.user_id = c.user_id
+                    LEFT JOIN users u
+                        ON u.id = c.user_id
+                    WHERE c.id=%s
+                    LIMIT 1
+                    """,
+                    (comment_key,),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comments" in str(e):
+                    return None
+                raise
+
+
+def add_book_comment(book_id: str, user_id: int, text: str, parent_comment_id: str | None = None) -> dict | None:
+    book_key = str(book_id or "").strip()
+    clean_text = str(text or "").strip()
+    if not book_key or not user_id or not clean_text:
+        return None
+    parent_key = str(parent_comment_id or "").strip() or None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if is_book_comment_banned(int(user_id)):
+                return {"error": "banned"}
+            parent_row: dict | None = None
+            if parent_key:
+                cur.execute(
+                    """
+                    SELECT id, book_id, user_id, parent_comment_id, root_comment_id, status
+                    FROM book_comments
+                    WHERE id=%s
+                    LIMIT 1
+                    """,
+                    (parent_key,),
+                )
+                parent_row = cur.fetchone()
+                if not parent_row or str(parent_row.get("book_id") or "") != book_key or str(parent_row.get("status") or "") != "active":
+                    return None
+            alias_number = _book_comment_alias_number(cur, book_key, int(user_id))
+            comment_uuid = uuid.uuid4().hex
+            root_comment_id = None
+            if parent_row:
+                root_comment_id = str(parent_row.get("root_comment_id") or parent_row.get("id") or "").strip() or None
+            cur.execute(
+                """
+                INSERT INTO book_comments (
+                    id, book_id, user_id, parent_comment_id, root_comment_id, text, status, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, 'active', NOW(), NOW())
+                RETURNING id, book_id, user_id, parent_comment_id, root_comment_id, text, status, created_at, updated_at
+                """,
+                (
+                    comment_uuid,
+                    book_key,
+                    int(user_id),
+                    parent_key,
+                    root_comment_id,
+                    clean_text,
+                ),
+            )
+            row = cur.fetchone()
+            if row:
+                row["alias_number"] = alias_number
+            return row
+
+
+def list_book_comment_threads(book_id: str, limit: int = 5, offset: int = 0) -> list[dict]:
+    book_key = str(book_id or "").strip()
+    if not book_key:
+        return []
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        c.*,
+                        a.alias_number,
+                        u.username,
+                        u.first_name,
+                        u.last_name,
+                        COALESCE(
+                            (
+                                SELECT COUNT(*)
+                                FROM book_comments r
+                                WHERE r.root_comment_id = c.id
+                                  AND r.status = 'active'
+                            ),
+                            0
+                        ) AS reply_count
+                    FROM book_comments c
+                    LEFT JOIN book_comment_aliases a
+                        ON a.book_id = c.book_id AND a.user_id = c.user_id
+                    LEFT JOIN users u
+                        ON u.id = c.user_id
+                    WHERE c.book_id=%s
+                      AND c.status='active'
+                      AND c.parent_comment_id IS NULL
+                    ORDER BY c.created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (book_key, max(1, int(limit)), max(0, int(offset))),
+                )
+                return cur.fetchall() or []
+            except Exception as e:
+                if "book_comments" in str(e):
+                    return []
+                raise
+
+
+def list_book_comment_replies(parent_comment_id: str, limit: int = 3) -> list[dict]:
+    parent_key = str(parent_comment_id or "").strip()
+    if not parent_key:
+        return []
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        c.*,
+                        a.alias_number,
+                        u.username,
+                        u.first_name,
+                        u.last_name
+                    FROM book_comments c
+                    LEFT JOIN book_comment_aliases a
+                        ON a.book_id = c.book_id AND a.user_id = c.user_id
+                    LEFT JOIN users u
+                        ON u.id = c.user_id
+                    WHERE c.parent_comment_id=%s
+                      AND c.status='active'
+                    ORDER BY c.created_at ASC
+                    LIMIT %s
+                    """,
+                    (parent_key, max(1, int(limit))),
+                )
+                return cur.fetchall() or []
+            except Exception as e:
+                if "book_comments" in str(e):
+                    return []
+                raise
+
+
+def list_user_book_comments(user_id: int, limit: int = 10, offset: int = 0) -> list[dict]:
+    safe_user_id = int(user_id or 0)
+    safe_limit = max(1, min(int(limit or 10), 30))
+    safe_offset = max(0, int(offset or 0))
+    if not safe_user_id:
+        return []
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        c.id,
+                        c.book_id,
+                        c.parent_comment_id,
+                        c.root_comment_id,
+                        c.text,
+                        c.created_at,
+                        COALESCE(NULLIF(b.display_name, ''), NULLIF(b.book_name, ''), c.book_id) AS book_title,
+                        (
+                            SELECT COUNT(*)
+                            FROM book_comments r
+                            WHERE r.parent_comment_id = c.id AND r.status='active'
+                        )::INT AS reply_count
+                    FROM book_comments c
+                    LEFT JOIN books b
+                        ON b.id = c.book_id
+                    WHERE c.user_id=%s AND c.status='active'
+                    ORDER BY c.created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (safe_user_id, safe_limit, safe_offset),
+                )
+                return list(cur.fetchall() or [])
+            except Exception as e:
+                if "book_comments" in str(e):
+                    return []
+                raise
+
+
+def update_book_comment_text(comment_id: str, user_id: int, text: str) -> dict | None:
+    comment_key = str(comment_id or "").strip()
+    clean_text = str(text or "").strip()
+    safe_user_id = int(user_id or 0)
+    if not comment_key or not clean_text or not safe_user_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    UPDATE book_comments
+                    SET text=%s,
+                        updated_at=NOW()
+                    WHERE id=%s
+                      AND user_id=%s
+                      AND status='active'
+                    RETURNING id, book_id, user_id, parent_comment_id, root_comment_id, text, status, created_at, updated_at
+                    """,
+                    (clean_text, comment_key, safe_user_id),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comments" in str(e):
+                    return None
+                raise
+
+
+def list_book_comment_thread_messages(root_comment_id: str, limit: int = 20) -> list[dict]:
+    root_key = str(root_comment_id or "").strip()
+    if not root_key:
+        return []
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        c.*,
+                        a.alias_number,
+                        u.username,
+                        u.first_name,
+                        u.last_name
+                    FROM book_comments c
+                    LEFT JOIN book_comment_aliases a
+                        ON a.book_id = c.book_id AND a.user_id = c.user_id
+                    LEFT JOIN users u
+                        ON u.id = c.user_id
+                    WHERE (c.id=%s OR c.root_comment_id=%s)
+                      AND c.status='active'
+                    ORDER BY c.created_at ASC
+                    LIMIT %s
+                    """,
+                    (root_key, root_key, max(1, int(limit))),
+                )
+                return cur.fetchall() or []
+            except Exception as e:
+                if "book_comments" in str(e):
+                    return []
+                raise
+
+
+def viewer_can_see_book_comment_identity(comment_id: str, viewer_user_id: int | None) -> bool:
+    if not viewer_user_id:
+        return False
+    comment = get_book_comment_by_id(comment_id)
+    if not comment:
+        return False
+    if int(comment.get("user_id") or 0) == int(viewer_user_id):
+        return True
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM book_comment_identity_requests
+                    WHERE comment_id=%s
+                      AND requester_user_id=%s
+                      AND status='approved'
+                    LIMIT 1
+                    """,
+                    (str(comment_id), int(viewer_user_id)),
+                )
+                return bool(cur.fetchone())
+            except Exception as e:
+                if "book_comment_identity_requests" in str(e):
+                    return False
+                raise
+
+
+def create_book_comment_identity_request(comment_id: str, requester_user_id: int) -> dict | None:
+    comment = get_book_comment_by_id(comment_id)
+    if not comment:
+        return None
+    commenter_user_id = int(comment.get("user_id") or 0)
+    if not commenter_user_id or commenter_user_id == int(requester_user_id or 0):
+        return {"status": "self", "comment_id": str(comment_id), "commenter_user_id": commenter_user_id}
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM book_comment_identity_requests
+                    WHERE comment_id=%s AND requester_user_id=%s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (str(comment_id), int(requester_user_id)),
+                )
+                existing = cur.fetchone()
+                if existing and str(existing.get("status") or "") in {"pending", "approved"}:
+                    existing["is_existing"] = True
+                    return existing
+                request_id = uuid.uuid4().hex
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_identity_requests (
+                        id, comment_id, requester_user_id, commenter_user_id, status, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, 'pending', NOW())
+                    RETURNING *
+                    """,
+                    (request_id, str(comment_id), int(requester_user_id), commenter_user_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    row["is_existing"] = False
+                return row
+            except Exception as e:
+                if "book_comment_identity_requests" in str(e):
+                    return None
+                raise
+
+
+def resolve_book_comment_identity_request(request_id: str, commenter_user_id: int, approve: bool) -> dict | None:
+    request_key = str(request_id or "").strip()
+    if not request_key or not commenter_user_id:
+        return None
+    next_status = "approved" if approve else "rejected"
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    UPDATE book_comment_identity_requests
+                    SET status=%s, resolved_at=NOW()
+                    WHERE id=%s
+                      AND commenter_user_id=%s
+                      AND status='pending'
+                    RETURNING *
+                    """,
+                    (next_status, request_key, int(commenter_user_id)),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comment_identity_requests" in str(e):
+                    return None
+                raise
+
+
+def create_book_comment_report(comment_id: str, reporter_user_id: int, reason: str | None = None) -> dict | None:
+    comment_key = str(comment_id or "").strip()
+    if not comment_key or not reporter_user_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_reports (id, comment_id, reporter_user_id, reason, status, created_at)
+                    VALUES (%s, %s, %s, %s, 'open', NOW())
+                    ON CONFLICT (comment_id, reporter_user_id) DO UPDATE SET
+                        reason = COALESCE(EXCLUDED.reason, book_comment_reports.reason),
+                        status = 'open'
+                    RETURNING *
+                    """,
+                    (uuid.uuid4().hex, comment_key, int(reporter_user_id), str(reason or "").strip() or None),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comment_reports" in str(e):
+                    return None
+                raise
+
+
+def get_or_create_book_comment_relay_conversation(comment_id: str, peer_user_id: int) -> dict | None:
+    comment = get_book_comment_by_id(comment_id)
+    if not comment:
+        return None
+    comment_key = str(comment.get("id") or "").strip()
+    book_id = str(comment.get("book_id") or "").strip()
+    owner_user_id = int(comment.get("user_id") or 0)
+    peer_id = int(peer_user_id or 0)
+    if not comment_key or not book_id or not owner_user_id or not peer_id or owner_user_id == peer_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_relay_conversations (
+                        id, book_id, comment_id, comment_owner_user_id, peer_user_id, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (comment_id, peer_user_id) DO UPDATE
+                    SET updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (uuid.uuid4().hex, book_id, comment_key, owner_user_id, peer_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        """
+                        INSERT INTO book_comment_relay_participants (
+                            conversation_id,
+                            user_id,
+                            muted,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES
+                            (%s, %s, FALSE, NOW(), NOW()),
+                            (%s, %s, FALSE, NOW(), NOW())
+                        ON CONFLICT (conversation_id, user_id) DO NOTHING
+                        """,
+                        (
+                            str(row.get("id") or ""),
+                            owner_user_id,
+                            str(row.get("id") or ""),
+                            peer_id,
+                        ),
+                    )
+                return row
+            except Exception as e:
+                if "book_comment_relay_conversations" in str(e):
+                    return None
+                raise
+
+
+def get_book_comment_relay_conversation(conversation_id: str) -> dict | None:
+    conv_key = str(conversation_id or "").strip()
+    if not conv_key:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM book_comment_relay_conversations
+                    WHERE id=%s
+                    LIMIT 1
+                    """,
+                    (conv_key,),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comment_relay_conversations" in str(e):
+                    return None
+                raise
+
+
+def close_book_comment_relay_conversation(conversation_id: str, user_id: int) -> dict | None:
+    conv_key = str(conversation_id or "").strip()
+    safe_user_id = int(user_id or 0)
+    if not conv_key or not safe_user_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    UPDATE book_comment_relay_conversations
+                    SET closed_by_user_id=%s,
+                        closed_at=NOW(),
+                        closed_notified_at=NULL,
+                        updated_at=NOW()
+                    WHERE id=%s
+                      AND (comment_owner_user_id=%s OR peer_user_id=%s)
+                    RETURNING *
+                    """,
+                    (safe_user_id, conv_key, safe_user_id, safe_user_id),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comment_relay_conversations" in str(e):
+                    return None
+                raise
+
+
+def acknowledge_book_comment_relay_closure(conversation_id: str, user_id: int) -> dict | None:
+    conv_key = str(conversation_id or "").strip()
+    safe_user_id = int(user_id or 0)
+    if not conv_key or not safe_user_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    UPDATE book_comment_relay_conversations
+                    SET closed_notified_at=NOW(),
+                        updated_at=NOW()
+                    WHERE id=%s
+                      AND closed_by_user_id IS NOT NULL
+                      AND closed_by_user_id <> %s
+                      AND closed_notified_at IS NULL
+                      AND (comment_owner_user_id=%s OR peer_user_id=%s)
+                    RETURNING *
+                    """,
+                    (conv_key, safe_user_id, safe_user_id, safe_user_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM book_comment_relay_conversations
+                    WHERE id=%s
+                      AND (comment_owner_user_id=%s OR peer_user_id=%s)
+                    LIMIT 1
+                    """,
+                    (conv_key, safe_user_id, safe_user_id),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comment_relay_conversations" in str(e):
+                    return None
+                raise
+
+
+def get_book_comment_relay_participant_state(conversation_id: str, user_id: int) -> dict | None:
+    conv_key = str(conversation_id or "").strip()
+    safe_user_id = int(user_id or 0)
+    if not conv_key or not safe_user_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_relay_participants (
+                        conversation_id,
+                        user_id,
+                        muted,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, FALSE, NOW(), NOW())
+                    ON CONFLICT (conversation_id, user_id) DO NOTHING
+                    """,
+                    (conv_key, safe_user_id),
+                )
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM book_comment_relay_participants
+                    WHERE conversation_id=%s AND user_id=%s
+                    LIMIT 1
+                    """,
+                    (conv_key, safe_user_id),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comment_relay_participants" in str(e):
+                    return None
+                raise
+
+
+def touch_book_comment_relay_last_seen(conversation_id: str, user_id: int, seen_at: datetime | None = None) -> dict | None:
+    conv_key = str(conversation_id or "").strip()
+    safe_user_id = int(user_id or 0)
+    if not conv_key or not safe_user_id:
+        return None
+    ts = seen_at if hasattr(seen_at, "strftime") else datetime.utcnow()
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_relay_participants (
+                        conversation_id,
+                        user_id,
+                        muted,
+                        last_seen_at,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, FALSE, %s, NOW(), NOW())
+                    ON CONFLICT (conversation_id, user_id) DO UPDATE SET
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (conv_key, safe_user_id, ts),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comment_relay_participants" in str(e):
+                    return None
+                raise
+
+
+def set_book_comment_relay_muted(conversation_id: str, user_id: int, muted: bool) -> dict | None:
+    conv_key = str(conversation_id or "").strip()
+    safe_user_id = int(user_id or 0)
+    if not conv_key or not safe_user_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_relay_participants (
+                        conversation_id,
+                        user_id,
+                        muted,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (conversation_id, user_id) DO UPDATE SET
+                        muted = EXCLUDED.muted,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (conv_key, safe_user_id, bool(muted)),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comment_relay_participants" in str(e):
+                    return None
+                raise
+
+
+def get_book_comment_relay_unread_summary(user_id: int) -> dict[str, int]:
+    safe_user_id = int(user_id or 0)
+    default = {"unread_messages": 0, "unread_conversations": 0}
+    if not safe_user_id:
+        return default
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(unread_count), 0)::INT AS unread_messages,
+                        COUNT(*) FILTER (WHERE unread_count > 0)::INT AS unread_conversations
+                    FROM (
+                        SELECT
+                            c.id,
+                            COUNT(m.id)::INT AS unread_count
+                        FROM book_comment_relay_conversations c
+                        LEFT JOIN book_comment_relay_participants p
+                            ON p.conversation_id = c.id AND p.user_id = %s
+                        LEFT JOIN book_comment_relay_messages m
+                            ON m.conversation_id = c.id
+                           AND m.recipient_user_id = %s
+                           AND (p.last_seen_at IS NULL OR m.created_at > p.last_seen_at)
+                        WHERE c.comment_owner_user_id = %s OR c.peer_user_id = %s
+                          AND (
+                              c.closed_by_user_id IS NULL
+                              OR (c.closed_notified_at IS NULL AND c.closed_by_user_id <> %s)
+                          )
+                        GROUP BY c.id
+                    ) q
+                    """,
+                    (safe_user_id, safe_user_id, safe_user_id, safe_user_id, safe_user_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    return {
+                        "unread_messages": int(row[0] or 0),
+                        "unread_conversations": int(row[1] or 0),
+                    }
+                return default
+            except Exception as e:
+                text = str(e)
+                if "book_comment_relay_conversations" in text or "book_comment_relay_participants" in text or "book_comment_relay_messages" in text:
+                    return default
+                raise
+
+
+def list_book_comment_relay_conversations_for_user(user_id: int, limit: int = 10, offset: int = 0) -> list[dict]:
+    safe_user_id = int(user_id or 0)
+    safe_limit = max(1, min(int(limit or 10), 30))
+    safe_offset = max(0, int(offset or 0))
+    if not safe_user_id:
+        return []
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        c.*,
+                        COALESCE(NULLIF(b.display_name, ''), NULLIF(b.book_name, ''), c.book_id) AS book_title,
+                        CASE
+                            WHEN c.comment_owner_user_id = %s THEN c.peer_user_id
+                            ELSE c.comment_owner_user_id
+                        END AS counterpart_user_id,
+                        counterpart.username AS counterpart_username,
+                        counterpart.first_name AS counterpart_first_name,
+                        counterpart.last_name AS counterpart_last_name,
+                        COALESCE(p.muted, FALSE) AS muted,
+                        p.last_seen_at,
+                        last_msg.id AS last_message_id,
+                        last_msg.message_type AS last_message_type,
+                        last_msg.text AS last_message_text,
+                        last_msg.caption AS last_message_caption,
+                        last_msg.created_at AS last_message_at,
+                        last_msg.sender_user_id AS last_sender_user_id,
+                        (
+                            SELECT COUNT(*)
+                            FROM book_comment_relay_messages unread
+                            WHERE unread.conversation_id = c.id
+                              AND unread.recipient_user_id = %s
+                              AND (p.last_seen_at IS NULL OR unread.created_at > p.last_seen_at)
+                        )::INT AS unread_count
+                    FROM book_comment_relay_conversations c
+                    LEFT JOIN books b
+                        ON b.id = c.book_id
+                    LEFT JOIN book_comment_relay_participants p
+                        ON p.conversation_id = c.id AND p.user_id = %s
+                    LEFT JOIN LATERAL (
+                        SELECT m.*
+                        FROM book_comment_relay_messages m
+                        WHERE m.conversation_id = c.id
+                        ORDER BY m.created_at DESC
+                        LIMIT 1
+                    ) last_msg ON TRUE
+                    LEFT JOIN users counterpart
+                        ON counterpart.id = CASE
+                            WHEN c.comment_owner_user_id = %s THEN c.peer_user_id
+                            ELSE c.comment_owner_user_id
+                        END
+                    WHERE c.comment_owner_user_id = %s OR c.peer_user_id = %s
+                      AND (
+                          c.closed_by_user_id IS NULL
+                          OR (c.closed_notified_at IS NULL AND c.closed_by_user_id <> %s)
+                      )
+                    ORDER BY COALESCE(last_msg.created_at, c.updated_at, c.created_at) DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (
+                        safe_user_id,
+                        safe_user_id,
+                        safe_user_id,
+                        safe_user_id,
+                        safe_user_id,
+                        safe_user_id,
+                        safe_user_id,
+                        safe_limit,
+                        safe_offset,
+                    ),
+                )
+                return list(cur.fetchall() or [])
+            except Exception as e:
+                text = str(e)
+                if "book_comment_relay_conversations" in text or "book_comment_relay_messages" in text or "book_comment_relay_participants" in text:
+                    return []
+                raise
+
+
+def count_book_comment_relay_conversations_for_user(user_id: int) -> int:
+    safe_user_id = int(user_id or 0)
+    if not safe_user_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::INT
+                    FROM book_comment_relay_conversations
+                    WHERE comment_owner_user_id = %s OR peer_user_id = %s
+                      AND (
+                          closed_by_user_id IS NULL
+                          OR (closed_notified_at IS NULL AND closed_by_user_id <> %s)
+                      )
+                    """,
+                    (safe_user_id, safe_user_id, safe_user_id),
+                )
+                row = cur.fetchone()
+                return int((row[0] if row else 0) or 0)
+            except Exception as e:
+                if "book_comment_relay_conversations" in str(e):
+                    return 0
+                raise
+
+
+def create_book_comment_relay_message(
+    conversation_id: str,
+    sender_user_id: int,
+    recipient_user_id: int,
+    message_type: str,
+    *,
+    text: str | None = None,
+    caption: str | None = None,
+    media_file_id: str | None = None,
+    media_file_unique_id: str | None = None,
+) -> dict | None:
+    conversation = get_book_comment_relay_conversation(conversation_id)
+    if not conversation:
+        return None
+    conv_key = str(conversation.get("id") or "").strip()
+    book_id = str(conversation.get("book_id") or "").strip()
+    comment_id = str(conversation.get("comment_id") or "").strip()
+    sender_id = int(sender_user_id or 0)
+    recipient_id = int(recipient_user_id or 0)
+    msg_type = str(message_type or "").strip().lower()
+    if (
+        not conv_key
+        or not book_id
+        or not comment_id
+        or not sender_id
+        or not recipient_id
+        or not msg_type
+        or int(conversation.get("closed_by_user_id") or 0) != 0
+    ):
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                message_id = uuid.uuid4().hex
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_relay_messages (
+                        id, conversation_id, book_id, comment_id, sender_user_id, recipient_user_id,
+                        message_type, text, caption, media_file_id, media_file_unique_id, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    RETURNING *
+                    """,
+                    (
+                        message_id,
+                        conv_key,
+                        book_id,
+                        comment_id,
+                        sender_id,
+                        recipient_id,
+                        msg_type,
+                        str(text or "").strip() or None,
+                        str(caption or "").strip() or None,
+                        str(media_file_id or "").strip() or None,
+                        str(media_file_unique_id or "").strip() or None,
+                    ),
+                )
+                row = cur.fetchone()
+                cur.execute(
+                    """
+                    UPDATE book_comment_relay_conversations
+                    SET updated_at=NOW()
+                    WHERE id=%s
+                    """,
+                    (conv_key,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_relay_participants (
+                        conversation_id,
+                        user_id,
+                        muted,
+                        last_seen_at,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, FALSE, NOW(), NOW(), NOW())
+                    ON CONFLICT (conversation_id, user_id) DO UPDATE SET
+                        last_seen_at = NOW(),
+                        updated_at = NOW()
+                    """,
+                    (conv_key, sender_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO book_comment_relay_participants (
+                        conversation_id,
+                        user_id,
+                        muted,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, FALSE, NOW(), NOW())
+                    ON CONFLICT (conversation_id, user_id) DO NOTHING
+                    """,
+                    (conv_key, recipient_id),
+                )
+                return row
+            except Exception as e:
+                if "book_comment_relay_messages" in str(e) or "book_comment_relay_conversations" in str(e):
+                    return None
+                raise
+
+
+def get_book_comment_relay_message(message_id: str) -> dict | None:
+    message_key = str(message_id or "").strip()
+    if not message_key:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        m.*,
+                        c.comment_owner_user_id,
+                        c.peer_user_id
+                    FROM book_comment_relay_messages m
+                    LEFT JOIN book_comment_relay_conversations c
+                        ON c.id = m.conversation_id
+                    WHERE m.id=%s
+                    LIMIT 1
+                    """,
+                    (message_key,),
+                )
+                return cur.fetchone()
+            except Exception as e:
+                if "book_comment_relay_messages" in str(e):
+                    return None
+                raise
+
+
+def list_book_comment_relay_messages_for_user(
+    conversation_id: str,
+    user_id: int,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[dict]:
+    conv_key = str(conversation_id or "").strip()
+    safe_user_id = int(user_id or 0)
+    safe_limit = max(1, min(int(limit or 20), 50))
+    safe_offset = max(0, int(offset or 0))
+    if not conv_key or not safe_user_id:
+        return []
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM book_comment_relay_conversations
+                    WHERE id=%s
+                      AND (comment_owner_user_id=%s OR peer_user_id=%s)
+                    LIMIT 1
+                    """,
+                    (conv_key, safe_user_id, safe_user_id),
+                )
+                if not cur.fetchone():
+                    return []
+                cur.execute(
+                    """
+                    SELECT
+                        m.*,
+                        CASE
+                            WHEN m.sender_user_id = %s THEN 'outgoing'
+                            ELSE 'incoming'
+                        END AS direction
+                    FROM book_comment_relay_messages m
+                    WHERE m.conversation_id=%s
+                    ORDER BY m.created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (safe_user_id, conv_key, safe_limit, safe_offset),
+                )
+                rows = list(cur.fetchall() or [])
+                rows.reverse()
+                return rows
+            except Exception as e:
+                text = str(e)
+                if "book_comment_relay_conversations" in text or "book_comment_relay_messages" in text:
+                    return []
+                raise
+
+
+def delete_book_comment(comment_id: str, moderator_user_id: int | None = None, reason: str | None = None) -> int:
+    comment = get_book_comment_by_id(comment_id)
+    if not comment:
+        return 0
+    comment_key = str(comment.get("id") or "").strip()
+    parent_comment_id = str(comment.get("parent_comment_id") or "").strip() or None
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                if parent_comment_id:
+                    cur.execute(
+                        """
+                        WITH RECURSIVE subtree AS (
+                            SELECT id
+                            FROM book_comments
+                            WHERE id=%s
+                            UNION ALL
+                            SELECT c.id
+                            FROM book_comments c
+                            JOIN subtree s ON c.parent_comment_id = s.id
+                        )
+                        UPDATE book_comments
+                        SET status='deleted',
+                            moderated_by_user_id=%s,
+                            moderated_at=NOW(),
+                            deleted_reason=%s,
+                            updated_at=NOW()
+                        WHERE id IN (SELECT id FROM subtree)
+                        """,
+                        (
+                            comment_key,
+                            int(moderator_user_id) if moderator_user_id else None,
+                            str(reason or "").strip() or "deleted",
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE book_comments
+                        SET status='deleted',
+                            moderated_by_user_id=%s,
+                            moderated_at=NOW(),
+                            deleted_reason=%s,
+                            updated_at=NOW()
+                        WHERE id=%s OR root_comment_id=%s
+                        """,
+                        (
+                            int(moderator_user_id) if moderator_user_id else None,
+                            str(reason or "").strip() or "deleted",
+                            comment_key,
+                            comment_key,
+                        ),
+                    )
+                return int(cur.rowcount or 0)
+            except Exception as e:
+                if "book_comments" in str(e):
+                    return 0
+                raise
+
+
+def _apply_book_reaction_adjustments(counts: dict[str, int], adjustments: dict[str, int] | None) -> dict[str, int]:
+    if not adjustments:
+        return {
+            "like": int(counts.get("like", 0) or 0),
+            "dislike": int(counts.get("dislike", 0) or 0),
+            "berry": int(counts.get("berry", 0) or 0),
+            "whale": int(counts.get("whale", 0) or 0),
+        }
+    adjusted: dict[str, int] = {}
+    for key in ("like", "dislike", "berry", "whale"):
+        base = int(counts.get(key, 0) or 0)
+        offset = int(adjustments.get(key, 0) or 0)
+        adjusted[key] = max(0, base + offset)
+    return adjusted
+
+
+def set_book_reaction_display_counts(book_id: str, target_counts: dict[str, int], editor_user_id: int | None = None) -> dict[str, int]:
+    raw_counts = get_book_reaction_counts(book_id, include_adjustments=False)
+    offsets = {}
+    for key in ("like", "dislike", "berry", "whale"):
+        target = max(0, int(target_counts.get(key, 0) or 0))
+        offsets[key] = target - int(raw_counts.get(key, 0) or 0)
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS book_reaction_adjustments (
+                    book_id TEXT PRIMARY KEY,
+                    like_offset INTEGER NOT NULL DEFAULT 0,
+                    dislike_offset INTEGER NOT NULL DEFAULT 0,
+                    berry_offset INTEGER NOT NULL DEFAULT 0,
+                    whale_offset INTEGER NOT NULL DEFAULT 0,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            if all(int(offsets.get(key, 0) or 0) == 0 for key in ("like", "dislike", "berry", "whale")):
+                cur.execute("DELETE FROM book_reaction_adjustments WHERE book_id=%s", (book_id,))
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO book_reaction_adjustments (
+                        book_id, like_offset, dislike_offset, berry_offset, whale_offset, updated_by, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (book_id) DO UPDATE SET
+                        like_offset = EXCLUDED.like_offset,
+                        dislike_offset = EXCLUDED.dislike_offset,
+                        berry_offset = EXCLUDED.berry_offset,
+                        whale_offset = EXCLUDED.whale_offset,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    """,
+                    (
+                        book_id,
+                        int(offsets["like"]),
+                        int(offsets["dislike"]),
+                        int(offsets["berry"]),
+                        int(offsets["whale"]),
+                        int(editor_user_id) if editor_user_id else None,
+                    ),
+                )
+    return _apply_book_reaction_adjustments(raw_counts, offsets)
+
+
+def clear_all_book_display_adjustments() -> dict[str, int]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM book_counter_adjustments")
+            counter_rows = int(cur.rowcount or 0)
+            cur.execute("DELETE FROM book_reaction_adjustments")
+            reaction_rows = int(cur.rowcount or 0)
+    return {"counter_rows": counter_rows, "reaction_rows": reaction_rows}
+
+
+def seed_all_book_display_stats_randomly(
+    *,
+    download_min: int = 20,
+    download_max: int = 50,
+    favorite_min: int = 10,
+    favorite_max: int = 60,
+    positive_min: int = 10,
+    positive_max: int = 60,
+    negative_min: int = 0,
+    negative_max: int = 10,
+    editor_user_id: int | None = None,
+) -> dict[str, int]:
+    download_low, download_high = sorted((int(download_min), int(download_max)))
+    favorite_low, favorite_high = sorted((int(favorite_min), int(favorite_max)))
+    positive_low, positive_high = sorted((int(positive_min), int(positive_max)))
+    negative_low, negative_high = sorted((int(negative_min), int(negative_max)))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    b.id,
+                    COALESCE(b.downloads, 0) AS downloads,
+                    COALESCE(f.fav_count, 0) AS fav_count,
+                    COALESCE(r.like_count, 0) AS like_count,
+                    COALESCE(r.dislike_count, 0) AS dislike_count,
+                    COALESCE(r.berry_count, 0) AS berry_count,
+                    COALESCE(r.whale_count, 0) AS whale_count
+                FROM books b
+                LEFT JOIN (
+                    SELECT book_id, COUNT(*) AS fav_count
+                    FROM user_favorites
+                    GROUP BY book_id
+                ) f ON f.book_id = b.id
+                LEFT JOIN (
+                    SELECT
+                        book_id,
+                        SUM(CASE WHEN reaction='like' THEN 1 ELSE 0 END) AS like_count,
+                        SUM(CASE WHEN reaction='dislike' THEN 1 ELSE 0 END) AS dislike_count,
+                        SUM(CASE WHEN reaction='berry' THEN 1 ELSE 0 END) AS berry_count,
+                        SUM(CASE WHEN reaction='whale' THEN 1 ELSE 0 END) AS whale_count
+                    FROM book_reactions
+                    GROUP BY book_id
+                ) r ON r.book_id = b.id
+                """
+            )
+            rows = cur.fetchall() or []
+
+        counter_payload: list[tuple[str, int, int, int | None]] = []
+        reaction_payload: list[tuple[str, int, int, int, int, int | None]] = []
+        randomized_books = 0
+
+        for row in rows:
+            book_id = str(row.get("id") or "").strip()
+            if not book_id:
+                continue
+            randomized_books += 1
+            target_downloads = random.randint(download_low, download_high)
+            target_favorites = random.randint(favorite_low, favorite_high)
+            target_like = random.randint(positive_low, positive_high)
+            target_berry = random.randint(positive_low, positive_high)
+            target_whale = random.randint(positive_low, positive_high)
+            target_dislike = random.randint(negative_low, negative_high)
+
+            downloads_offset = int(target_downloads) - int(row.get("downloads") or 0)
+            favorite_offset = int(target_favorites) - int(row.get("fav_count") or 0)
+            like_offset = int(target_like) - int(row.get("like_count") or 0)
+            dislike_offset = int(target_dislike) - int(row.get("dislike_count") or 0)
+            berry_offset = int(target_berry) - int(row.get("berry_count") or 0)
+            whale_offset = int(target_whale) - int(row.get("whale_count") or 0)
+
+            if downloads_offset or favorite_offset:
+                counter_payload.append(
+                    (
+                        book_id,
+                        int(downloads_offset),
+                        int(favorite_offset),
+                        int(editor_user_id) if editor_user_id else None,
+                    )
+                )
+            if like_offset or dislike_offset or berry_offset or whale_offset:
+                reaction_payload.append(
+                    (
+                        book_id,
+                        int(like_offset),
+                        int(dislike_offset),
+                        int(berry_offset),
+                        int(whale_offset),
+                        int(editor_user_id) if editor_user_id else None,
+                    )
+                )
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS book_counter_adjustments (
+                    book_id TEXT PRIMARY KEY,
+                    downloads_offset INTEGER NOT NULL DEFAULT 0,
+                    favorite_offset INTEGER NOT NULL DEFAULT 0,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS book_reaction_adjustments (
+                    book_id TEXT PRIMARY KEY,
+                    like_offset INTEGER NOT NULL DEFAULT 0,
+                    dislike_offset INTEGER NOT NULL DEFAULT 0,
+                    berry_offset INTEGER NOT NULL DEFAULT 0,
+                    whale_offset INTEGER NOT NULL DEFAULT 0,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("DELETE FROM book_counter_adjustments")
+            cur.execute("DELETE FROM book_reaction_adjustments")
+            if counter_payload and execute_values is not None:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO book_counter_adjustments (
+                        book_id, downloads_offset, favorite_offset, updated_by, updated_at
+                    ) VALUES %s
+                    ON CONFLICT (book_id) DO UPDATE SET
+                        downloads_offset = EXCLUDED.downloads_offset,
+                        favorite_offset = EXCLUDED.favorite_offset,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    """,
+                    counter_payload,
+                    template="(%s, %s, %s, %s, NOW())",
+                )
+            if reaction_payload and execute_values is not None:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO book_reaction_adjustments (
+                        book_id, like_offset, dislike_offset, berry_offset, whale_offset, updated_by, updated_at
+                    ) VALUES %s
+                    ON CONFLICT (book_id) DO UPDATE SET
+                        like_offset = EXCLUDED.like_offset,
+                        dislike_offset = EXCLUDED.dislike_offset,
+                        berry_offset = EXCLUDED.berry_offset,
+                        whale_offset = EXCLUDED.whale_offset,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    """,
+                    reaction_payload,
+                    template="(%s, %s, %s, %s, %s, %s, NOW())",
+                )
+
+    return {
+        "books": int(randomized_books),
+        "counter_rows": int(len(counter_payload)),
+        "reaction_rows": int(len(reaction_payload)),
+        "download_min": int(download_low),
+        "download_max": int(download_high),
+        "favorite_min": int(favorite_low),
+        "favorite_max": int(favorite_high),
+        "positive_min": int(positive_low),
+        "positive_max": int(positive_high),
+        "negative_min": int(negative_low),
+        "negative_max": int(negative_high),
+    }
+
+
+def get_book_reaction_counts(book_id: str, include_adjustments: bool = True) -> dict[str, int]:
     counts = {"like": 0, "dislike": 0, "berry": 0, "whale": 0}
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -3543,6 +5761,8 @@ def get_book_reaction_counts(book_id: str) -> dict[str, int]:
             for reaction, count in cur.fetchall():
                 if reaction in counts:
                     counts[reaction] = int(count)
+    if include_adjustments:
+        return _apply_book_reaction_adjustments(counts, get_book_reaction_adjustments(book_id))
     return counts
 
 def get_book_favorite_count(book_id: str) -> int:
@@ -3597,13 +5817,25 @@ def get_book_stats(book_id: str):
                     "berry": 0,
                     "whale": 0,
                 }
-            return {
-                "downloads": int(row.get("downloads") or 0),
-                "fav_count": int(row.get("fav_count") or 0),
+            base_counts = {
                 "like": int(row.get("like_count") or 0),
                 "dislike": int(row.get("dislike_count") or 0),
                 "berry": int(row.get("berry_count") or 0),
                 "whale": int(row.get("whale_count") or 0),
+            }
+            adjusted_downloads, adjusted_favorites = _apply_book_counter_adjustments(
+                int(row.get("downloads") or 0),
+                int(row.get("fav_count") or 0),
+                get_book_counter_adjustments(book_id),
+            )
+            adjusted_counts = _apply_book_reaction_adjustments(base_counts, get_book_reaction_adjustments(book_id))
+            return {
+                "downloads": adjusted_downloads,
+                "fav_count": adjusted_favorites,
+                "like": adjusted_counts["like"],
+                "dislike": adjusted_counts["dislike"],
+                "berry": adjusted_counts["berry"],
+                "whale": adjusted_counts["whale"],
             }
 
 
@@ -4614,6 +6846,131 @@ def delete_bot_setting(key: str) -> int:
             return cur.rowcount
 
 
+def upsert_forbidden_books(entries: list[tuple[str, str]] | tuple[tuple[str, str], ...], created_by_user_id: int | None = None) -> int:
+    clean_rows: list[tuple[str, str, int | None]] = []
+    seen: set[str] = set()
+    for normalized_title, title in entries or []:
+        norm = str(normalized_title or "").strip()
+        raw = str(title or "").strip()
+        if not norm or not raw or norm in seen:
+            continue
+        seen.add(norm)
+        clean_rows.append((norm, raw, int(created_by_user_id) if created_by_user_id is not None else None))
+    if not clean_rows:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO forbidden_books (normalized_title, title, created_by_user_id, created_at, updated_at)
+                VALUES %s
+                ON CONFLICT (normalized_title) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    created_by_user_id = EXCLUDED.created_by_user_id,
+                    updated_at = NOW()
+                """,
+                clean_rows,
+                template="(%s, %s, %s, NOW(), NOW())",
+            )
+            return len(clean_rows)
+
+
+def get_forbidden_book_title(normalized_title: str) -> str | None:
+    key = str(normalized_title or "").strip()
+    if not key:
+        return None
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT title FROM forbidden_books WHERE normalized_title=%s LIMIT 1",
+                (key,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            try:
+                value = row[0]
+            except Exception:
+                value = None
+            text = str(value or "").strip()
+            return text or None
+
+
+def list_forbidden_book_titles() -> list[str]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT normalized_title FROM forbidden_books")
+            rows = cur.fetchall() or []
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        try:
+            value = row[0]
+        except Exception:
+            value = None
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def list_forbidden_books(limit: int | None = None) -> list[dict]:
+    sql = """
+        SELECT normalized_title, title, created_by_user_id, created_at, updated_at
+        FROM forbidden_books
+        ORDER BY LOWER(title) ASC, updated_at DESC
+    """
+    params: tuple[object, ...] = ()
+    if limit is not None:
+        sql += " LIMIT %s"
+        params = (max(1, int(limit)),)
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall() or []
+    items: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        normalized_title = str((row or {}).get("normalized_title") or "").strip()
+        title = str((row or {}).get("title") or "").strip()
+        if not normalized_title or not title or normalized_title in seen:
+            continue
+        seen.add(normalized_title)
+        items.append(
+            {
+                "normalized_title": normalized_title,
+                "title": title,
+                "created_by_user_id": (row or {}).get("created_by_user_id"),
+                "created_at": (row or {}).get("created_at"),
+                "updated_at": (row or {}).get("updated_at"),
+            }
+        )
+    return items
+
+
+def remove_forbidden_books(normalized_titles: list[str] | tuple[str, ...]) -> int:
+    clean_titles: list[str] = []
+    seen: set[str] = set()
+    for item in normalized_titles or []:
+        title = str(item or "").strip()
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        clean_titles.append(title)
+    if not clean_titles:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM forbidden_books WHERE normalized_title = ANY(%s)",
+                (clean_titles,),
+            )
+            return int(cur.rowcount or 0)
+
+
 def insert_upload_receipt(record: dict):
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -5209,6 +7566,48 @@ def delete_book_and_related(book_id: str) -> int:
             cur.execute("DELETE FROM user_favorites WHERE book_id=%s", (book_id,))
             cur.execute("DELETE FROM user_favorite_awards WHERE book_id=%s", (book_id,))
             cur.execute("DELETE FROM user_recents WHERE book_id=%s", (book_id,))
+            cur.execute("DELETE FROM book_counter_adjustments WHERE book_id=%s", (book_id,))
+            cur.execute("DELETE FROM book_reaction_adjustments WHERE book_id=%s", (book_id,))
+            cur.execute("DELETE FROM book_reaction_policies WHERE book_id=%s", (book_id,))
+            cur.execute("DELETE FROM book_comment_aliases WHERE book_id=%s", (book_id,))
+            cur.execute(
+                """
+                DELETE FROM book_comment_relay_messages
+                WHERE book_id=%s
+                """,
+                (book_id,),
+            )
+            cur.execute(
+                """
+                DELETE FROM book_comment_relay_participants
+                WHERE conversation_id IN (
+                    SELECT id FROM book_comment_relay_conversations WHERE book_id=%s
+                )
+                """,
+                (book_id,),
+            )
+            cur.execute(
+                """
+                DELETE FROM book_comment_relay_conversations
+                WHERE book_id=%s
+                """,
+                (book_id,),
+            )
+            cur.execute(
+                """
+                DELETE FROM book_comment_identity_requests
+                WHERE comment_id IN (SELECT id FROM book_comments WHERE book_id=%s)
+                """,
+                (book_id,),
+            )
+            cur.execute(
+                """
+                DELETE FROM book_comment_reports
+                WHERE comment_id IN (SELECT id FROM book_comments WHERE book_id=%s)
+                """,
+                (book_id,),
+            )
+            cur.execute("DELETE FROM book_comments WHERE book_id=%s", (book_id,))
             cur.execute("DELETE FROM book_reactions WHERE book_id=%s", (book_id,))
             cur.execute("DELETE FROM user_reaction_awards WHERE book_id=%s", (book_id,))
             cur.execute("UPDATE book_requests SET book_id=NULL WHERE book_id=%s", (book_id,))

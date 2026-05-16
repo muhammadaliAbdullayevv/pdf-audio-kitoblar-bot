@@ -66,6 +66,9 @@ REQUIRED_DEP_KEYS = (
     "chatid_command",
     "mystats_command",
     "myprofile_command",
+    "my_comments_command",
+    "my_chats_command",
+    "comment_inbox_command",
     "inlinequery",
     "chosen_inline_result",
     "audit_command",
@@ -78,6 +81,10 @@ REQUIRED_DEP_KEYS = (
     "user_search_command",
     "pause_bot_command",
     "resume_bot_command",
+    "drafttime_command",
+    "negalert_command",
+    "seedbookstats_command",
+    "forbidden_books_command",
     "handle_upload_help_callback",
     "handle_upload_request_status_callback",
     "handle_delete_book_callback",
@@ -86,6 +93,30 @@ REQUIRED_DEP_KEYS = (
     "handle_audiobook_delete_callback",
     "handle_audiobook_add_callback",
     "handle_book_rename_callback",
+    "handle_book_reaction_edit_callback",
+    "handle_book_reaction_policy_callback",
+    "handle_book_comments_callback",
+    "handle_book_comment_thread_callback",
+    "handle_book_comment_add_callback",
+    "handle_book_comment_reply_callback",
+    "handle_my_comments_page_callback",
+    "handle_my_comment_view_callback",
+    "handle_my_comment_edit_callback",
+    "handle_my_comment_delete_callback",
+    "handle_my_chats_page_callback",
+    "handle_my_chat_view_callback",
+    "handle_my_chat_delete_callback",
+    "handle_comment_inbox_callback",
+    "handle_comment_conversation_callback",
+    "handle_comment_conversation_mute_callback",
+    "handle_book_comment_relay_reply_callback",
+    "handle_book_comment_identity_request_callback",
+    "handle_book_comment_identity_resolve_callback",
+    "handle_book_comment_report_callback",
+    "handle_book_comment_user_ban_toggle_callback",
+    "handle_book_comment_relay_block_callback",
+    "handle_book_comment_relay_report_callback",
+    "handle_book_comment_moderation_callback",
     "handle_book_selection",
     "handle_error",
 )
@@ -151,9 +182,22 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CommandHandler("chatid", d["chatid_command"]))
     app.add_handler(CommandHandler("mystats", d["mystats_command"]))
     app.add_handler(CommandHandler("myprofile", d["myprofile_command"]))
+    app.add_handler(CommandHandler("my_comments", d["my_comments_command"]))
+    app.add_handler(CommandHandler("mycomments", d["my_comments_command"]))
+    app.add_handler(CommandHandler("my_commands", d["my_comments_command"]))
+    app.add_handler(CommandHandler("my_chats", d["my_chats_command"]))
+    app.add_handler(CommandHandler("mychats", d["my_chats_command"]))
+    app.add_handler(CommandHandler("comment_inbox", d["comment_inbox_command"]))
+    app.add_handler(CommandHandler("commentinbox", d["comment_inbox_command"]))
     app.add_handler(InlineQueryHandler(d["inlinequery"]))
     app.add_handler(ChosenInlineResultHandler(d["chosen_inline_result"]))
     app.add_handler(CommandHandler("audit", d["audit_command"]))
+    app.add_handler(CommandHandler("drafttime", d["drafttime_command"]))
+    app.add_handler(CommandHandler("negalert", d["negalert_command"]))
+    app.add_handler(CommandHandler("seedbookstats", d["seedbookstats_command"]))
+    app.add_handler(CommandHandler("randbookstats", d["seedbookstats_command"]))
+    app.add_handler(CommandHandler("forbidden_books", d["forbidden_books_command"]))
+    app.add_handler(CommandHandler("forbiddenbooks", d["forbidden_books_command"]))
     app.add_handler(CommandHandler("prune", d["prune_command"]))
     app.add_handler(CommandHandler("missing", d["missing_command"]))
     app.add_handler(CommandHandler("db_dupes", d["db_dupes_command"]))
@@ -171,6 +215,30 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_delete_callback"], pattern=r"^abdel:"))
     app.add_handler(CallbackQueryHandler(d["handle_audiobook_add_callback"], pattern=r"^abadd:"))
     app.add_handler(CallbackQueryHandler(d["handle_book_rename_callback"], pattern=r"^bookrename:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_reaction_edit_callback"], pattern=r"^bookreactedit:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_reaction_policy_callback"], pattern=r"^bookreactpolicy:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comments_callback"], pattern=r"^bookcomments:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_thread_callback"], pattern=r"^commentthread:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_add_callback"], pattern=r"^commentadd:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_reply_callback"], pattern=r"^commentreply:"))
+    app.add_handler(CallbackQueryHandler(d["handle_my_comments_page_callback"], pattern=r"^mycomments:"))
+    app.add_handler(CallbackQueryHandler(d["handle_my_comment_view_callback"], pattern=r"^mycommentview:"))
+    app.add_handler(CallbackQueryHandler(d["handle_my_comment_edit_callback"], pattern=r"^mycommentedit:"))
+    app.add_handler(CallbackQueryHandler(d["handle_my_comment_delete_callback"], pattern=r"^mycommentdelete:"))
+    app.add_handler(CallbackQueryHandler(d["handle_my_chats_page_callback"], pattern=r"^mychats:"))
+    app.add_handler(CallbackQueryHandler(d["handle_my_chat_view_callback"], pattern=r"^mychatview:"))
+    app.add_handler(CallbackQueryHandler(d["handle_my_chat_delete_callback"], pattern=r"^mychatdelete:"))
+    app.add_handler(CallbackQueryHandler(d["handle_comment_inbox_callback"], pattern=r"^commentinbox:"))
+    app.add_handler(CallbackQueryHandler(d["handle_comment_conversation_callback"], pattern=r"^commentconv:"))
+    app.add_handler(CallbackQueryHandler(d["handle_comment_conversation_mute_callback"], pattern=r"^commentmute:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_relay_reply_callback"], pattern=r"^commentrelayreply:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_identity_request_callback"], pattern=r"^commentwho:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_identity_resolve_callback"], pattern=r"^commentreveal:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_report_callback"], pattern=r"^commentreport:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_user_ban_toggle_callback"], pattern=r"^commentuserban:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_relay_block_callback"], pattern=r"^commentrelayblock:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_relay_report_callback"], pattern=r"^commentrelayreport:"))
+    app.add_handler(CallbackQueryHandler(d["handle_book_comment_moderation_callback"], pattern=r"^commentmod:"))
     app.add_handler(
         CallbackQueryHandler(
             d["handle_book_selection"],

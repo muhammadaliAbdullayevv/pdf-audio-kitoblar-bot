@@ -107,6 +107,131 @@ def _is_callback_reaction_latest(context: ContextTypes.DEFAULT_TYPE, state_key: 
     return int(state.get(state_key, 0) or 0) == int(state_seq)
 
 
+def _negative_reaction_alert_threshold() -> int:
+    resolver = globals().get("_get_negative_reaction_alert_threshold")
+    if callable(resolver):
+        try:
+            return max(1, int(resolver() or 0))
+        except Exception:
+            pass
+    try:
+        return max(2, int(globals().get("BOOK_NEGATIVE_ALERT_THRESHOLD") or 2))
+    except Exception:
+        return 2
+
+
+async def _maybe_send_negative_reaction_alert(
+    context: ContextTypes.DEFAULT_TYPE,
+    book_id: str,
+    dislike_count: int,
+    *,
+    book: dict | None = None,
+) -> None:
+    threshold = _negative_reaction_alert_threshold()
+    state_fn = globals().get("db_get_book_negative_reaction_alert_state")
+    clear_fn = globals().get("db_clear_book_negative_reaction_alert")
+    mark_fn = globals().get("db_mark_book_negative_reaction_alert_sent")
+    target_fn = globals().get("get_request_target_id")
+    get_book_fn = globals().get("db_get_book_by_id")
+
+    if dislike_count < threshold:
+        if callable(clear_fn):
+            await run_blocking(clear_fn, book_id)
+        return
+
+    state = {}
+    if callable(state_fn):
+        state = await run_blocking(state_fn, book_id) or {}
+    if bool((state or {}).get("negative_reaction_alert_active")):
+        return
+
+    target_id = target_fn() if callable(target_fn) else None
+    if not target_id:
+        return
+
+    if book is None and callable(get_book_fn):
+        book = await run_blocking(get_book_fn, book_id)
+    if not book:
+        return
+
+    title = str(
+        (globals().get("get_display_name")(book) if callable(globals().get("get_display_name")) else None)
+        or (globals().get("get_result_title")(book) if callable(globals().get("get_result_title")) else None)
+        or book.get("display_name")
+        or book.get("book_name")
+        or book_id
+    ).strip()
+    if len(title) > 180:
+        title = title[:177].rstrip() + "..."
+
+    template = (
+        MESSAGES.get("uz", {}).get(
+            "book_negative_reaction_alert_caption",
+            "⚠️ Bu kitobda salbiy reaksiyalar ko'paydi.\n\n📖 {title}\n👎 Salbiy reaksiyalar: {dislike_count}\n📏 Chegara: {threshold}\n🆔 {book_id}\n\nIltimos, tekshirib chiqing.",
+        )
+        if isinstance(MESSAGES, dict)
+        else "⚠️ Book received too many negative reactions.\n\n📖 {title}\n👎 Negative reactions: {dislike_count}\n📏 Threshold: {threshold}\n🆔 {book_id}"
+    )
+    caption = template.format(
+        title=title,
+        dislike_count=int(dislike_count or 0),
+        threshold=int(threshold or 0),
+        book_id=book_id,
+    )
+
+    sent = None
+    bot = getattr(context, "bot", None)
+    if not bot:
+        return
+
+    file_id = str(book.get("file_id") or "").strip()
+    local_path = str(book.get("path") or "").strip()
+    filename_builder = globals().get("_book_filename")
+    input_file_cls = globals().get("InputFile")
+
+    if file_id:
+        try:
+            sent = await bot.send_document(
+                chat_id=target_id,
+                document=file_id,
+                caption=caption,
+            )
+        except Exception as e:
+            logger.warning("Failed to send negative-reaction alert by file_id for %s: %s", book_id, e)
+
+    if sent is None and local_path and os.path.exists(local_path) and input_file_cls is not None:
+        try:
+            filename = (
+                filename_builder(book)
+                if callable(filename_builder)
+                else (os.path.basename(local_path) or f"{book_id}.pdf")
+            )
+            with open(local_path, "rb") as f:
+                sent = await bot.send_document(
+                    chat_id=target_id,
+                    document=input_file_cls(f, filename=filename),
+                    caption=caption,
+                )
+        except Exception as e:
+            logger.warning("Failed to send negative-reaction alert by local file for %s: %s", book_id, e)
+
+    if sent is None:
+        try:
+            sent = await bot.send_message(chat_id=target_id, text=caption)
+        except Exception as e:
+            logger.warning("Failed to send negative-reaction alert text for %s: %s", book_id, e)
+            return
+
+    if callable(mark_fn):
+        await run_blocking(
+            mark_fn,
+            book_id,
+            int(dislike_count or 0),
+            getattr(sent, "chat_id", None) or getattr(getattr(sent, "chat", None), "id", None),
+            getattr(sent, "message_id", None),
+        )
+
+
 async def _send_reaction_for_callback_message(
     query,
     context: ContextTypes.DEFAULT_TYPE,
@@ -244,10 +369,18 @@ def _invalidate_top_caches(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _edit_progress_or_reply(progress_message, target_message, text: str, reply_markup=None) -> None:
+    edit_failed = False
     if progress_message:
         try:
             await progress_message.edit_text(text, reply_markup=reply_markup)
             return
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+            edit_failed = True
+    if progress_message and edit_failed:
+        try:
+            await progress_message.delete()
         except Exception:
             pass
     await target_message.reply_text(text, reply_markup=reply_markup)
@@ -526,18 +659,58 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if limited:
         await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
         return
+    private_draft_status_fn = globals().get("push_private_live_status")
+    hold_private_draft_status_fn = globals().get("hold_private_live_status")
+    hold_private_search_presentation_fn = globals().get("hold_private_search_presentation")
+    use_private_draft = False
+    draft_top_started_at = None
     progress_message = None
+    if callable(private_draft_status_fn) and getattr(update.effective_chat, "type", None) == "private":
+        try:
+            use_private_draft = bool(
+                await private_draft_status_fn(
+                    context.bot,
+                    update.effective_chat.id,
+                    lang,
+                    "draft_top_books",
+                    message_thread_id=getattr(target_message, "message_thread_id", None),
+                )
+            )
+            if use_private_draft:
+                draft_top_started_at = time.monotonic()
+        except Exception:
+            use_private_draft = False
     try:
-        progress_message = await target_message.reply_text(
-            MESSAGES[lang].get("processing_general", "⏳ Processing your request...")
+        progress_message = None if use_private_draft else await target_message.reply_text(
+            MESSAGES[lang].get(
+                "private_top_results_status" if use_private_draft else "processing_general",
+                "⏳ Processing your request...",
+            )
         )
     except Exception:
         progress_message = None
+
+    async def _ensure_private_top_status_message() -> None:
+        nonlocal progress_message
+        if progress_message is not None or not use_private_draft:
+            return
+        try:
+            progress_message = await target_message.reply_text(
+                MESSAGES[lang].get(
+                    "private_top_results_status",
+                    MESSAGES[lang].get("draft_top_books", "🔥 Preparing top books..."),
+                )
+            )
+        except Exception:
+            progress_message = None
+
     try:
         entries = get_cached_top_entries(context)
         if entries is None:
             books = await run_blocking(db_get_top_books, 20, 0)
             if not books:
+                if use_private_draft:
+                    await _ensure_private_top_status_message()
                 await _edit_progress_or_reply(progress_message, target_message, MESSAGES[lang]["top_empty"])
                 return
 
@@ -560,12 +733,36 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_cached_top_entries(context, entries)
 
         if not entries:
+            if use_private_draft and callable(hold_private_draft_status_fn):
+                try:
+                    await hold_private_draft_status_fn("draft_top_books", draft_top_started_at)
+                except Exception:
+                    pass
+            if use_private_draft:
+                await _ensure_private_top_status_message()
+            if use_private_draft and callable(hold_private_search_presentation_fn):
+                try:
+                    await hold_private_search_presentation_fn(draft_top_started_at)
+                except Exception:
+                    pass
             await _edit_progress_or_reply(progress_message, target_message, MESSAGES[lang]["top_empty"])
             return
 
         query_id = cache_top_results(context, entries)
         text, page_entries, pages = build_top_text(entries, 0, lang)
         reply_markup = build_top_keyboard(page_entries, 0, pages, query_id)
+        if use_private_draft:
+            await _ensure_private_top_status_message()
+        if use_private_draft and callable(hold_private_draft_status_fn):
+            try:
+                await hold_private_draft_status_fn("draft_top_books", draft_top_started_at)
+            except Exception:
+                pass
+        if use_private_draft and callable(hold_private_search_presentation_fn):
+            try:
+                await hold_private_search_presentation_fn(draft_top_started_at)
+            except Exception:
+                pass
         await _edit_progress_or_reply(progress_message, target_message, text, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"/top failed: {e}", exc_info=True)
@@ -702,6 +899,13 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     ab_request_count = 0
             can_rename_books_fn = globals().get("can_rename_books")
             can_rename_book = bool(callable(can_rename_books_fn) and can_rename_books_fn(query.from_user.id) and not is_group_chat)
+            reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
+            get_reaction_policy_fn = globals().get("db_get_book_reaction_policy")
+            if bool(is_owner_user and not is_group_chat) and callable(get_reaction_policy_fn):
+                try:
+                    reaction_policy = await run_blocking(get_reaction_policy_fn, book_id) or reaction_policy
+                except Exception:
+                    reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
             await query.message.edit_caption(
                 caption=build_book_caption(book, downloads, fav_count, counts),
                 reply_markup=build_book_keyboard(
@@ -711,6 +915,7 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     user_reaction,
                     can_delete,
                     can_rename_book,
+                    bool(is_owner_user and not is_group_chat),
                     lang,
                     has_audiobook=has_ab,
                     can_add_audiobook=can_add_ab,
@@ -718,7 +923,10 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     audiobook_request_count=ab_request_count,
                     show_personal_state=not is_group_chat,
                     show_favorite_button=not is_group_chat,
+                    show_comments_button=not is_group_chat,
                     more_books_url=more_books_url,
+                    reactions_locked=bool(reaction_policy.get("reactions_locked")),
+                    dislikes_disabled=bool(reaction_policy.get("dislikes_disabled")),
                 ),
             )
         elif book and inline_message_id:
@@ -739,7 +947,6 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
             audio_book = await run_blocking(get_audio_book_for_book, book_id)
             has_ab = bool(audio_book)
             can_add_ab = False
-            is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
             show_listen_btn = False
             await context.bot.edit_message_caption(
                 inline_message_id=inline_message_id,
@@ -751,6 +958,7 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     user_reaction,
                     can_delete,
                     False,
+                    False,
                     lang,
                     has_audiobook=has_ab,
                     can_add_audiobook=False,
@@ -758,6 +966,7 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     audiobook_request_count=0,
                     show_personal_state=not is_group_chat,
                     show_favorite_button=False,
+                    show_comments_button=False,
                     more_books_url=more_books_url,
                 ),
             )
@@ -786,6 +995,30 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
 
     if reaction not in REACTION_EMOJI:
         await safe_answer(query, "Error", show_alert=True)
+        return
+    is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
+    get_reaction_policy_fn = globals().get("db_get_book_reaction_policy")
+    if callable(get_reaction_policy_fn):
+        try:
+            reaction_policy = await run_blocking(get_reaction_policy_fn, book_id) or {}
+        except Exception as policy_error:
+            logger.warning("Failed to load reaction policy for %s: %s", book_id, policy_error, exc_info=True)
+            reaction_policy = {}
+    else:
+        reaction_policy = {}
+    if bool(reaction_policy.get("reactions_locked")) and not is_owner_user:
+        await safe_answer(
+            query,
+            MESSAGES[lang].get("book_reactions_locked_user", "Reactions are locked for this book."),
+            show_alert=True,
+        )
+        return
+    if reaction == "dislike" and bool(reaction_policy.get("dislikes_disabled")) and not is_owner_user:
+        await safe_answer(
+            query,
+            MESSAGES[lang].get("book_dislikes_disabled_user", "Dislikes are disabled for this book."),
+            show_alert=True,
+        )
         return
 
     reaction_emojis = {
@@ -824,6 +1057,7 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
             state_seq=reaction_state_seq,
         )
         _invalidate_top_caches(context)
+        raw_counts = await run_blocking(db_get_book_reaction_counts, book_id, False)
         stats = await run_blocking(db_get_book_stats, book_id)
         downloads = stats.get("downloads", 0)
         fav_count = stats.get("fav_count", 0)
@@ -834,9 +1068,28 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
             "whale": stats.get("whale", 0),
         }
         book = await run_blocking(db_get_book_by_id, book_id)
+        alert_coro = _maybe_send_negative_reaction_alert(
+            context,
+            book_id,
+            int((raw_counts or {}).get("dislike", 0) or 0),
+            book=book,
+        )
+        try:
+            app = getattr(context, "application", None)
+            if app and hasattr(app, "create_task"):
+                app.create_task(alert_coro)
+            else:
+                asyncio_mod = globals().get("asyncio")
+                if asyncio_mod and hasattr(asyncio_mod, "create_task"):
+                    asyncio_mod.create_task(alert_coro)
+                else:
+                    await alert_coro
+        except Exception as alert_error:
+            logger.warning("Failed to schedule negative-reaction alert for %s: %s", book_id, alert_error, exc_info=True)
         inline_message_id = getattr(query, "inline_message_id", None)
         guest_inline_delivery = bool(inline_message_id and not query.message)
         more_books_url = _guest_more_books_url(context) if guest_inline_delivery else None
+        more_books_label = MESSAGES["uz"].get("inline_more_books_button", "📚 Ko‘proq kitoblar") if guest_inline_delivery else None
         if book and query.message:
             user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
             is_fav_now = await run_blocking(is_favorited, query.from_user.id, book_id)
@@ -852,7 +1105,6 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     can_add_ab = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
                 except Exception:
                     can_add_ab = False
-            is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
             show_listen_btn = False if guest_inline_delivery else (has_ab if (is_group_chat or is_owner_user) else True)
             ab_request_count = 0
             if can_add_ab and is_owner_user and callable(globals().get("count_pending_audiobook_requests")):
@@ -862,6 +1114,12 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     ab_request_count = 0
             can_rename_books_fn = globals().get("can_rename_books")
             can_rename_book = bool(callable(can_rename_books_fn) and can_rename_books_fn(query.from_user.id) and not is_group_chat)
+            reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
+            if bool(is_owner_user and not is_group_chat) and callable(get_reaction_policy_fn):
+                try:
+                    reaction_policy = await run_blocking(get_reaction_policy_fn, book_id) or reaction_policy
+                except Exception:
+                    reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
             await query.message.edit_caption(
                 caption=build_book_caption(book, downloads, fav_count, counts),
                 reply_markup=build_book_keyboard(
@@ -871,14 +1129,19 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     user_reaction,
                     can_delete,
                     can_rename_book,
+                    bool(is_owner_user and not is_group_chat),
                     lang,
                     has_audiobook=has_ab,
                     can_add_audiobook=can_add_ab,
                     show_listen_button=show_listen_btn,
-                    audiobook_request_count=ab_request_count,
+                        audiobook_request_count=ab_request_count,
                     show_personal_state=not is_group_chat,
                     show_favorite_button=not is_group_chat,
                     more_books_url=more_books_url,
+                    more_books_label=more_books_label,
+                    show_comments_button=not is_group_chat,
+                    reactions_locked=bool(reaction_policy.get("reactions_locked")),
+                    dislikes_disabled=bool(reaction_policy.get("dislikes_disabled")),
                 ),
             )
         elif book and inline_message_id:
@@ -890,7 +1153,6 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
             audio_book = await run_blocking(get_audio_book_for_book, book_id)
             has_ab = bool(audio_book)
             can_add_ab = False
-            is_owner_user = bool(_is_owner_user(query.from_user.id)) if callable(globals().get("_is_owner_user")) else False
             show_listen_btn = False
             await context.bot.edit_message_caption(
                 inline_message_id=inline_message_id,
@@ -902,16 +1164,19 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     user_reaction,
                     can_delete,
                     False,
+                    False,
                     lang,
                     has_audiobook=has_ab,
                     can_add_audiobook=False,
                     show_listen_button=show_listen_btn,
-                    audiobook_request_count=0,
-                    show_personal_state=not is_group_chat,
-                    show_favorite_button=False,
-                    more_books_url=more_books_url,
-                ),
-            )
+                        audiobook_request_count=0,
+                        show_personal_state=not is_group_chat,
+                        show_favorite_button=False,
+                        show_comments_button=False,
+                        more_books_url=more_books_url,
+                        more_books_label=more_books_label,
+                    ),
+                )
         if guest_inline_delivery:
             await safe_answer(query, MESSAGES[lang].get("guest_reaction_saved", MESSAGES["en"].get("guest_reaction_saved", "Reaction saved")))
         else:

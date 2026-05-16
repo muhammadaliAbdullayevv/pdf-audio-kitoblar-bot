@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import hashlib
 import json
 import logging
@@ -83,6 +84,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
     except Exception:
         return bool(default)
+
+
+def _is_message_not_modified_error(exc: Exception) -> bool:
+    try:
+        return "message is not modified" in str(exc or "").lower()
+    except Exception:
+        return False
 
 
 def _audiobook_ffmpeg_time(seconds: float) -> str:
@@ -1768,6 +1776,742 @@ def build_results_keyboard(entries: list, page: int, pages: int, query_id: str):
     return InlineKeyboardMarkup(keyboard)
 
 
+def _entry_title_normalized(entry: dict) -> str:
+    return normalize(str((entry or {}).get("title") or "")).lower().strip()
+
+
+def build_forbidden_related_text(entries: list, lang: str, blocked_message: str | None = None):
+    total = len(entries)
+    header = MESSAGES[lang]["forbidden_books_related_header"].format(total=total)
+    lines = []
+    for idx, entry in enumerate(entries, start=1):
+        title = str(entry.get("title") or "").strip()
+        if len(title) > 88:
+            title = title[:85].rstrip() + "..."
+        lines.append(MESSAGES[lang]["results_item_line"].format(index=idx, title=title))
+        subtitle = str(entry.get("subtitle") or "").strip()
+        if subtitle:
+            lines.append(f"   {subtitle}")
+    body = "\n".join(lines).strip()
+    footer = MESSAGES[lang]["use_buttons"]
+    parts = [str(blocked_message or MESSAGES[lang]["forbidden_books_blocked"]).strip()]
+    if total > 0:
+        parts.extend(["", header, "", body, "", footer])
+    return "\n".join(part for part in parts if part is not None).strip()
+
+
+BOOK_COMMENTS_PAGE_SIZE = 30
+BOOK_COMMENT_MAX_TEXT = 500
+COMMENT_INBOX_PAGE_SIZE = 10
+COMMENT_INBOX_HISTORY_LIMIT = 15
+MY_COMMENTS_PAGE_SIZE = 10
+MY_CHATS_PAGE_SIZE = 10
+MY_CHAT_DETAIL_LIMIT = 6
+
+
+def _comment_timestamp_text(value: Any) -> str:
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(value)
+    return str(value or "").strip()
+
+
+def _comment_html_excerpt(text: str, limit: int = 220) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    if len(cleaned) > limit:
+        cleaned = cleaned[: max(1, limit - 3)].rstrip() + "..."
+    return html.escape(cleaned)
+
+
+def _comment_identity_text(user: dict | None) -> str:
+    if not user:
+        return "User"
+    first = str((user or {}).get("first_name") or "").strip()
+    last = str((user or {}).get("last_name") or "").strip()
+    username = str((user or {}).get("username") or "").strip()
+    full_name = " ".join(part for part in (first, last) if part).strip()
+    if full_name and username:
+        return f"{full_name} (@{username})"
+    if full_name:
+        return full_name
+    if username:
+        return f"@{username}"
+    return f"User {(user or {}).get('id')}"
+
+
+async def _comment_author_label(comment: dict, viewer_user_id: int | None, lang: str, can_manage: bool) -> str:
+    alias_number = int((comment or {}).get("alias_number") or 0)
+    alias_label = MESSAGES[lang].get("comments_author_alias", "Anon #{number}").format(number=max(1, alias_number or 1))
+    owner_user_id = int((comment or {}).get("user_id") or 0)
+    if owner_user_id and viewer_user_id and int(viewer_user_id) == owner_user_id:
+        return MESSAGES[lang].get("comments_author_you", "{alias} (you)").format(alias=alias_label)
+    can_show_identity = bool(can_manage)
+    if not can_show_identity and owner_user_id and viewer_user_id:
+        can_view_fn = globals().get("db_viewer_can_see_book_comment_identity")
+        if callable(can_view_fn):
+            try:
+                can_show_identity = bool(await run_blocking(can_view_fn, str((comment or {}).get("id") or ""), int(viewer_user_id)))
+            except Exception:
+                can_show_identity = False
+    if not can_show_identity:
+        return alias_label
+    user = None
+    try:
+        user = await run_blocking(get_user, owner_user_id) if owner_user_id else None
+    except Exception:
+        user = None
+    identity_text = _comment_identity_text(user)
+    return MESSAGES[lang].get("comments_author_revealed", "{alias} • {identity}").format(alias=alias_label, identity=identity_text)
+
+
+def _comment_board_author_name(comment: dict, lang: str) -> str:
+    first_name = str((comment or {}).get("first_name") or "").strip()
+    username = str((comment or {}).get("username") or "").strip().lstrip("@")
+    if first_name:
+        return first_name
+    if username:
+        return f"@{username}"
+    return MESSAGES[lang].get("comments_author_unknown", "User")
+
+
+async def _build_book_comments_panel(book_id: str, viewer_user_id: int, lang: str, page: int, can_manage: bool) -> tuple[str, InlineKeyboardMarkup | None]:
+    get_book_comment_count_fn = globals().get("db_get_book_comment_count")
+    get_book_comment_thread_count_fn = globals().get("db_get_book_comment_thread_count")
+    list_threads_fn = globals().get("db_list_book_comment_threads")
+    if not callable(get_book_comment_count_fn) or not callable(get_book_comment_thread_count_fn) or not callable(list_threads_fn):
+        return MESSAGES[lang]["error"], None
+    book = await run_blocking(db_get_book_by_id, book_id)
+    if not book:
+        return MESSAGES[lang]["book_not_found"], None
+    total_threads = int(await run_blocking(get_book_comment_thread_count_fn, book_id) or 0)
+    pages = max(1, int(math.ceil(total_threads / BOOK_COMMENTS_PAGE_SIZE))) if total_threads else 1
+    safe_page = max(0, min(int(page or 0), pages - 1))
+    offset = safe_page * BOOK_COMMENTS_PAGE_SIZE
+    threads = list(await run_blocking(list_threads_fn, book_id, BOOK_COMMENTS_PAGE_SIZE, offset) or [])
+
+    lines = [
+        MESSAGES[lang].get("comments_panel_title", "💬 Comments for {title}").format(title=html.escape(get_display_name(book))),
+        MESSAGES[lang].get("comments_panel_meta", "Comments: {total} • Threads: {threads} • Page {page}/{pages}").format(
+            total=total_threads,
+            threads=total_threads,
+            page=safe_page + 1,
+            pages=pages,
+        ),
+        "",
+    ]
+    if not threads:
+        lines.append(MESSAGES[lang].get("comments_panel_empty", "No comments yet. Be the first to write one."))
+    for index, thread in enumerate(threads, start=1):
+        author = _comment_board_author_name(thread, lang)
+        lines.append(f"<b>{index}. {html.escape(author)}</b>")
+        lines.append(f"<blockquote>{_comment_html_excerpt(str(thread.get('text') or ''), 90)}</blockquote>")
+        reply_count = int(thread.get("reply_count") or 0)
+        if reply_count > 0:
+            lines.append(MESSAGES[lang].get("comments_reply_count", "Replies: {count}").format(count=reply_count))
+        lines.append("")
+    lines.append(MESSAGES[lang].get("comments_panel_footer", "👇 Use the buttons below to open a thread or leave your comment."))
+
+    rows: list[list[InlineKeyboardButton]] = []
+    number_row: list[InlineKeyboardButton] = []
+    for index, thread in enumerate(threads, start=1):
+        number_row.append(InlineKeyboardButton(str(index), callback_data=f"commentthread:{thread.get('id')}"))
+        if len(number_row) == 5:
+            rows.append(number_row)
+            number_row = []
+    if number_row:
+        rows.append(number_row)
+    nav_row: list[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav_row.append(InlineKeyboardButton(MESSAGES[lang].get("comments_prev_page", "⬅️ Prev"), callback_data=f"bookcomments:{book_id}:{safe_page - 1}"))
+    if safe_page < pages - 1:
+        nav_row.append(InlineKeyboardButton(MESSAGES[lang].get("comments_next_page", "Next ➡️"), callback_data=f"bookcomments:{book_id}:{safe_page + 1}"))
+    if nav_row:
+        rows.append(nav_row)
+    rows.append(
+        [
+            InlineKeyboardButton(MESSAGES[lang].get("comments_add_button", "✍️ Add comment"), callback_data=f"commentadd:{book_id}:{safe_page}"),
+            InlineKeyboardButton(MESSAGES[lang].get("comments_refresh_button", "↻ Refresh"), callback_data=f"bookcomments:{book_id}:{safe_page}"),
+        ]
+    )
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(rows)
+
+
+async def _build_book_comment_thread_view(
+    book_id: str,
+    comment_id: str,
+    viewer_user_id: int,
+    lang: str,
+    can_manage: bool,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    get_comment_fn = globals().get("db_get_book_comment_by_id")
+    if not callable(get_comment_fn):
+        return MESSAGES[lang]["error"], None
+    book = await run_blocking(db_get_book_by_id, book_id)
+    comment = await run_blocking(get_comment_fn, comment_id)
+    if not book or not comment or str(comment.get("book_id") or "") != str(book_id):
+        return MESSAGES[lang]["page_expired"], None
+    author = _comment_board_author_name(comment, lang)
+    reply_count = int(comment.get("reply_count") or 0)
+    lines = [
+        MESSAGES[lang].get("comments_detail_title", "💬 Comment for {title}").format(title=html.escape(get_display_name(book))),
+        "",
+        f"<b>{html.escape(author)}</b> • <code>{_comment_timestamp_text(comment.get('created_at'))}</code>",
+        f"<blockquote>{html.escape(str(comment.get('text') or '').strip())}</blockquote>",
+    ]
+    if reply_count > 0:
+        lines.extend(["", MESSAGES[lang].get("comments_reply_count", "Replies: {count}").format(count=reply_count)])
+    lines.extend(["", MESSAGES[lang].get("comments_detail_footer", "👇 Reply to this comment or report it from the buttons below.")])
+
+    rows: list[list[InlineKeyboardButton]] = []
+    comment_key = str(comment.get("id") or "").strip()
+    comment_owner_user_id = int(comment.get("user_id") or 0)
+    viewer_is_comment_owner = bool(comment_owner_user_id and int(viewer_user_id or 0) == comment_owner_user_id)
+    comment_owner_banned = False
+    is_banned_fn = globals().get("db_is_book_comment_banned")
+    if callable(is_banned_fn) and comment_owner_user_id:
+        try:
+            comment_owner_banned = bool(await run_blocking(is_banned_fn, comment_owner_user_id))
+        except Exception:
+            comment_owner_banned = False
+    action_row: list[InlineKeyboardButton] = []
+    if comment_owner_user_id and not viewer_is_comment_owner:
+        action_row.append(
+            InlineKeyboardButton(
+                MESSAGES[lang].get("comments_reply_button", "↩️ Reply"),
+                callback_data=f"commentreply:{comment_key}",
+            )
+        )
+        action_row.append(
+            InlineKeyboardButton(
+                MESSAGES[lang].get("comments_report_button", "⚠️ Report"),
+                callback_data=f"commentreport:{comment_key}",
+            )
+        )
+    elif viewer_is_comment_owner:
+        action_row.append(
+            InlineKeyboardButton(
+                MESSAGES[lang].get("comments_delete_own_button", "🗑️ Delete my comment"),
+                callback_data=f"commentmod:{comment_key}:selfdelete",
+            )
+        )
+    if action_row:
+        rows.append(action_row)
+    if can_manage and not viewer_is_comment_owner:
+        manage_row: list[InlineKeyboardButton] = [
+            InlineKeyboardButton(
+                MESSAGES[lang].get("comments_delete_button", "🗑️ Delete"),
+                callback_data=f"commentmod:{comment_key}:delete",
+            )
+        ]
+        if comment_owner_user_id and not viewer_is_comment_owner:
+            manage_row.append(
+                InlineKeyboardButton(
+                    MESSAGES[lang].get(
+                        "comments_unblock_user_button" if comment_owner_banned else "comments_block_user_button",
+                        "✅ Unblock comments" if comment_owner_banned else "🚫 Block comments",
+                    ),
+                    callback_data=f"commentmod:{comment_key}:banuser",
+                )
+            )
+        rows.append(manage_row)
+    rows.append(
+        [
+            InlineKeyboardButton(MESSAGES[lang].get("comments_back_button", "⬅️ All comments"), callback_data=f"bookcomments:{book_id}:0"),
+        ]
+    )
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(rows)
+
+
+async def _build_my_comments_panel(viewer_user_id: int, lang: str, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    summary_fn = globals().get("db_get_user_book_comment_summary")
+    list_comments_fn = globals().get("db_list_user_book_comments")
+    if not callable(summary_fn) or not callable(list_comments_fn):
+        return MESSAGES[lang]["error"], None
+    summary = await run_blocking(summary_fn, viewer_user_id) or {}
+    total_comments = int(summary.get("total_comments") or 0)
+    pages = max(1, int(math.ceil(total_comments / MY_COMMENTS_PAGE_SIZE))) if total_comments else 1
+    safe_page = max(0, min(int(page or 0), pages - 1))
+    offset = safe_page * MY_COMMENTS_PAGE_SIZE
+    comments = list(await run_blocking(list_comments_fn, viewer_user_id, MY_COMMENTS_PAGE_SIZE, offset) or [])
+
+    lines = [
+        MESSAGES[lang].get("my_comments_list_title", "💬 My Book Comments"),
+        MESSAGES[lang].get(
+            "my_comments_list_meta",
+            "Comments: {total} • Page {page}/{pages}",
+        ).format(total=total_comments, page=safe_page + 1, pages=pages),
+        "",
+    ]
+    if not comments:
+        lines.append(MESSAGES[lang].get("my_comments_list_empty", "You have not written any comments yet."))
+    for index, comment in enumerate(comments, start=1):
+        book_title = str(comment.get("book_title") or comment.get("book_id") or "book").strip()
+        lines.append(f"{index}. <b>{html.escape(book_title)}</b>")
+        lines.append(f"<blockquote>{_comment_html_excerpt(str(comment.get('text') or ''), 110)}</blockquote>")
+        lines.append("")
+    lines.append(MESSAGES[lang].get("my_comments_list_footer", "👇 Choose one of your comments below."))
+
+    rows: list[list[InlineKeyboardButton]] = []
+    number_row: list[InlineKeyboardButton] = []
+    for index, comment in enumerate(comments, start=1):
+        number_row.append(
+            InlineKeyboardButton(str(index), callback_data=f"mycommentview:{str(comment.get('id') or '')}:{safe_page}")
+        )
+        if len(number_row) == 5:
+            rows.append(number_row)
+            number_row = []
+    if number_row:
+        rows.append(number_row)
+    nav_row: list[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav_row.append(
+            InlineKeyboardButton(MESSAGES[lang].get("comments_prev_page", "⬅️ Prev"), callback_data=f"mycomments:{safe_page - 1}")
+        )
+    if safe_page < pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(MESSAGES[lang].get("comments_next_page", "Next ➡️"), callback_data=f"mycomments:{safe_page + 1}")
+        )
+    if nav_row:
+        rows.append(nav_row)
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _build_my_comment_detail_view(comment_id: str, viewer_user_id: int, lang: str, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    get_comment_fn = globals().get("db_get_book_comment_by_id")
+    if not callable(get_comment_fn):
+        return MESSAGES[lang]["error"], None
+    comment = await run_blocking(get_comment_fn, comment_id)
+    if not comment or int(comment.get("user_id") or 0) != int(viewer_user_id or 0):
+        return MESSAGES[lang].get("page_expired", "Expired"), None
+    book = await run_blocking(db_get_book_by_id, str(comment.get("book_id") or ""))
+    book_title = get_display_name(book) if book else str(comment.get("book_id") or "book")
+    is_reply = bool(str(comment.get("parent_comment_id") or "").strip())
+    lines = [
+        MESSAGES[lang].get("my_comments_detail_title", "💬 Your comment for {title}").format(title=html.escape(book_title)),
+        MESSAGES[lang].get(
+            "my_comments_item_header",
+            "{index}. {book_title}\n{kind} • {created_at}",
+        ).format(
+            index=1,
+            book_title=html.escape(book_title),
+            kind=MESSAGES[lang].get("my_comments_item_reply" if is_reply else "my_comments_item_comment", "Reply" if is_reply else "Comment"),
+            created_at=html.escape(_comment_timestamp_text(comment.get("created_at")) or "—"),
+        ),
+        f"<blockquote>{html.escape(str(comment.get('text') or '').strip())}</blockquote>",
+    ]
+    if not is_reply:
+        lines.append(
+            MESSAGES[lang].get("my_comments_item_replies", "Replies received: {count}").format(
+                count=int(comment.get("reply_count") or 0)
+            )
+        )
+    lines.extend(["", MESSAGES[lang].get("my_comments_detail_footer", "👇 You can edit or delete this comment.")])
+    rows = [
+        [
+            InlineKeyboardButton(
+                MESSAGES[lang].get("my_comments_edit_button", "✏️ Edit"),
+                callback_data=f"mycommentedit:{str(comment.get('id') or '')}:{max(0, int(page or 0))}",
+            ),
+            InlineKeyboardButton(
+                MESSAGES[lang].get("my_comments_delete_button", "🗑️ Delete"),
+                callback_data=f"mycommentdelete:{str(comment.get('id') or '')}:{max(0, int(page or 0))}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                MESSAGES[lang].get("my_comments_back_button", "⬅️ My comments"),
+                callback_data=f"mycomments:{max(0, int(page or 0))}",
+            )
+        ],
+    ]
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(rows)
+
+
+async def _build_my_chats_panel(viewer_user_id: int, lang: str, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    count_fn = globals().get("db_count_book_comment_relay_conversations_for_user")
+    list_fn = globals().get("db_list_book_comment_relay_conversations_for_user")
+    unread_fn = globals().get("db_get_book_comment_relay_unread_summary")
+    if not callable(count_fn) or not callable(list_fn) or not callable(unread_fn):
+        return MESSAGES[lang]["error"], None
+    total_chats = int(await run_blocking(count_fn, viewer_user_id) or 0)
+    unread = await run_blocking(unread_fn, viewer_user_id) or {}
+    unread_messages = int((unread or {}).get("unread_messages") or 0)
+    unread_conversations = int((unread or {}).get("unread_conversations") or 0)
+    pages = max(1, int(math.ceil(total_chats / MY_CHATS_PAGE_SIZE))) if total_chats else 1
+    safe_page = max(0, min(int(page or 0), pages - 1))
+    offset = safe_page * MY_CHATS_PAGE_SIZE
+    conversations = list(await run_blocking(list_fn, viewer_user_id, MY_CHATS_PAGE_SIZE, offset) or [])
+
+    lines = [
+        MESSAGES[lang].get("my_chats_title", "💬 My Comment Chats"),
+        MESSAGES[lang].get(
+            "my_chats_meta",
+            "Chats: {total} • Unread chats: {conversations} • Unread replies: {messages} • Page {page}/{pages}",
+        ).format(
+            total=total_chats,
+            conversations=unread_conversations,
+            messages=unread_messages,
+            page=safe_page + 1,
+            pages=pages,
+        ),
+        "",
+    ]
+    if not conversations:
+        lines.append(MESSAGES[lang].get("my_chats_empty", "You do not have any comment chats yet."))
+    for index, conversation in enumerate(conversations, start=1):
+        counterpart = _comment_counterpart_name(conversation)
+        unread_count = int(conversation.get("unread_count") or 0)
+        status_text = (
+            " (" + MESSAGES[lang].get("comments_inbox_unread_badge", "Unread: {count}").format(count=unread_count) + ")"
+            if unread_count > 0
+            else ""
+        )
+        lines.append(f"{index}. <b>{html.escape(counterpart)}{html.escape(status_text)}</b>")
+        lines.append(
+            MESSAGES[lang].get("my_chats_book_line", "📚 {title}").format(
+                title=html.escape(str(conversation.get("book_title") or conversation.get("book_id") or "book").strip())
+            )
+        )
+        lines.append(f"<blockquote>{_comment_relay_preview_text(conversation, lang, 100)}</blockquote>")
+        lines.append("")
+    lines.append(MESSAGES[lang].get("my_chats_footer", "👇 Choose one of your chats below."))
+
+    rows: list[list[InlineKeyboardButton]] = []
+    number_row: list[InlineKeyboardButton] = []
+    for index, conversation in enumerate(conversations, start=1):
+        number_row.append(
+            InlineKeyboardButton(str(index), callback_data=f"mychatview:{str(conversation.get('id') or '')}:{safe_page}")
+        )
+        if len(number_row) == 5:
+            rows.append(number_row)
+            number_row = []
+    if number_row:
+        rows.append(number_row)
+    nav_row: list[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav_row.append(
+            InlineKeyboardButton(MESSAGES[lang].get("comments_prev_page", "⬅️ Prev"), callback_data=f"mychats:{safe_page - 1}")
+        )
+    if safe_page < pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(MESSAGES[lang].get("comments_next_page", "Next ➡️"), callback_data=f"mychats:{safe_page + 1}")
+        )
+    if nav_row:
+        rows.append(nav_row)
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _build_closed_relay_conversation_notice(
+    conversation: dict,
+    viewer_user_id: int,
+    lang: str,
+    *,
+    back_callback: str,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    closed_by_user_id = int((conversation or {}).get("closed_by_user_id") or 0)
+    current_user_id = int(viewer_user_id or 0)
+    if not closed_by_user_id:
+        return MESSAGES[lang].get("page_expired", "Expired"), None
+    if current_user_id != closed_by_user_id and not conversation.get("closed_notified_at"):
+        acknowledge_fn = globals().get("db_acknowledge_book_comment_relay_closure")
+        if callable(acknowledge_fn):
+            try:
+                updated = await run_blocking(acknowledge_fn, str(conversation.get("id") or ""), current_user_id)
+                if updated:
+                    conversation = updated
+            except Exception:
+                logger.debug("Failed to acknowledge relay conversation closure", exc_info=True)
+        closed_by_user = await run_blocking(get_user, closed_by_user_id) if closed_by_user_id else None
+        closed_by_name = _comment_identity_text(closed_by_user)
+        text = MESSAGES[lang].get(
+            "my_chat_deleted_partner_notice",
+            "💬 This chat has been deleted and stopped by {name}.",
+        ).format(name=html.escape(closed_by_name))
+    elif current_user_id == closed_by_user_id:
+        text = MESSAGES[lang].get(
+            "my_chat_deleted_self_notice",
+            "🗑️ This chat has been deleted from your side.",
+        )
+    else:
+        text = MESSAGES[lang].get(
+            "my_chat_deleted_expired_notice",
+            "💬 This chat has already been closed.",
+        )
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(MESSAGES[lang].get("my_chats_back_button", "⬅️ My chats"), callback_data=back_callback)]]
+    )
+    return text, markup
+
+
+async def _build_my_chat_detail_view(conversation_id: str, viewer_user_id: int, lang: str, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    get_conversation_fn = globals().get("db_get_book_comment_relay_conversation")
+    list_messages_fn = globals().get("db_list_book_comment_relay_messages_for_user")
+    touch_seen_fn = globals().get("db_touch_book_comment_relay_last_seen")
+    if not callable(get_conversation_fn) or not callable(list_messages_fn) or not callable(touch_seen_fn):
+        return MESSAGES[lang]["error"], None
+    conversation = await run_blocking(get_conversation_fn, conversation_id)
+    if not conversation:
+        return MESSAGES[lang]["page_expired"], None
+    owner_user_id = int(conversation.get("comment_owner_user_id") or 0)
+    peer_user_id = int(conversation.get("peer_user_id") or 0)
+    if int(viewer_user_id or 0) not in {owner_user_id, peer_user_id}:
+        return MESSAGES[lang].get("not_authorized", "Not authorized"), None
+    if int(conversation.get("closed_by_user_id") or 0):
+        return await _build_closed_relay_conversation_notice(
+            conversation,
+            viewer_user_id,
+            lang,
+            back_callback=f"mychats:{max(0, int(page or 0))}",
+        )
+    await run_blocking(touch_seen_fn, conversation_id, viewer_user_id)
+    counterpart_user_id = peer_user_id if int(viewer_user_id or 0) == owner_user_id else owner_user_id
+    counterpart_user = await run_blocking(get_user, counterpart_user_id) if counterpart_user_id else None
+    counterpart_name = _comment_identity_text(counterpart_user)
+    book = await run_blocking(db_get_book_by_id, str(conversation.get("book_id") or ""))
+    messages = list(await run_blocking(list_messages_fn, conversation_id, viewer_user_id, MY_CHAT_DETAIL_LIMIT, 0) or [])
+
+    lines = [
+        MESSAGES[lang].get("my_chats_detail_title", "💬 Chat with {name}").format(name=html.escape(counterpart_name)),
+        MESSAGES[lang].get(
+            "my_chats_detail_book",
+            "📚 Book: {title}",
+        ).format(title=html.escape(get_display_name(book) if book else str(conversation.get("book_id") or "book"))),
+        "",
+    ]
+    if not messages:
+        lines.append(MESSAGES[lang].get("comments_conversation_empty", "No messages in this conversation yet."))
+    for message in messages:
+        direction = str(message.get("direction") or "").strip().lower()
+        sender_label = MESSAGES[lang].get("comments_conversation_you", "You") if direction == "outgoing" else counterpart_name
+        lines.append(f"<b>{html.escape(sender_label)}</b> • <code>{_comment_timestamp_text(message.get('created_at'))}</code>")
+        lines.append(f"<blockquote>{_comment_relay_preview_text(message, lang, 220)}</blockquote>")
+        lines.append("")
+    lines.append(MESSAGES[lang].get("my_chats_detail_footer", "👇 Reply to continue this chat."))
+    rows = [
+        [
+            InlineKeyboardButton(
+                MESSAGES[lang].get("comments_relay_reply_button", "↩️ Reply"),
+                callback_data=f"commentrelayreply:{conversation_id}",
+            ),
+            InlineKeyboardButton(
+                MESSAGES[lang].get("my_chats_delete_button", "🗑️ Delete chat"),
+                callback_data=f"mychatdelete:{conversation_id}:{max(0, int(page or 0))}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                MESSAGES[lang].get("my_chats_back_button", "⬅️ My chats"),
+                callback_data=f"mychats:{max(0, int(page or 0))}",
+            )
+        ],
+    ]
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(rows)
+
+
+def _comment_counterpart_name(conversation: dict) -> str:
+    first = str((conversation or {}).get("counterpart_first_name") or "").strip()
+    last = str((conversation or {}).get("counterpart_last_name") or "").strip()
+    username = str((conversation or {}).get("counterpart_username") or "").strip()
+    full_name = " ".join(part for part in (first, last) if part).strip()
+    if full_name and username:
+        return f"{full_name} (@{username})"
+    if full_name:
+        return full_name
+    if username:
+        return f"@{username}"
+    return "User"
+
+
+def _comment_message_type_label(message_type: str, lang: str) -> str:
+    key = str(message_type or "").strip().lower()
+    mapping = {
+        "text": MESSAGES[lang].get("comments_message_type_text", "Text"),
+        "photo": MESSAGES[lang].get("comments_message_type_photo", "Photo"),
+        "document": MESSAGES[lang].get("comments_message_type_document", "File"),
+        "audio": MESSAGES[lang].get("comments_message_type_audio", "Audio"),
+        "voice": MESSAGES[lang].get("comments_message_type_voice", "Voice"),
+        "video": MESSAGES[lang].get("comments_message_type_video", "Video"),
+    }
+    return mapping.get(key, key.title() or "Message")
+
+
+def _comment_relay_preview_text(item: dict, lang: str, limit: int = 90) -> str:
+    message_type = str((item or {}).get("last_message_type") or (item or {}).get("message_type") or "").strip().lower()
+    text = str((item or {}).get("last_message_text") or (item or {}).get("text") or "").strip()
+    caption = str((item or {}).get("last_message_caption") or (item or {}).get("caption") or "").strip()
+    if message_type == "text" and text:
+        return _comment_html_excerpt(text, limit)
+    content = caption or text
+    prefix = _comment_message_type_label(message_type, lang)
+    if content:
+        return html.escape(prefix) + ": " + _comment_html_excerpt(content, max(20, limit - len(prefix) - 2))
+    return html.escape(prefix)
+
+
+async def _build_comment_inbox_panel(viewer_user_id: int, lang: str, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    list_fn = globals().get("db_list_book_comment_relay_conversations_for_user")
+    count_fn = globals().get("db_count_book_comment_relay_conversations_for_user")
+    unread_fn = globals().get("db_get_book_comment_relay_unread_summary")
+    if not callable(list_fn) or not callable(count_fn) or not callable(unread_fn):
+        return MESSAGES[lang]["error"], None
+    total_conversations = int(await run_blocking(count_fn, viewer_user_id) or 0)
+    unread = await run_blocking(unread_fn, viewer_user_id) or {}
+    total_unread_messages = int((unread or {}).get("unread_messages") or 0)
+    total_unread_conversations = int((unread or {}).get("unread_conversations") or 0)
+    pages = max(1, int(math.ceil(total_conversations / COMMENT_INBOX_PAGE_SIZE))) if total_conversations else 1
+    safe_page = max(0, min(int(page or 0), pages - 1))
+    offset = safe_page * COMMENT_INBOX_PAGE_SIZE
+    conversations = list(await run_blocking(list_fn, viewer_user_id, COMMENT_INBOX_PAGE_SIZE, offset) or [])
+
+    lines = [
+        MESSAGES[lang].get("comments_inbox_title", "💬 Reply Inbox"),
+        MESSAGES[lang].get(
+            "comments_inbox_meta",
+            "Chats: {total} • Unread chats: {unread_conversations} • Unread replies: {unread_messages} • Page {page}/{pages}",
+        ).format(
+            total=total_conversations,
+            unread_conversations=total_unread_conversations,
+            unread_messages=total_unread_messages,
+            conversations=total_unread_conversations,
+            messages=total_unread_messages,
+            page=safe_page + 1,
+            pages=pages,
+        ),
+        "",
+    ]
+    if not conversations:
+        lines.append(MESSAGES[lang].get("comments_inbox_empty", "No active reply conversations yet."))
+    for index, conversation in enumerate(conversations, start=1):
+        counterpart = _comment_counterpart_name(conversation)
+        muted = bool(conversation.get("muted"))
+        unread_count = int(conversation.get("unread_count") or 0)
+        book_title = str(conversation.get("book_title") or conversation.get("book_id") or "book").strip()
+        last_at = _comment_timestamp_text(conversation.get("last_message_at") or conversation.get("updated_at") or conversation.get("created_at"))
+        status_bits: list[str] = []
+        if unread_count > 0:
+            status_bits.append(MESSAGES[lang].get("comments_inbox_unread_badge", "Unread: {count}").format(count=unread_count))
+        if muted:
+            status_bits.append(MESSAGES[lang].get("comments_muted_badge", "Muted"))
+        status_text = f" ({' • '.join(status_bits)})" if status_bits else ""
+        lines.append(f"<b>{index}. {html.escape(counterpart)}{html.escape(status_text)}</b>")
+        lines.append(MESSAGES[lang].get("comments_inbox_book_line", "📚 {title}").format(title=html.escape(book_title)))
+        lines.append(MESSAGES[lang].get("comments_inbox_last_line", "🕒 {time} • {preview}").format(
+            time=html.escape(last_at or "—"),
+            preview=_comment_relay_preview_text(conversation, lang),
+        ))
+        lines.append("")
+    lines.append(MESSAGES[lang].get("comments_inbox_footer", "👇 Open a conversation or refresh the inbox."))
+
+    rows: list[list[InlineKeyboardButton]] = []
+    number_row: list[InlineKeyboardButton] = []
+    for index, conversation in enumerate(conversations, start=1):
+        number_row.append(
+            InlineKeyboardButton(
+                str(index),
+                callback_data=f"commentconv:{str(conversation.get('id') or '')}:{safe_page}",
+            )
+        )
+        if len(number_row) == 5:
+            rows.append(number_row)
+            number_row = []
+    if number_row:
+        rows.append(number_row)
+    nav_row: list[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav_row.append(InlineKeyboardButton(MESSAGES[lang].get("comments_prev_page", "⬅️ Prev"), callback_data=f"commentinbox:{safe_page - 1}"))
+    if safe_page < pages - 1:
+        nav_row.append(InlineKeyboardButton(MESSAGES[lang].get("comments_next_page", "Next ➡️"), callback_data=f"commentinbox:{safe_page + 1}"))
+    if nav_row:
+        rows.append(nav_row)
+    rows.append(
+        [InlineKeyboardButton(MESSAGES[lang].get("comments_refresh_button", "↻ Refresh"), callback_data=f"commentinbox:{safe_page}")]
+    )
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(rows)
+
+
+async def _build_comment_conversation_view(
+    conversation_id: str,
+    viewer_user_id: int,
+    lang: str,
+    inbox_page: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    get_conversation_fn = globals().get("db_get_book_comment_relay_conversation")
+    get_state_fn = globals().get("db_get_book_comment_relay_participant_state")
+    list_messages_fn = globals().get("db_list_book_comment_relay_messages_for_user")
+    touch_seen_fn = globals().get("db_touch_book_comment_relay_last_seen")
+    if not callable(get_conversation_fn) or not callable(get_state_fn) or not callable(list_messages_fn) or not callable(touch_seen_fn):
+        return MESSAGES[lang]["error"], None
+    conversation = await run_blocking(get_conversation_fn, conversation_id)
+    if not conversation:
+        return MESSAGES[lang]["page_expired"], None
+    owner_user_id = int(conversation.get("comment_owner_user_id") or 0)
+    peer_user_id = int(conversation.get("peer_user_id") or 0)
+    if int(viewer_user_id or 0) not in {owner_user_id, peer_user_id}:
+        return MESSAGES[lang].get("not_authorized", "Not authorized"), None
+    if int(conversation.get("closed_by_user_id") or 0):
+        return await _build_closed_relay_conversation_notice(
+            conversation,
+            viewer_user_id,
+            lang,
+            back_callback=f"commentinbox:{max(0, int(inbox_page or 0))}",
+        )
+    await run_blocking(touch_seen_fn, conversation_id, viewer_user_id)
+    participant_state = await run_blocking(get_state_fn, conversation_id, viewer_user_id) or {}
+    counterpart_user_id = peer_user_id if int(viewer_user_id or 0) == owner_user_id else owner_user_id
+    counterpart_user = await run_blocking(get_user, counterpart_user_id) if counterpart_user_id else None
+    counterpart_name = _comment_identity_text(counterpart_user)
+    book = await run_blocking(db_get_book_by_id, str(conversation.get("book_id") or ""))
+    messages = list(await run_blocking(list_messages_fn, conversation_id, viewer_user_id, COMMENT_INBOX_HISTORY_LIMIT, 0) or [])
+    lines = [
+        MESSAGES[lang].get("comments_conversation_title", "💬 Conversation with {name}").format(name=html.escape(counterpart_name)),
+        MESSAGES[lang].get("comments_conversation_book", "📚 Book: {title}").format(
+            title=html.escape(get_display_name(book) if book else str(conversation.get("book_id") or "book"))
+        ),
+    ]
+    if bool(participant_state.get("muted")):
+        lines.append(MESSAGES[lang].get("comments_conversation_muted", "🔕 Notifications are muted for this conversation."))
+    lines.append("")
+    if not messages:
+        lines.append(MESSAGES[lang].get("comments_conversation_empty", "No messages in this conversation yet."))
+    for message in messages:
+        direction = str(message.get("direction") or "").strip().lower()
+        sender_label = (
+            MESSAGES[lang].get("comments_conversation_you", "You")
+            if direction == "outgoing"
+            else counterpart_name
+        )
+        lines.append(f"<b>{html.escape(sender_label)}</b> • <code>{_comment_timestamp_text(message.get('created_at'))}</code>")
+        lines.append(f"<blockquote>{_comment_relay_preview_text(message, lang, 220)}</blockquote>")
+        lines.append("")
+    lines.append(MESSAGES[lang].get("comments_conversation_footer", "👇 Reply, mute, or go back to the inbox."))
+
+    muted = bool(participant_state.get("muted"))
+    rows = [
+        [
+            InlineKeyboardButton(
+                MESSAGES[lang].get("comments_relay_reply_button", "↩️ Reply"),
+                callback_data=f"commentrelayreply:{conversation_id}",
+            ),
+            InlineKeyboardButton(
+                MESSAGES[lang].get(
+                    "comments_conversation_unmute_button" if muted else "comments_conversation_mute_button",
+                    "🔔 Unmute" if muted else "🔕 Mute",
+                ),
+                callback_data=f"commentmute:{conversation_id}:{max(0, int(inbox_page or 0))}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                MESSAGES[lang].get("comments_back_to_inbox_button", "⬅️ Inbox"),
+                callback_data=f"commentinbox:{max(0, int(inbox_page or 0))}",
+            )
+        ],
+    ]
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(rows)
+
+
 def build_user_results_text(query: str, entries: list, page: int, lang: str):
     total = len(entries)
     pages = max(1, int(math.ceil(total / PAGE_SIZE)))
@@ -2027,17 +2771,27 @@ async def _edit_progress_or_reply(
     reply_markup=None,
     reply_to_message_id: int | None = None,
 ):
+    edit_failed = False
     if progress_message:
         for attempt in range(2):
             try:
                 await progress_message.edit_text(text, reply_markup=reply_markup)
                 return
             except Exception as e:
+                if "message is not modified" in str(e).lower():
+                    return
                 retry_after = getattr(e, "retry_after", None)
                 if retry_after is not None and attempt == 0:
                     await asyncio.sleep(float(retry_after or 1) + 0.5)
                     continue
+                edit_failed = True
                 break
+
+    if progress_message and edit_failed:
+        try:
+            await progress_message.delete()
+        except Exception:
+            pass
 
     for attempt in range(2):
         try:
@@ -2609,6 +3363,9 @@ async def handle_abook_audio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Capture audio/voice/document while an audiobook add flow is pending."""
     pending = context.user_data.get("pending_abook")
     logger.debug("handle_abook_audio called (pending=%s)", pending is not None)
+    if not pending and context.user_data.get("pending_comment_relay"):
+        if await handle_pending_comment_relay_message(update, context):
+            raise ApplicationHandlerStop()
     if not pending:
         logger.debug("handle_abook_audio: no pending audiobook flow, returning")
         return
@@ -3657,6 +4414,336 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await _reply_private_language_picker_again(update, context):
             return
 
+        pending_forbidden = context.user_data.get("pending_forbidden_books")
+        if pending_forbidden and callable(globals().get("_is_owner_user")) and _is_owner_user(update.effective_user.id):
+            expires_at = float((pending_forbidden or {}).get("expires_at", 0) or 0)
+            if time.time() > expires_at:
+                context.user_data.pop("pending_forbidden_books", None)
+            else:
+                owner_text = update.message.text.strip()
+                owner_text_lower = owner_text.lower()
+                if owner_text_lower in {"cancel", "stop", "/cancel"}:
+                    context.user_data.pop("pending_forbidden_books", None)
+                    await update.message.reply_text(MESSAGES[lang]["forbidden_books_cancelled"])
+                    return
+                mode = str((pending_forbidden or {}).get("mode") or "add").strip().lower()
+                if mode == "warning":
+                    if owner_text_lower in {"reset", "default"}:
+                        delete_setting_fn = globals().get("db_delete_bot_setting")
+                        if callable(delete_setting_fn):
+                            await run_blocking(delete_setting_fn, "forbidden_books_warning_text")
+                        context.user_data.pop("pending_forbidden_books", None)
+                        await update.message.reply_text(MESSAGES[lang]["forbidden_books_warning_reset"])
+                        return
+                    set_setting_fn = globals().get("db_set_bot_setting")
+                    if not callable(set_setting_fn):
+                        context.user_data.pop("pending_forbidden_books", None)
+                        await update.message.reply_text(MESSAGES[lang]["error"])
+                        return
+                    await run_blocking(set_setting_fn, "forbidden_books_warning_text", owner_text)
+                    context.user_data.pop("pending_forbidden_books", None)
+                    await update.message.reply_text(MESSAGES[lang]["forbidden_books_warning_saved"])
+                    return
+
+                entries: list[tuple[str, str]] = []
+                seen_forbidden_titles: set[str] = set()
+                for part in re.split(r"[\n,]+", owner_text):
+                    title = str(part or "").strip()
+                    if not title:
+                        continue
+                    normalized_title = normalize(title).lower().strip()
+                    if not normalized_title or normalized_title in seen_forbidden_titles:
+                        continue
+                    seen_forbidden_titles.add(normalized_title)
+                    entries.append((normalized_title, title))
+                if not entries:
+                    invalid_key = "forbidden_books_invalid" if mode == "add" else "forbidden_books_remove_invalid"
+                    await update.message.reply_text(MESSAGES[lang].get(invalid_key, MESSAGES[lang]["forbidden_books_invalid"]))
+                    return
+                if mode == "remove":
+                    remove_forbidden_fn = globals().get("db_remove_forbidden_books")
+                    if not callable(remove_forbidden_fn):
+                        context.user_data.pop("pending_forbidden_books", None)
+                        await update.message.reply_text(MESSAGES[lang]["error"])
+                        return
+                    removed_count = int(await run_blocking(remove_forbidden_fn, [normalized_title for normalized_title, _title in entries]) or 0)
+                    context.user_data.pop("pending_forbidden_books", None)
+                    if removed_count <= 0:
+                        await update.message.reply_text(MESSAGES[lang]["forbidden_books_remove_none"])
+                        return
+                    await update.message.reply_text(MESSAGES[lang]["forbidden_books_removed"].format(count=removed_count))
+                    return
+                save_forbidden_fn = globals().get("db_upsert_forbidden_books")
+                if callable(save_forbidden_fn):
+                    await run_blocking(save_forbidden_fn, entries, update.effective_user.id)
+                context.user_data.pop("pending_forbidden_books", None)
+                await update.message.reply_text(MESSAGES[lang]["forbidden_books_saved"].format(count=len(entries)))
+                return
+
+        pending_forbidden_until = float(context.user_data.get("awaiting_forbidden_books_input_until") or 0)
+        if pending_forbidden_until and callable(globals().get("_is_owner_user")) and _is_owner_user(update.effective_user.id):
+            if time.time() > pending_forbidden_until:
+                context.user_data.pop("awaiting_forbidden_books_input_until", None)
+            else:
+                owner_text = update.message.text.strip()
+                if owner_text.lower() in {"cancel", "stop"}:
+                    context.user_data.pop("awaiting_forbidden_books_input_until", None)
+                    await update.message.reply_text(MESSAGES[lang]["forbidden_books_cancelled"])
+                    return
+                entries: list[tuple[str, str]] = []
+                seen_forbidden_titles: set[str] = set()
+                for part in re.split(r"[\n,]+", owner_text):
+                    title = str(part or "").strip()
+                    if not title:
+                        continue
+                    normalized_title = normalize(title).lower().strip()
+                    if not normalized_title or normalized_title in seen_forbidden_titles:
+                        continue
+                    seen_forbidden_titles.add(normalized_title)
+                    entries.append((normalized_title, title))
+                if not entries:
+                    await update.message.reply_text(MESSAGES[lang]["forbidden_books_invalid"])
+                    return
+                save_forbidden_fn = globals().get("db_upsert_forbidden_books")
+                if callable(save_forbidden_fn):
+                    await run_blocking(save_forbidden_fn, entries, update.effective_user.id)
+                context.user_data.pop("awaiting_forbidden_books_input_until", None)
+                await update.message.reply_text(MESSAGES[lang]["forbidden_books_saved"].format(count=len(entries)))
+                return
+
+        pending_seedbookstats = context.user_data.get("pending_seedbookstats")
+        if pending_seedbookstats and callable(globals().get("_is_owner_user")) and _is_owner_user(update.effective_user.id):
+            if time.time() > float((pending_seedbookstats or {}).get("expires_at", 0) or 0):
+                context.user_data.pop("pending_seedbookstats", None)
+            else:
+                owner_text = update.message.text.strip()
+                if owner_text.lower() in {"cancel", "stop", "/cancel"}:
+                    context.user_data.pop("pending_seedbookstats", None)
+                    await update.message.reply_text(
+                        MESSAGES[lang].get(
+                            "seedbookstats_cancelled",
+                            "✖️ Random stats input cancelled.",
+                        )
+                    )
+                    return
+                parse_ranges_fn = globals().get("_parse_seedbookstats_ranges")
+                seed_fn = globals().get("db_seed_all_book_display_stats_randomly")
+                if not callable(parse_ranges_fn) or not callable(seed_fn):
+                    context.user_data.pop("pending_seedbookstats", None)
+                    await update.message.reply_text(MESSAGES[lang]["error"])
+                    return
+                ranges = parse_ranges_fn(owner_text.split())
+                if not ranges:
+                    await update.message.reply_text(MESSAGES[lang]["seedbookstats_invalid"], parse_mode="HTML")
+                    return
+                result = await run_blocking(
+                    seed_fn,
+                    download_min=ranges["downloads"][0],
+                    download_max=ranges["downloads"][1],
+                    favorite_min=ranges["favorites"][0],
+                    favorite_max=ranges["favorites"][1],
+                    positive_min=ranges["positive"][0],
+                    positive_max=ranges["positive"][1],
+                    negative_min=ranges["negative"][0],
+                    negative_max=ranges["negative"][1],
+                    editor_user_id=update.effective_user.id,
+                )
+                context.user_data.pop("pending_seedbookstats", None)
+                await update.message.reply_text(
+                    MESSAGES[lang].get(
+                        "seedbookstats_done",
+                        "✅ Random display stats applied.\nBooks: {books}\nDownloads: {download_min}-{download_max}\nFavorites: {favorite_min}-{favorite_max}\nPositive reactions: {positive_min}-{positive_max}\nNegative reactions: {negative_min}-{negative_max}",
+                    ).format(
+                        books=int((result or {}).get("books", 0) or 0),
+                        download_min=int((result or {}).get("download_min", 20) or 20),
+                        download_max=int((result or {}).get("download_max", 50) or 50),
+                        favorite_min=int((result or {}).get("favorite_min", 10) or 10),
+                        favorite_max=int((result or {}).get("favorite_max", 60) or 60),
+                        positive_min=int((result or {}).get("positive_min", 10) or 10),
+                        positive_max=int((result or {}).get("positive_max", 60) or 60),
+                        negative_min=int((result or {}).get("negative_min", 0) or 0),
+                        negative_max=int((result or {}).get("negative_max", 10) or 10),
+                    )
+                )
+                return
+
+        pending_relay = context.user_data.get("pending_comment_relay")
+        if pending_relay:
+            handled_relay = await handle_pending_comment_relay_message(update, context)
+            if handled_relay:
+                return
+
+        pending_comment = context.user_data.get("pending_book_comment")
+        if pending_comment:
+            if time.time() > float((pending_comment or {}).get("expires_at", 0) or 0):
+                context.user_data.pop("pending_book_comment", None)
+            else:
+                comment_text = update.message.text.strip()
+                mode = str((pending_comment or {}).get("mode") or "add").strip().lower()
+                if comment_text.lower() in {"cancel", "stop", "/cancel"}:
+                    context.user_data.pop("pending_book_comment", None)
+                    await update.message.reply_text(MESSAGES[lang].get("comments_cancelled", "✖️ Comment input cancelled."))
+                    return
+                if len(comment_text) > BOOK_COMMENT_MAX_TEXT:
+                    await update.message.reply_text(
+                        MESSAGES[lang].get(
+                            "comments_too_long",
+                            "⚠️ Comment is too long. Keep it within {limit} characters.",
+                        ).format(limit=BOOK_COMMENT_MAX_TEXT)
+                    )
+                    return
+                add_comment_fn = globals().get("db_add_book_comment")
+                comment_banned_fn = globals().get("db_is_book_comment_banned")
+                update_comment_fn = globals().get("db_update_book_comment_text")
+                if not callable(comment_banned_fn) or (mode == "edit" and not callable(update_comment_fn)) or (mode != "edit" and not callable(add_comment_fn)):
+                    context.user_data.pop("pending_book_comment", None)
+                    await update.message.reply_text(MESSAGES[lang]["error"])
+                    return
+                if await run_blocking(comment_banned_fn, update.effective_user.id):
+                    context.user_data.pop("pending_book_comment", None)
+                    await update.message.reply_text(MESSAGES[lang].get("comments_banned", "🚫 You are not allowed to comment right now."))
+                    return
+                book_id = str((pending_comment or {}).get("book_id") or "").strip()
+                parent_comment_id = str((pending_comment or {}).get("parent_comment_id") or "").strip() or None
+                comment_id = str((pending_comment or {}).get("comment_id") or "").strip()
+                created_comment = None
+                updated_comment = None
+                if mode == "edit":
+                    updated_comment = await run_blocking(update_comment_fn, comment_id, update.effective_user.id, comment_text)
+                else:
+                    created_comment = await run_blocking(add_comment_fn, book_id, update.effective_user.id, comment_text, parent_comment_id)
+                result_comment = updated_comment or created_comment
+                if not result_comment or str((result_comment or {}).get("error") or "") == "banned":
+                    context.user_data.pop("pending_book_comment", None)
+                    await update.message.reply_text(
+                        MESSAGES[lang].get(
+                            "my_comments_update_failed" if mode == "edit" else "comments_save_failed",
+                            "⚠️ Could not update your comment." if mode == "edit" else "⚠️ Could not save your comment. Please try again.",
+                        )
+                    )
+                    return
+                context.user_data.pop("pending_book_comment", None)
+
+                if created_comment:
+                    request_target_fn = globals().get("get_request_target_id")
+                    if callable(request_target_fn):
+                        report_target_id = request_target_fn()
+                        if report_target_id:
+                            try:
+                                book = await run_blocking(db_get_book_by_id, book_id)
+                                commenter = await run_blocking(get_user, update.effective_user.id)
+                                await context.bot.send_message(
+                                    chat_id=report_target_id,
+                                    text=MESSAGES["en"].get(
+                                        "comments_new_owner_notify",
+                                        "💬 New book comment\nBook: {title}\nUser: {commenter}\n\n<blockquote>{text}</blockquote>",
+                                    ).format(
+                                        title=html.escape(get_display_name(book) if book else str(book_id or "book")),
+                                        commenter=html.escape(_comment_identity_text(commenter)),
+                                        text=html.escape(str(created_comment.get("text") or comment_text or "").strip()),
+                                    ),
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                logger.debug("Failed to notify request target about new book comment", exc_info=True)
+
+                view_mode = str((pending_comment or {}).get("view_mode") or "panel").strip().lower()
+                source_chat_id = (pending_comment or {}).get("source_chat_id")
+                source_message_id = (pending_comment or {}).get("source_message_id")
+                parent_comment = None
+                if parent_comment_id:
+                    get_comment_fn = globals().get("db_get_book_comment_by_id")
+                    if callable(get_comment_fn):
+                        try:
+                            parent_comment = await run_blocking(get_comment_fn, parent_comment_id)
+                        except Exception:
+                            parent_comment = None
+                try:
+                    if source_chat_id and source_message_id:
+                        can_manage_comments = bool(
+                            (callable(globals().get("_is_owner_user")) and _is_owner_user(update.effective_user.id))
+                            or (callable(globals().get("_is_admin_user")) and _is_admin_user(update.effective_user.id))
+                        )
+                        if view_mode == "thread":
+                            root_comment_id = str((pending_comment or {}).get("root_comment_id") or "").strip()
+                            panel_text, panel_markup = await _build_book_comment_thread_view(
+                                book_id,
+                                root_comment_id,
+                                update.effective_user.id,
+                                lang,
+                                can_manage_comments,
+                            )
+                        elif view_mode == "mycomment_detail":
+                            page = int((pending_comment or {}).get("page") or 0)
+                            panel_text, panel_markup = await _build_my_comment_detail_view(
+                                comment_id,
+                                update.effective_user.id,
+                                lang,
+                                page,
+                            )
+                        else:
+                            page = int((pending_comment or {}).get("page") or 0)
+                            panel_text, panel_markup = await _build_book_comments_panel(
+                                book_id,
+                                update.effective_user.id,
+                                lang,
+                                page,
+                                can_manage_comments,
+                            )
+                        await context.bot.edit_message_text(
+                            chat_id=int(source_chat_id),
+                            message_id=int(source_message_id),
+                            text=panel_text,
+                            reply_markup=panel_markup,
+                            parse_mode="HTML",
+                        )
+                except Exception:
+                    logger.debug("Failed to refresh comments panel after new comment", exc_info=True)
+
+                if parent_comment and created_comment:
+                    parent_owner_user_id = int((parent_comment or {}).get("user_id") or 0)
+                    if parent_owner_user_id and parent_owner_user_id != int(update.effective_user.id or 0):
+                        try:
+                            book = await run_blocking(db_get_book_by_id, book_id)
+                            target_user = await run_blocking(get_user, parent_owner_user_id)
+                            target_lang = str((target_user or {}).get("language") or "en").strip() or "en"
+                            replier_user = await run_blocking(get_user, int(created_comment.get("user_id") or 0))
+                            reply_author = _comment_identity_text(replier_user)
+                            notify_text = MESSAGES[target_lang].get(
+                                "comments_reply_notification",
+                                "💬 {author} replied to your comment on <b>{title}</b>.\n\n<blockquote>{text}</blockquote>",
+                            ).format(
+                                title=html.escape(get_display_name(book) if book else "book"),
+                                author=html.escape(reply_author),
+                                text=html.escape(str(created_comment.get("text") or "")),
+                            )
+                            await context.bot.send_message(
+                                chat_id=parent_owner_user_id,
+                                text=notify_text,
+                                parse_mode="HTML",
+                                reply_markup=InlineKeyboardMarkup(
+                                    [
+                                        [
+                                            InlineKeyboardButton(
+                                                MESSAGES[target_lang].get("comments_open_thread_notify_button", "🧵 Open thread"),
+                                                callback_data=f"commentthread:{str((pending_comment or {}).get('root_comment_id') or parent_comment.get('root_comment_id') or parent_comment.get('id') or '').strip()}",
+                                            )
+                                        ]
+                                    ]
+                                ),
+                            )
+                        except Exception:
+                            logger.debug("Failed to notify parent commenter about reply", exc_info=True)
+
+                saved_message_key = "comments_reply_saved" if parent_comment_id else "comments_saved"
+                await update.message.reply_text(
+                    MESSAGES[lang].get(
+                        "my_comments_updated" if mode == "edit" else saved_message_key,
+                        "✅ Your comment was updated." if mode == "edit" else ("✅ Comment saved anonymously." if not parent_comment_id else "✅ Reply saved anonymously."),
+                    )
+                )
+                return
+
         menu_action = _main_menu_text_action(update.message.text.strip())
         if menu_action:
             await _cancel_menu_conflicting_flows(update, context, lang)
@@ -3952,6 +5039,129 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await update.message.reply_text(error_text)
                 return
 
+        pending_reaction_edit = context.user_data.get("pending_book_reaction_edit")
+        if pending_reaction_edit and callable(globals().get("_is_owner_user")) and _is_owner_user(update.effective_user.id):
+            if time.time() > float(pending_reaction_edit.get("expires_at", 0) or 0):
+                context.user_data.pop("pending_book_reaction_edit", None)
+            else:
+                reaction_text = update.message.text.strip()
+                if reaction_text.lower() in {"cancel", "stop", "/cancel"}:
+                    context.user_data.pop("pending_book_reaction_edit", None)
+                    await update.message.reply_text(
+                        MESSAGES[lang].get("book_reaction_edit_cancelled", "✖️ Reaction edit cancelled.")
+                    )
+                    return
+
+                parse_fn = globals().get("_parse_book_reaction_edit_input")
+                if not callable(parse_fn):
+                    context.user_data.pop("pending_book_reaction_edit", None)
+                    await update.message.reply_text(MESSAGES[lang]["error"])
+                    return
+
+                parsed_counts = parse_fn(reaction_text)
+                if not parsed_counts:
+                    await update.message.reply_text(
+                        MESSAGES[lang].get(
+                            "book_reaction_edit_invalid",
+                            "⚠️ Send four numbers in order: like dislike berry whale\nExample: 95 0 2 1",
+                        ),
+                        parse_mode="HTML",
+                    )
+                    return
+
+                book_id = str(pending_reaction_edit.get("book_id") or "").strip()
+                if not book_id:
+                    context.user_data.pop("pending_book_reaction_edit", None)
+                    await update.message.reply_text(MESSAGES[lang]["page_expired"])
+                    return
+
+                set_counts_fn = globals().get("db_set_book_reaction_display_counts")
+                if not callable(set_counts_fn):
+                    context.user_data.pop("pending_book_reaction_edit", None)
+                    await update.message.reply_text(MESSAGES[lang]["error"])
+                    return
+
+                await run_blocking(set_counts_fn, book_id, parsed_counts, update.effective_user.id)
+                context.user_data.pop("pending_book_reaction_edit", None)
+
+                source_chat_id = pending_reaction_edit.get("source_chat_id")
+                source_message_id = pending_reaction_edit.get("source_message_id")
+                try:
+                    book = await run_blocking(db_get_book_by_id, book_id)
+                    stats = await run_blocking(db_get_book_stats, book_id)
+                    if book and source_chat_id and source_message_id:
+                        counts = {
+                            "like": int(stats.get("like", 0) or 0),
+                            "dislike": int(stats.get("dislike", 0) or 0),
+                            "berry": int(stats.get("berry", 0) or 0),
+                            "whale": int(stats.get("whale", 0) or 0),
+                        }
+                        fav_count = int(stats.get("fav_count", 0) or 0)
+                        downloads = int(stats.get("downloads", 0) or 0)
+                        is_fav_now = bool(await run_blocking(is_favorited, update.effective_user.id, book_id))
+                        user_reaction = await run_blocking(db_get_user_reaction, book_id, update.effective_user.id)
+                        can_delete = bool(await can_delete_books(update.effective_user.id))
+                        can_rename_books_fn = globals().get("can_rename_books")
+                        can_rename_book = bool(callable(can_rename_books_fn) and can_rename_books_fn(update.effective_user.id))
+                        audio_book = await run_blocking(get_audio_book_for_book, book_id)
+                        has_ab = bool(audio_book)
+                        can_add_ab = False
+                        if callable(globals().get("is_audio_allowed")):
+                            try:
+                                can_add_ab = bool(await run_blocking(globals().get("is_audio_allowed"), update.effective_user.id))
+                            except Exception:
+                                can_add_ab = False
+                        ab_request_count = 0
+                        if can_add_ab and callable(globals().get("count_pending_audiobook_requests")):
+                            try:
+                                ab_request_count = await run_blocking(count_pending_audiobook_requests, book_id)
+                            except Exception:
+                                ab_request_count = 0
+                        reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
+                        get_reaction_policy_fn = globals().get("db_get_book_reaction_policy")
+                        if callable(get_reaction_policy_fn):
+                            try:
+                                reaction_policy = await run_blocking(get_reaction_policy_fn, book_id) or reaction_policy
+                            except Exception:
+                                reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
+                        await context.bot.edit_message_caption(
+                            chat_id=int(source_chat_id),
+                            message_id=int(source_message_id),
+                            caption=build_book_caption(book, downloads, fav_count, counts),
+                            reply_markup=build_book_keyboard(
+                                book_id,
+                                counts,
+                                is_fav_now,
+                                user_reaction,
+                                can_delete,
+                                can_rename_book,
+                                True,
+                                lang,
+                                has_audiobook=has_ab,
+                                can_add_audiobook=can_add_ab,
+                                show_listen_button=has_ab if _is_owner_user(update.effective_user.id) else True,
+                                audiobook_request_count=ab_request_count,
+                                show_comments_button=True,
+                                reactions_locked=bool(reaction_policy.get("reactions_locked")),
+                                dislikes_disabled=bool(reaction_policy.get("dislikes_disabled")),
+                            ),
+                        )
+                except Exception:
+                    logger.debug("Failed to refresh book card after reaction edit", exc_info=True)
+
+                await update.message.reply_text(
+                    MESSAGES[lang].get(
+                        "book_reaction_edit_done",
+                        "✅ Reactions updated: 👍 {like}  👎 {dislike}  🍓 {berry}  🐳 {whale}",
+                    ).format(
+                        like=int(parsed_counts["like"]),
+                        dislike=int(parsed_counts["dislike"]),
+                        berry=int(parsed_counts["berry"]),
+                        whale=int(parsed_counts["whale"]),
+                    )
+                )
+                return
+
         # Admin adding audiobook parts
         pending_abook = context.user_data.get("pending_abook")
         if pending_abook and _is_admin_user(update.effective_user.id):
@@ -4052,6 +5262,17 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not query:
             await update.message.reply_text(MESSAGES[lang]["enter_specific"])
             return
+        cleaned_query = normalize(query).lower()
+        if not cleaned_query:
+            await update.message.reply_text(MESSAGES[lang]["enter_specific"])
+            return
+        forbidden_title = None
+        get_forbidden_title_fn = globals().get("db_get_forbidden_book_title")
+        if callable(get_forbidden_title_fn):
+            try:
+                forbidden_title = await run_blocking(get_forbidden_title_fn, cleaned_query)
+            except Exception as e:
+                logger.warning("forbidden books lookup failed: %s", e)
         await _send_salute_reaction_for_message(update, context)
         try:
             progress_message = await update.message.reply_text(
@@ -4070,11 +5291,6 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("search analytics update failed: %s", e)
 
         _schedule_bg_task(context, _record_search_analytics())
-
-        cleaned_query = normalize(query).lower()
-        if not cleaned_query:
-            await update.message.reply_text(MESSAGES[lang]["enter_specific"])
-            return
         query_variants: list[str] = []
         for candidate in (cleaned_query, cleaned_query.replace("ʻ", "")):
             candidate = str(candidate or "").strip()
@@ -4189,6 +5405,84 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     MESSAGES[lang]["not_found"],
                     reply_markup=reply_markup,
                 )
+            return
+
+        if forbidden_title:
+            blocked_message = MESSAGES[lang]["forbidden_books_blocked"]
+            get_setting_fn = globals().get("db_get_bot_setting")
+            if callable(get_setting_fn):
+                try:
+                    custom_warning = str(await run_blocking(get_setting_fn, "forbidden_books_warning_text") or "").strip()
+                    if custom_warning:
+                        blocked_message = custom_warning
+                except Exception as e:
+                    logger.warning("forbidden books warning text load failed: %s", e)
+            forbidden_norms: set[str] = {cleaned_query}
+            list_forbidden_titles_fn = globals().get("db_list_forbidden_book_titles")
+            if callable(list_forbidden_titles_fn):
+                try:
+                    forbidden_norms.update(
+                        str(item or "").strip()
+                        for item in (await run_blocking(list_forbidden_titles_fn) or [])
+                        if str(item or "").strip()
+                    )
+                except Exception as e:
+                    logger.warning("forbidden books list load failed: %s", e)
+
+            def _is_safe_related_entry(entry: dict) -> bool:
+                title_norm = _entry_title_normalized(entry)
+                if not title_norm:
+                    return False
+                if title_norm in forbidden_norms:
+                    return False
+                if cleaned_query and (title_norm == cleaned_query or title_norm.startswith(cleaned_query + " ")):
+                    return False
+                for forbidden_norm in forbidden_norms:
+                    if forbidden_norm and title_norm.startswith(forbidden_norm + " "):
+                        return False
+                return True
+
+            related_entries = [entry for entry in entries if _is_safe_related_entry(entry)]
+            if not related_entries:
+                source_books = await run_blocking(load_books)
+                suggested_related = suggest_books(source_books, query_variants[0] if query_variants else cleaned_query, limit=12)
+                suggested_ids = [str(item.get("id") or "").strip() for item in suggested_related if str(item.get("id") or "").strip()]
+                if suggested_ids:
+                    book_map = {str((book or {}).get("id") or "").strip(): book for book in source_books if str((book or {}).get("id") or "").strip()}
+                    built_entries: list[dict] = []
+                    for suggested in suggested_related:
+                        book_id = str(suggested.get("id") or "").strip()
+                        book = book_map.get(book_id)
+                        if not book:
+                            continue
+                        built_entries.append(_build_book_entry(book, query, float(suggested.get("score") or 0.0)))
+                    related_entries = [entry for entry in built_entries if _is_safe_related_entry(entry)]
+
+            deduped_related: list[dict] = []
+            seen_related_keys: set[str] = set()
+            for entry in related_entries:
+                dedupe_key = _book_entry_dedupe_key(entry) or str(entry.get("id") or "")
+                if not dedupe_key or dedupe_key in seen_related_keys:
+                    continue
+                seen_related_keys.add(dedupe_key)
+                deduped_related.append(entry)
+            related_entries = deduped_related[:4]
+
+            if not related_entries:
+                await _edit_progress_or_reply(
+                    progress_message,
+                    update.message,
+                    blocked_message,
+                )
+                return
+
+            related_query_id = cache_search_results(context, query, related_entries)
+            await _edit_progress_or_reply(
+                progress_message,
+                update.message,
+                build_forbidden_related_text(related_entries, lang, blocked_message),
+                reply_markup=build_results_keyboard(related_entries, 0, 1, related_query_id),
+            )
             return
 
         # Cache results for paging
@@ -4385,11 +5679,9 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         local_path = book.get("path")
         file_id = book.get("file_id")
 
-        status_msg = None
         if not guest_inline_delivery:
             try:
                 await context.bot.send_chat_action(chat_id=query.message.chat_id, action="upload_document")
-                status_msg = await query.message.reply_text(MESSAGES[lang]["sending"])
             except Exception:
                 pass
 
@@ -4445,10 +5737,20 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
         can_rename_books_fn = globals().get("can_rename_books")
         can_rename_book = bool(callable(can_rename_books_fn) and can_rename_books_fn(query.from_user.id) and not is_group_chat)
         more_books_url = None
+        more_books_label = None
         if guest_inline_delivery:
             username = (getattr(context.bot, "username", None) or "pdf_audio_kitoblar_bot").strip("@")
             if username:
                 more_books_url = f"https://t.me/{username}"
+                more_books_label = MESSAGES["uz"].get("inline_more_books_button", "📚 Ko‘proq kitoblar")
+        reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
+        if bool(is_owner_user and not is_group_chat):
+            get_reaction_policy_fn = globals().get("db_get_book_reaction_policy")
+            if callable(get_reaction_policy_fn):
+                try:
+                    reaction_policy = await run_blocking(get_reaction_policy_fn, book_id) or reaction_policy
+                except Exception:
+                    reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
         reactions_kb = build_book_keyboard(
             book_id,
             counts,
@@ -4456,6 +5758,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             user_reaction,
             can_delete,
             can_rename_book,
+            bool(is_owner_user and not is_group_chat),
             lang,
             has_audiobook=has_ab,
             can_add_audiobook=can_add_ab,
@@ -4463,7 +5766,11 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             audiobook_request_count=ab_request_count,
             show_personal_state=not is_group_chat,
             show_favorite_button=not is_group_chat,
+            show_comments_button=not is_group_chat,
             more_books_url=more_books_url,
+            more_books_label=more_books_label,
+            reactions_locked=bool(reaction_policy.get("reactions_locked")),
+            dislikes_disabled=bool(reaction_policy.get("dislikes_disabled")),
         )
 
         if guest_inline_delivery:
@@ -4476,9 +5783,13 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                     sent_ok = bool(sent)
                 except Exception as e:
-                    logger.error(f"Failed guest inline delivery by file_id {file_id}: {e}")
                     text = str(e or "")
                     if "Chat_send_docs_forbidden" in text or "CHAT_SEND_DOCS_FORBIDDEN" in text:
+                        logger.warning(
+                            "Guest inline delivery forbidden by Telegram for file_id %s; switching to private handoff fallback: %s",
+                            file_id,
+                            e,
+                        )
                         if source_guest_chat_id:
                             mark_forbidden_fn = globals().get("db_mark_guest_group_delivery_forbidden")
                             if callable(mark_forbidden_fn):
@@ -4515,6 +5826,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                                 )
                         error_key = "guest_delivery_forbidden"
                     else:
+                        logger.error("Failed guest inline delivery by file_id %s: %s", file_id, e)
                         error_key = "book_unavailable_send_failed"
             else:
                 error_key = "book_unavailable_no_file"
@@ -4589,11 +5901,6 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             message = MESSAGES[lang].get(error_key, MESSAGES[lang]["book_unavailable"])
             if guest_inline_delivery:
                 await safe_answer(query, message, show_alert=True)
-            elif status_msg:
-                try:
-                    await status_msg.edit_text(message)
-                except Exception:
-                    await query.message.reply_text(message)
             else:
                 await query.message.reply_text(message)
 
@@ -4656,6 +5963,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             user_reaction,
                             can_delete,
                             False,
+                            False,
                             lang,
                             has_audiobook=has_ab2,
                             can_add_audiobook=False,
@@ -4663,7 +5971,9 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             audiobook_request_count=0,
                             show_personal_state=not is_group_chat,
                             show_favorite_button=False,
+                            show_comments_button=False,
                             more_books_url=more_books_url,
+                            more_books_label=MESSAGES["uz"].get("inline_more_books_button", "📚 Ko‘proq kitoblar") if guest_inline_delivery else None,
                         ),
                     )
                 elif sent:
@@ -4685,6 +5995,14 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             ab_request_count2 = await run_blocking(count_pending_audiobook_requests, book_id)
                         except Exception:
                             ab_request_count2 = 0
+                    reaction_policy2 = {"reactions_locked": False, "dislikes_disabled": False}
+                    if bool(is_owner_user2 and not is_group_chat):
+                        get_reaction_policy_fn2 = globals().get("db_get_book_reaction_policy")
+                        if callable(get_reaction_policy_fn2):
+                            try:
+                                reaction_policy2 = await run_blocking(get_reaction_policy_fn2, book_id) or reaction_policy2
+                            except Exception:
+                                reaction_policy2 = {"reactions_locked": False, "dislikes_disabled": False}
                     await sent.edit_caption(
                         caption=build_book_caption(book, new_downloads, fav_count, counts),
                         reply_markup=build_book_keyboard(
@@ -4694,6 +6012,7 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             user_reaction,
                             can_delete,
                             can_rename_book,
+                            bool(is_owner_user2 and not is_group_chat),
                             lang,
                             has_audiobook=has_ab2,
                             can_add_audiobook=can_add_ab2,
@@ -4701,16 +6020,13 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             audiobook_request_count=ab_request_count2,
                             show_personal_state=not is_group_chat,
                             show_favorite_button=not is_group_chat,
+                            show_comments_button=not is_group_chat,
+                            reactions_locked=bool(reaction_policy2.get("reactions_locked")),
+                            dislikes_disabled=bool(reaction_policy2.get("dislikes_disabled")),
                         ),
                     )
             except Exception as e:
                 logger.error(f"Failed to update book stats caption: {e}", exc_info=True)
-
-        if status_msg:
-            try:
-                await status_msg.edit_text(MESSAGES[lang]["sent"])
-            except Exception:
-                pass
 
     except Exception as e:
         logger.error(f"handle_book_selection failed: {e}", exc_info=True)
@@ -4789,6 +6105,1777 @@ async def handle_book_rename_callback(update: Update, context: ContextTypes.DEFA
         except Exception:
             pass
         raise
+
+
+def _parse_book_reaction_edit_input(text: str) -> dict[str, int] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    alias_map = {
+        "like": "like",
+        "likes": "like",
+        "👍": "like",
+        "dislike": "dislike",
+        "dislikes": "dislike",
+        "👎": "dislike",
+        "berry": "berry",
+        "berries": "berry",
+        "🍓": "berry",
+        "whale": "whale",
+        "whales": "whale",
+        "🐳": "whale",
+    }
+    parsed: dict[str, int] = {}
+    for key_raw, value_raw in re.findall(r"(like|likes|👍|dislike|dislikes|👎|berry|berries|🍓|whale|whales|🐳)\s*[:=]\s*(-?\d+)", raw, flags=re.IGNORECASE):
+        key = alias_map.get(str(key_raw).strip().lower(), alias_map.get(str(key_raw).strip(), ""))
+        if key:
+            parsed[key] = max(0, int(value_raw))
+    if len(parsed) == 4:
+        return {
+            "like": int(parsed["like"]),
+            "dislike": int(parsed["dislike"]),
+            "berry": int(parsed["berry"]),
+            "whale": int(parsed["whale"]),
+        }
+
+    numbers = re.findall(r"-?\d+", raw)
+    if len(numbers) == 4:
+        like, dislike, berry, whale = [max(0, int(part)) for part in numbers]
+        return {
+            "like": like,
+            "dislike": dislike,
+            "berry": berry,
+            "whale": whale,
+        }
+    return None
+
+
+async def handle_book_reaction_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        if not callable(globals().get("_is_owner_user")) or not _is_owner_user(query.from_user.id):
+            await safe_answer(query, MESSAGES[lang].get("owner_only", MESSAGES[lang].get("admin_only", "Owner only")), show_alert=True)
+            return
+        data = str(query.data or "")
+        if not data.startswith("bookreactedit:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if _is_group_chat(update):
+            await safe_answer(
+                query,
+                MESSAGES[lang].get(
+                    "book_reaction_edit_private_only",
+                    "🎛 Reaction editing is available only in private chat.",
+                ),
+                show_alert=True,
+            )
+            return
+        book_id = data.split(":", 1)[1].strip()
+        if not book_id:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        book = await run_blocking(db_get_book_by_id, book_id)
+        if not book:
+            await safe_answer(query, MESSAGES[lang]["book_not_found"], show_alert=True)
+            return
+        stats = await run_blocking(db_get_book_stats, book_id)
+        source_message = getattr(query, "message", None)
+        source_chat = getattr(source_message, "chat", None) if source_message else None
+        context.user_data["pending_book_reaction_edit"] = {
+            "book_id": book_id,
+            "source_chat_id": getattr(source_chat, "id", None),
+            "source_message_id": getattr(source_message, "message_id", None),
+            "expires_at": time.time() + 300,
+        }
+        prompt = MESSAGES[lang].get(
+            "book_reaction_edit_prompt",
+            "🎛 Send new reaction numbers for: {title}\nCurrent: 👍 {like}  👎 {dislike}  🍓 {berry}  🐳 {whale}\n\nSend either:\n95 0 2 1\nor\nlike=95 dislike=0 berry=2 whale=1\n\nSend /cancel to abort.",
+        ).format(
+            title=get_display_name(book),
+            like=int(stats.get("like", 0) or 0),
+            dislike=int(stats.get("dislike", 0) or 0),
+            berry=int(stats.get("berry", 0) or 0),
+            whale=int(stats.get("whale", 0) or 0),
+        )
+        try:
+            await query.message.reply_text(prompt, parse_mode="HTML")
+        except Exception:
+            pass
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_book_reaction_edit_callback failed: %s", e, exc_info=True)
+        try:
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        except Exception:
+            pass
+
+
+async def handle_book_reaction_policy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        if not callable(globals().get("_is_owner_user")) or not _is_owner_user(query.from_user.id):
+            await safe_answer(query, MESSAGES[lang].get("owner_only", MESSAGES[lang].get("admin_only", "Owner only")), show_alert=True)
+            return
+        data = str(query.data or "")
+        if not data.startswith("bookreactpolicy:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if _is_group_chat(update):
+            await safe_answer(
+                query,
+                MESSAGES[lang].get(
+                    "book_reaction_edit_private_only",
+                    "🎛 Reaction editing is available only in private chat.",
+                ),
+                show_alert=True,
+            )
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, book_id, action = parts
+        book_id = str(book_id or "").strip()
+        action = str(action or "").strip().lower()
+        if not book_id or action not in {"lock", "dislikes"}:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+
+        get_policy_fn = globals().get("db_get_book_reaction_policy")
+        set_policy_fn = globals().get("db_set_book_reaction_policy")
+        if not callable(get_policy_fn) or not callable(set_policy_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+
+        book = await run_blocking(db_get_book_by_id, book_id)
+        if not book:
+            await safe_answer(query, MESSAGES[lang]["book_not_found"], show_alert=True)
+            return
+
+        current_policy = await run_blocking(get_policy_fn, book_id) or {}
+        if action == "lock":
+            next_locked = not bool(current_policy.get("reactions_locked"))
+            updated_policy = await run_blocking(
+                set_policy_fn,
+                book_id,
+                reactions_locked=next_locked,
+                updated_by=query.from_user.id,
+            )
+            owner_message_key = "book_reactions_locked_owner" if next_locked else "book_reactions_unlocked_owner"
+        else:
+            next_dislikes_disabled = not bool(current_policy.get("dislikes_disabled"))
+            updated_policy = await run_blocking(
+                set_policy_fn,
+                book_id,
+                dislikes_disabled=next_dislikes_disabled,
+                updated_by=query.from_user.id,
+            )
+            owner_message_key = "book_dislikes_disabled_owner" if next_dislikes_disabled else "book_dislikes_enabled_owner"
+
+        stats = await run_blocking(db_get_book_stats, book_id)
+        counts = {
+            "like": int(stats.get("like", 0) or 0),
+            "dislike": int(stats.get("dislike", 0) or 0),
+            "berry": int(stats.get("berry", 0) or 0),
+            "whale": int(stats.get("whale", 0) or 0),
+        }
+        fav_count = int(stats.get("fav_count", 0) or 0)
+        downloads = int(stats.get("downloads", 0) or 0)
+        is_fav_now = bool(await run_blocking(is_favorited, query.from_user.id, book_id))
+        user_reaction = await run_blocking(db_get_user_reaction, book_id, query.from_user.id)
+        can_delete = bool(await can_delete_books(query.from_user.id))
+        can_rename_books_fn = globals().get("can_rename_books")
+        can_rename_book = bool(callable(can_rename_books_fn) and can_rename_books_fn(query.from_user.id))
+        audio_book = await run_blocking(get_audio_book_for_book, book_id)
+        has_ab = bool(audio_book)
+        can_add_ab = False
+        if callable(globals().get("is_audio_allowed")):
+            try:
+                can_add_ab = bool(await run_blocking(globals().get("is_audio_allowed"), query.from_user.id))
+            except Exception:
+                can_add_ab = False
+        ab_request_count = 0
+        if can_add_ab and callable(globals().get("count_pending_audiobook_requests")):
+            try:
+                ab_request_count = await run_blocking(count_pending_audiobook_requests, book_id)
+            except Exception:
+                ab_request_count = 0
+        await query.message.edit_caption(
+            caption=build_book_caption(book, downloads, fav_count, counts),
+            reply_markup=build_book_keyboard(
+                book_id,
+                counts,
+                is_fav_now,
+                user_reaction,
+                can_delete,
+                can_rename_book,
+                True,
+                lang,
+                has_audiobook=has_ab,
+                can_add_audiobook=can_add_ab,
+                show_listen_button=has_ab if _is_owner_user(query.from_user.id) else True,
+                audiobook_request_count=ab_request_count,
+                show_comments_button=True,
+                reactions_locked=bool(updated_policy.get("reactions_locked")),
+                dislikes_disabled=bool(updated_policy.get("dislikes_disabled")),
+            ),
+        )
+        await safe_answer(query, MESSAGES[lang][owner_message_key], show_alert=True)
+    except Exception as e:
+        logger.error("handle_book_reaction_policy_callback failed: %s", e, exc_info=True)
+        try:
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+        except Exception:
+            pass
+
+
+def _can_manage_comments_for_user(user_id: int | None) -> bool:
+    if not user_id:
+        return False
+    return bool(
+        (callable(globals().get("_is_owner_user")) and _is_owner_user(int(user_id)))
+        or (callable(globals().get("_is_admin_user")) and _is_admin_user(int(user_id)))
+    )
+
+
+def _build_comment_admin_ban_markup(user_id: int, lang: str, is_blocked: bool) -> InlineKeyboardMarkup:
+    button_text = MESSAGES[lang].get(
+        "comments_unblock_user_button" if is_blocked else "comments_block_user_button",
+        "✅ Unblock comments" if is_blocked else "🚫 Block from comments",
+    )
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(button_text, callback_data=f"commentuserban:{int(user_id)}")]]
+    )
+
+
+def _build_comment_relay_reply_markup(
+    conversation_id: str,
+    relay_message_id: str,
+    lang: str,
+    *,
+    is_blocked_for_recipient: bool = False,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    MESSAGES[lang].get("comments_relay_reply_button", "↩️ Reply"),
+                    callback_data=f"commentrelayreply:{conversation_id}",
+                ),
+                InlineKeyboardButton(
+                    MESSAGES[lang].get(
+                        "comments_relay_unblock_button" if is_blocked_for_recipient else "comments_relay_block_button",
+                        "✅ Unblock" if is_blocked_for_recipient else "🚫 Block",
+                    ),
+                    callback_data=f"commentrelayblock:{relay_message_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def _extract_comment_relay_payload(message) -> dict[str, Any] | None:
+    if not message:
+        return None
+    text = str(getattr(message, "text", "") or "").strip()
+    if text:
+        return {"message_type": "text", "text": text}
+    if getattr(message, "photo", None):
+        photo = message.photo[-1]
+        return {
+            "message_type": "photo",
+            "media_file_id": photo.file_id,
+            "media_file_unique_id": getattr(photo, "file_unique_id", None),
+            "caption": str(getattr(message, "caption", "") or "").strip() or None,
+        }
+    if getattr(message, "document", None):
+        document = message.document
+        return {
+            "message_type": "document",
+            "media_file_id": document.file_id,
+            "media_file_unique_id": getattr(document, "file_unique_id", None),
+            "caption": str(getattr(message, "caption", "") or "").strip() or None,
+        }
+    if getattr(message, "audio", None):
+        audio = message.audio
+        return {
+            "message_type": "audio",
+            "media_file_id": audio.file_id,
+            "media_file_unique_id": getattr(audio, "file_unique_id", None),
+            "caption": str(getattr(message, "caption", "") or "").strip() or None,
+        }
+    if getattr(message, "voice", None):
+        voice = message.voice
+        return {
+            "message_type": "voice",
+            "media_file_id": voice.file_id,
+            "media_file_unique_id": getattr(voice, "file_unique_id", None),
+            "caption": str(getattr(message, "caption", "") or "").strip() or None,
+        }
+    if getattr(message, "video", None):
+        video = message.video
+        return {
+            "message_type": "video",
+            "media_file_id": video.file_id,
+            "media_file_unique_id": getattr(video, "file_unique_id", None),
+            "caption": str(getattr(message, "caption", "") or "").strip() or None,
+        }
+    return None
+
+
+async def _send_comment_relay_delivery(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    conversation: dict,
+    recipient_user_id: int,
+    payload: dict[str, Any],
+) -> bool:
+    message = getattr(update, "message", None)
+    if not message:
+        return False
+    create_relay_message_fn = globals().get("db_create_book_comment_relay_message")
+    if not callable(create_relay_message_fn):
+        return False
+    sender_user_id = int(update.effective_user.id if update.effective_user else 0)
+    recipient_id = int(recipient_user_id or 0)
+    if not sender_user_id or not recipient_id:
+        return False
+    peer_block_fn = globals().get("db_is_book_comment_peer_blocked")
+    if callable(peer_block_fn):
+        try:
+            if await run_blocking(peer_block_fn, recipient_id, sender_user_id):
+                return False
+        except Exception:
+            logger.debug("Failed to check comment relay peer block before delivery", exc_info=True)
+    target_user = await run_blocking(get_user, recipient_id)
+    target_lang = str((target_user or {}).get("language") or "en").strip() or "en"
+    sender_user = await run_blocking(get_user, sender_user_id)
+    sender_label = _comment_identity_text(sender_user)
+    book = await run_blocking(db_get_book_by_id, str(conversation.get("book_id") or ""))
+    notification_header = MESSAGES[target_lang].get(
+        "comments_relay_notification_header",
+        "💬 {sender} replied to your comment on <b>{title}</b>.",
+    ).format(
+        sender=html.escape(sender_label),
+        title=html.escape(get_display_name(book) if book else "book"),
+    )
+    relay_row = await run_blocking(
+        create_relay_message_fn,
+        str(conversation.get("id") or ""),
+        sender_user_id,
+        recipient_id,
+        str(payload.get("message_type") or ""),
+        text=payload.get("text"),
+        caption=payload.get("caption"),
+        media_file_id=payload.get("media_file_id"),
+        media_file_unique_id=payload.get("media_file_unique_id"),
+    )
+    if not relay_row:
+        return False
+    participant_state_fn = globals().get("db_get_book_comment_relay_participant_state")
+    recipient_muted = False
+    if callable(participant_state_fn):
+        try:
+            recipient_state = await run_blocking(participant_state_fn, str(conversation.get("id") or ""), recipient_id) or {}
+            recipient_muted = bool(recipient_state.get("muted"))
+        except Exception:
+            recipient_muted = False
+    reply_markup = _build_comment_relay_reply_markup(
+        str(conversation.get("id") or ""),
+        str(relay_row.get("id") or ""),
+        target_lang,
+        is_blocked_for_recipient=False,
+    )
+    message_type = str(payload.get("message_type") or "").strip().lower()
+    body_text = str(payload.get("text") or payload.get("caption") or "").strip()
+
+    def _combined_html_text(limit: int | None = None) -> str:
+        combined = notification_header
+        if body_text:
+            combined += "\n\n<blockquote>" + html.escape(body_text) + "</blockquote>"
+        if limit and len(combined) > limit:
+            overhead = len(notification_header) + len("\n\n<blockquote></blockquote>")
+            available = max(0, limit - overhead - 3)
+            trimmed = body_text[:available].rstrip() + "..." if available and len(body_text) > available else body_text[:available]
+            combined = notification_header
+            if trimmed:
+                combined += "\n\n<blockquote>" + html.escape(trimmed) + "</blockquote>"
+        return combined
+
+    if recipient_muted:
+        return True
+    if message_type == "text":
+        await context.bot.send_message(
+            chat_id=recipient_id,
+            text=_combined_html_text(4096),
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+        return True
+    if message_type == "photo":
+        await context.bot.send_photo(
+            chat_id=recipient_id,
+            photo=str(payload.get("media_file_id") or ""),
+            caption=_combined_html_text(1024),
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+        return True
+    if message_type == "document":
+        await context.bot.send_document(
+            chat_id=recipient_id,
+            document=str(payload.get("media_file_id") or ""),
+            caption=_combined_html_text(1024),
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+        return True
+    if message_type == "audio":
+        await context.bot.send_audio(
+            chat_id=recipient_id,
+            audio=str(payload.get("media_file_id") or ""),
+            caption=_combined_html_text(1024),
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+        return True
+    if message_type == "voice":
+        await context.bot.send_voice(
+            chat_id=recipient_id,
+            voice=str(payload.get("media_file_id") or ""),
+            caption=_combined_html_text(1024),
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+        return True
+    if message_type == "video":
+        await context.bot.send_video(
+            chat_id=recipient_id,
+            video=str(payload.get("media_file_id") or ""),
+            caption=_combined_html_text(1024),
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+        return True
+    return False
+
+
+async def _set_pending_comment_relay(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    conversation: dict,
+    recipient_user_id: int,
+    lang: str,
+) -> None:
+    context.user_data["pending_comment_relay"] = {
+        "conversation_id": str(conversation.get("id") or ""),
+        "book_id": str(conversation.get("book_id") or ""),
+        "comment_id": str(conversation.get("comment_id") or ""),
+        "recipient_user_id": int(recipient_user_id or 0),
+        "expires_at": time.time() + 600,
+    }
+    await update.callback_query.message.reply_text(
+        MESSAGES[lang].get(
+            "comments_relay_prompt",
+            "✍️ Send your anonymous reply now.\nYou can send text, photo, file, audio, voice, or video.\nCancel: cancel",
+        )
+    )
+
+
+async def handle_pending_comment_relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    pending_relay = context.user_data.get("pending_comment_relay")
+    if not pending_relay:
+        return False
+    if time.time() > float((pending_relay or {}).get("expires_at", 0) or 0):
+        context.user_data.pop("pending_comment_relay", None)
+        return False
+    message = getattr(update, "message", None)
+    if not message:
+        return False
+    lang = ensure_user_language(update, context)
+    raw_text = str(getattr(message, "text", "") or "").strip()
+    if raw_text.lower() in {"cancel", "stop", "/cancel"}:
+        context.user_data.pop("pending_comment_relay", None)
+        await message.reply_text(MESSAGES[lang].get("comments_cancelled", "✖️ Comment input cancelled."))
+        return True
+    is_banned_fn = globals().get("db_is_book_comment_banned")
+    if callable(is_banned_fn) and await run_blocking(is_banned_fn, update.effective_user.id):
+        context.user_data.pop("pending_comment_relay", None)
+        await message.reply_text(MESSAGES[lang].get("comments_banned", "🚫 You are not allowed to comment right now."))
+        return True
+    payload = _extract_comment_relay_payload(message)
+    if not payload:
+        await message.reply_text(
+            MESSAGES[lang].get(
+                "comments_relay_unsupported",
+                "⚠️ Send text, photo, file, audio, voice, or video for this anonymous reply.",
+            )
+        )
+        return True
+    get_conversation_fn = globals().get("db_get_book_comment_relay_conversation")
+    if not callable(get_conversation_fn):
+        context.user_data.pop("pending_comment_relay", None)
+        await message.reply_text(MESSAGES[lang]["error"])
+        return True
+    conversation = await run_blocking(get_conversation_fn, str((pending_relay or {}).get("conversation_id") or ""))
+    if not conversation:
+        context.user_data.pop("pending_comment_relay", None)
+        await message.reply_text(MESSAGES[lang]["page_expired"])
+        return True
+    if int(conversation.get("closed_by_user_id") or 0):
+        context.user_data.pop("pending_comment_relay", None)
+        closed_by_user_id = int(conversation.get("closed_by_user_id") or 0)
+        if closed_by_user_id and closed_by_user_id != int(update.effective_user.id or 0):
+            acknowledge_fn = globals().get("db_acknowledge_book_comment_relay_closure")
+            if callable(acknowledge_fn):
+                try:
+                    await run_blocking(acknowledge_fn, str(conversation.get("id") or ""), int(update.effective_user.id or 0))
+                except Exception:
+                    logger.debug("Failed to acknowledge relay closure during pending send", exc_info=True)
+            closed_by_user = await run_blocking(get_user, closed_by_user_id) if closed_by_user_id else None
+            await message.reply_text(
+                MESSAGES[lang].get(
+                    "my_chat_deleted_partner_notice",
+                    "💬 This chat has been deleted and stopped by {name}.",
+                ).format(name=html.escape(_comment_identity_text(closed_by_user)))
+            )
+        else:
+            await message.reply_text(
+                MESSAGES[lang].get(
+                    "my_chat_deleted_self_notice",
+                    "🗑️ This chat has been deleted from your side.",
+                )
+            )
+        return True
+    recipient_user_id = int((pending_relay or {}).get("recipient_user_id") or 0)
+    if not recipient_user_id:
+        context.user_data.pop("pending_comment_relay", None)
+        await message.reply_text(MESSAGES[lang]["page_expired"])
+        return True
+    peer_block_fn = globals().get("db_is_book_comment_peer_blocked")
+    current_user_id = int(update.effective_user.id if update.effective_user else 0)
+    if callable(peer_block_fn) and await run_blocking(peer_block_fn, recipient_user_id, current_user_id):
+        context.user_data.pop("pending_comment_relay", None)
+        await message.reply_text(
+            MESSAGES[lang].get(
+                "comments_relay_blocked_by_user",
+                "🚫 This user is not accepting anonymous replies from you.",
+            )
+        )
+        return True
+    try:
+        delivered = await _send_comment_relay_delivery(update, context, conversation, recipient_user_id, payload)
+    except Exception as e:
+        logger.error("Anonymous comment relay delivery failed: %s", e, exc_info=True)
+        delivered = False
+    context.user_data.pop("pending_comment_relay", None)
+    if delivered:
+        await message.reply_text(MESSAGES[lang].get("comments_relay_sent", "✅ Anonymous reply sent."))
+    else:
+        await message.reply_text(MESSAGES[lang].get("comments_relay_failed", "⚠️ Could not send that anonymous reply."))
+    return True
+
+
+async def send_comments_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message or not update.effective_user:
+        return
+    if getattr(target_message.chat, "type", None) != "private":
+        await target_message.reply_text(
+            MESSAGES[lang].get("comments_private_only", "💬 Comments are available only in private chat.")
+        )
+        return
+    text, markup = await _build_comment_inbox_panel(int(update.effective_user.id or 0), lang, 0)
+    await target_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def handle_comment_inbox_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentinbox:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if getattr(query, "inline_message_id", None) or _is_group_chat(update):
+            await safe_answer(query, MESSAGES[lang].get("comments_private_only", "💬 Comments are available only in private chat."), show_alert=True)
+            return
+        _, page_str = data.split(":", 1)
+        page = int(page_str or 0)
+        text, markup = await _build_comment_inbox_panel(int(query.from_user.id or 0), lang, page)
+        try:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        except Exception as e:
+            if not _is_message_not_modified_error(e):
+                raise
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_comment_inbox_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_comment_conversation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentconv:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if getattr(query, "inline_message_id", None) or _is_group_chat(update):
+            await safe_answer(query, MESSAGES[lang].get("comments_private_only", "💬 Comments are available only in private chat."), show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, conversation_id, page_str = parts
+        page = int(page_str or 0)
+        text, markup = await _build_comment_conversation_view(conversation_id, int(query.from_user.id or 0), lang, page)
+        try:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        except Exception as e:
+            if not _is_message_not_modified_error(e):
+                raise
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_comment_conversation_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_comment_conversation_mute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentmute:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if getattr(query, "inline_message_id", None) or _is_group_chat(update):
+            await safe_answer(query, MESSAGES[lang].get("comments_private_only", "💬 Comments are available only in private chat."), show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, conversation_id, page_str = parts
+        inbox_page = int(page_str or 0)
+        get_state_fn = globals().get("db_get_book_comment_relay_participant_state")
+        set_muted_fn = globals().get("db_set_book_comment_relay_muted")
+        get_conversation_fn = globals().get("db_get_book_comment_relay_conversation")
+        if not callable(get_state_fn) or not callable(set_muted_fn) or not callable(get_conversation_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        conversation = await run_blocking(get_conversation_fn, conversation_id)
+        if not conversation:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        current_user_id = int(query.from_user.id or 0)
+        if current_user_id not in {
+            int(conversation.get("comment_owner_user_id") or 0),
+            int(conversation.get("peer_user_id") or 0),
+        }:
+            await safe_answer(query, MESSAGES[lang].get("not_authorized", "Not authorized"), show_alert=True)
+            return
+        state = await run_blocking(get_state_fn, conversation_id, current_user_id) or {}
+        muted = not bool(state.get("muted"))
+        await run_blocking(set_muted_fn, conversation_id, current_user_id, muted)
+        text, markup = await _build_comment_conversation_view(conversation_id, current_user_id, lang, inbox_page)
+        try:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        except Exception as e:
+            if not _is_message_not_modified_error(e):
+                raise
+        await safe_answer(
+            query,
+            MESSAGES[lang].get(
+                "comments_conversation_muted_done" if muted else "comments_conversation_unmuted_done",
+                "🔕 Conversation muted." if muted else "🔔 Conversation unmuted.",
+            ),
+            show_alert=True,
+        )
+    except Exception as e:
+        logger.error("handle_comment_conversation_mute_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def send_my_comments_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message or not update.effective_user:
+        return
+    if getattr(target_message.chat, "type", None) != "private":
+        await target_message.reply_text(
+            MESSAGES[lang].get("my_comments_private_only", "💬 This command is available only in private chat.")
+        )
+        return
+    if is_blocked(update.effective_user.id):
+        await target_message.reply_text(MESSAGES[lang]["blocked"])
+        return
+    if await is_stopped_user(update.effective_user.id):
+        return
+    limited, wait_s = spam_check_message(update, context)
+    if limited:
+        await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+        return
+    await update_user_info(update, context)
+    text, markup = await _build_my_comments_panel(int(update.effective_user.id or 0), lang, 0)
+    await target_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def send_my_chats_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message or not update.effective_user:
+        return
+    if getattr(target_message.chat, "type", None) != "private":
+        await target_message.reply_text(
+            MESSAGES[lang].get("my_chats_private_only", "💬 This command is available only in private chat.")
+        )
+        return
+    if is_blocked(update.effective_user.id):
+        await target_message.reply_text(MESSAGES[lang]["blocked"])
+        return
+    if await is_stopped_user(update.effective_user.id):
+        return
+    limited, wait_s = spam_check_message(update, context)
+    if limited:
+        await target_message.reply_text(MESSAGES[lang]["spam_wait"].format(seconds=wait_s))
+        return
+    await update_user_info(update, context)
+    text, markup = await _build_my_chats_panel(int(update.effective_user.id or 0), lang, 0)
+    await target_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def handle_my_comments_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("mycomments:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, page_str = data.split(":", 1)
+        page = int(page_str or 0)
+        text, markup = await _build_my_comments_panel(int(query.from_user.id or 0), lang, page)
+        try:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        except Exception as e:
+            if not _is_message_not_modified_error(e):
+                raise
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_my_comments_page_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_my_comment_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("mycommentview:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, comment_id, page_str = parts
+        page = int(page_str or 0)
+        text, markup = await _build_my_comment_detail_view(comment_id, int(query.from_user.id or 0), lang, page)
+        source_message = getattr(query, "message", None)
+        if source_message:
+            await source_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=markup, parse_mode="HTML")
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_my_comment_view_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_my_comment_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("mycommentedit:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, comment_id, page_str = parts
+        get_comment_fn = globals().get("db_get_book_comment_by_id")
+        if not callable(get_comment_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        comment = await run_blocking(get_comment_fn, comment_id)
+        if not comment or int(comment.get("user_id") or 0) != int(query.from_user.id or 0):
+            await safe_answer(query, MESSAGES[lang].get("not_authorized", "Not authorized"), show_alert=True)
+            return
+        book = await run_blocking(db_get_book_by_id, str(comment.get("book_id") or ""))
+        source_message = getattr(query, "message", None)
+        source_chat = getattr(source_message, "chat", None) if source_message else None
+        context.user_data["pending_book_comment"] = {
+            "mode": "edit",
+            "comment_id": str(comment.get("id") or ""),
+            "book_id": str(comment.get("book_id") or ""),
+            "view_mode": "mycomment_detail",
+            "page": int(page_str or 0),
+            "source_chat_id": getattr(source_chat, "id", None),
+            "source_message_id": getattr(source_message, "message_id", None),
+            "expires_at": time.time() + 300,
+        }
+        await query.message.reply_text(
+            MESSAGES[lang].get(
+                "my_comments_edit_prompt",
+                "✏️ Send the new text for your comment on <b>{title}</b>.\nCancel: /cancel",
+            ).format(title=html.escape(get_display_name(book) if book else "book")),
+            parse_mode="HTML",
+        )
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_my_comment_edit_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_my_comment_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("mycommentdelete:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, comment_id, page_str = parts
+        get_comment_fn = globals().get("db_get_book_comment_by_id")
+        delete_fn = globals().get("db_delete_book_comment")
+        if not callable(get_comment_fn) or not callable(delete_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        comment = await run_blocking(get_comment_fn, comment_id)
+        if not comment or int(comment.get("user_id") or 0) != int(query.from_user.id or 0):
+            await safe_answer(query, MESSAGES[lang].get("not_authorized", "Not authorized"), show_alert=True)
+            return
+        deleted = int(await run_blocking(delete_fn, comment_id, int(query.from_user.id or 0), "self_deleted_from_my_comments") or 0)
+        if deleted <= 0:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        result_text = MESSAGES[lang].get("my_comments_deleted", "🗑️ Your comment was deleted.")
+        result_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(MESSAGES[lang].get("my_comments_back_button", "⬅️ My comments"), callback_data=f"mycomments:{max(0, int(page_str or 0))}")]]
+        )
+        await query.edit_message_text(result_text, reply_markup=result_markup)
+        await safe_answer(query, result_text, show_alert=True)
+    except Exception as e:
+        logger.error("handle_my_comment_delete_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_my_chats_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("mychats:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, page_str = data.split(":", 1)
+        page = int(page_str or 0)
+        text, markup = await _build_my_chats_panel(int(query.from_user.id or 0), lang, page)
+        try:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        except Exception as e:
+            if not _is_message_not_modified_error(e):
+                raise
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_my_chats_page_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_my_chat_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("mychatview:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, conversation_id, page_str = parts
+        page = int(page_str or 0)
+        text, markup = await _build_my_chat_detail_view(conversation_id, int(query.from_user.id or 0), lang, page)
+        source_message = getattr(query, "message", None)
+        if source_message:
+            await source_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=markup, parse_mode="HTML")
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_my_chat_view_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_my_chat_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("mychatdelete:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, conversation_id, page_str = parts
+        get_conversation_fn = globals().get("db_get_book_comment_relay_conversation")
+        close_fn = globals().get("db_close_book_comment_relay_conversation")
+        if not callable(get_conversation_fn) or not callable(close_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        conversation = await run_blocking(get_conversation_fn, conversation_id)
+        if not conversation:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        current_user_id = int(query.from_user.id or 0)
+        if current_user_id not in {
+            int(conversation.get("comment_owner_user_id") or 0),
+            int(conversation.get("peer_user_id") or 0),
+        }:
+            await safe_answer(query, MESSAGES[lang].get("not_authorized", "Not authorized"), show_alert=True)
+            return
+        await run_blocking(close_fn, conversation_id, current_user_id)
+        deleted_text = MESSAGES[lang].get(
+            "my_chat_deleted_self_notice",
+            "🗑️ This chat has been deleted from your side.",
+        )
+        deleted_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(MESSAGES[lang].get("my_chats_back_button", "⬅️ My chats"), callback_data=f"mychats:{max(0, int(page_str or 0))}")]]
+        )
+        await query.edit_message_text(deleted_text, reply_markup=deleted_markup)
+        await safe_answer(query, deleted_text, show_alert=True)
+    except Exception as e:
+        logger.error("handle_my_chat_delete_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comments_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("bookcomments:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if getattr(query, "inline_message_id", None) or _is_group_chat(update):
+            await safe_answer(query, MESSAGES[lang].get("comments_private_only", "💬 Comments are available only in private chat."), show_alert=True)
+            return
+        _, book_id, page_str = data.split(":", 2)
+        page = int(page_str)
+        can_manage = _can_manage_comments_for_user(query.from_user.id)
+        panel_text, panel_markup = await _build_book_comments_panel(book_id, query.from_user.id, lang, page, can_manage)
+        source_message = getattr(query, "message", None)
+        if source_message and (getattr(source_message, "document", None) or getattr(source_message, "caption", None)):
+            await source_message.reply_text(panel_text, reply_markup=panel_markup, parse_mode="HTML")
+        else:
+            try:
+                await query.edit_message_text(panel_text, reply_markup=panel_markup, parse_mode="HTML")
+            except Exception as e:
+                if not _is_message_not_modified_error(e):
+                    raise
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_book_comments_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_thread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentthread:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if getattr(query, "inline_message_id", None) or _is_group_chat(update):
+            await safe_answer(query, MESSAGES[lang].get("comments_private_only", "💬 Comments are available only in private chat."), show_alert=True)
+            return
+        _, root_comment_id = data.split(":", 1)
+        get_comment_fn = globals().get("db_get_book_comment_by_id")
+        if not callable(get_comment_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        root_comment = await run_blocking(get_comment_fn, root_comment_id)
+        if not root_comment:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        book_id = str(root_comment.get("book_id") or "").strip()
+        if not book_id:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        can_manage = _can_manage_comments_for_user(query.from_user.id)
+        text, markup = await _build_book_comment_thread_view(book_id, root_comment_id, query.from_user.id, lang, can_manage)
+        source_message = getattr(query, "message", None)
+        if source_message:
+            await source_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=text,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_book_comment_thread_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentadd:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if getattr(query, "inline_message_id", None) or _is_group_chat(update):
+            await safe_answer(query, MESSAGES[lang].get("comments_private_only", "💬 Comments are available only in private chat."), show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, book_id, page_str = parts
+        page = int(page_str)
+        is_banned_fn = globals().get("db_is_book_comment_banned")
+        if callable(is_banned_fn) and await run_blocking(is_banned_fn, query.from_user.id):
+            await safe_answer(query, MESSAGES[lang].get("comments_banned", "🚫 You are not allowed to comment right now."), show_alert=True)
+            return
+        source_message = getattr(query, "message", None)
+        source_chat = getattr(source_message, "chat", None) if source_message else None
+        context.user_data["pending_book_comment"] = {
+            "mode": "add",
+            "book_id": str(book_id),
+            "view_mode": "panel",
+            "page": page,
+            "source_chat_id": getattr(source_chat, "id", None),
+            "source_message_id": getattr(source_message, "message_id", None),
+            "expires_at": time.time() + 300,
+        }
+        book = await run_blocking(db_get_book_by_id, book_id)
+        await query.message.reply_text(
+            MESSAGES[lang].get(
+                "comments_prompt_add",
+                "✍️ Write your comment for <b>{title}</b>.\nIt will appear anonymously.\nCancel: /cancel",
+            ).format(title=html.escape(get_display_name(book) if book else "book")),
+            parse_mode="HTML",
+        )
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_book_comment_add_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentreply:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if getattr(query, "inline_message_id", None) or _is_group_chat(update):
+            await safe_answer(query, MESSAGES[lang].get("comments_private_only", "💬 Comments are available only in private chat."), show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 2:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, parent_comment_id = parts
+        is_banned_fn = globals().get("db_is_book_comment_banned")
+        if callable(is_banned_fn) and await run_blocking(is_banned_fn, query.from_user.id):
+            await safe_answer(query, MESSAGES[lang].get("comments_banned", "🚫 You are not allowed to comment right now."), show_alert=True)
+            return
+        get_comment_fn = globals().get("db_get_book_comment_by_id")
+        create_conversation_fn = globals().get("db_get_or_create_book_comment_relay_conversation")
+        parent_comment = await run_blocking(get_comment_fn, parent_comment_id) if callable(get_comment_fn) else None
+        if not parent_comment or not callable(create_conversation_fn):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        comment_owner_user_id = int(parent_comment.get("user_id") or 0)
+        if comment_owner_user_id == int(query.from_user.id or 0):
+            await safe_answer(
+                query,
+                MESSAGES[lang].get("comments_identity_request_self", "ℹ️ This is your own comment."),
+                show_alert=True,
+            )
+            return
+        peer_block_fn = globals().get("db_is_book_comment_peer_blocked")
+        if callable(peer_block_fn) and await run_blocking(peer_block_fn, comment_owner_user_id, query.from_user.id):
+            await safe_answer(
+                query,
+                MESSAGES[lang].get(
+                    "comments_relay_blocked_by_user",
+                    "🚫 This user is not accepting anonymous replies from you.",
+                ),
+                show_alert=True,
+            )
+            return
+        conversation = await run_blocking(create_conversation_fn, parent_comment_id, query.from_user.id)
+        if not conversation:
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        await _set_pending_comment_relay(
+            update,
+            context,
+            conversation=conversation,
+            recipient_user_id=comment_owner_user_id,
+            lang=lang,
+        )
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_book_comment_reply_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_relay_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentrelayreply:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, conversation_id = data.split(":", 1)
+        get_conversation_fn = globals().get("db_get_book_comment_relay_conversation")
+        if not callable(get_conversation_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        conversation = await run_blocking(get_conversation_fn, conversation_id)
+        if not conversation:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        if int(conversation.get("closed_by_user_id") or 0):
+            current_user_id = int(query.from_user.id or 0)
+            closed_by_user_id = int(conversation.get("closed_by_user_id") or 0)
+            if closed_by_user_id and closed_by_user_id != current_user_id:
+                acknowledge_fn = globals().get("db_acknowledge_book_comment_relay_closure")
+                if callable(acknowledge_fn):
+                    try:
+                        await run_blocking(acknowledge_fn, conversation_id, current_user_id)
+                    except Exception:
+                        logger.debug("Failed to acknowledge relay closure from reply callback", exc_info=True)
+                closed_by_user = await run_blocking(get_user, closed_by_user_id) if closed_by_user_id else None
+                await safe_answer(
+                    query,
+                    MESSAGES[lang].get(
+                        "my_chat_deleted_partner_notice",
+                        "💬 This chat has been deleted and stopped by {name}.",
+                    ).format(name=_comment_identity_text(closed_by_user)),
+                    show_alert=True,
+                )
+            else:
+                await safe_answer(
+                    query,
+                    MESSAGES[lang].get(
+                        "my_chat_deleted_self_notice",
+                        "🗑️ This chat has been deleted from your side.",
+                    ),
+                    show_alert=True,
+                )
+            return
+        is_banned_fn = globals().get("db_is_book_comment_banned")
+        if callable(is_banned_fn) and await run_blocking(is_banned_fn, query.from_user.id):
+            await safe_answer(query, MESSAGES[lang].get("comments_banned", "🚫 You are not allowed to comment right now."), show_alert=True)
+            return
+        owner_user_id = int(conversation.get("comment_owner_user_id") or 0)
+        peer_user_id = int(conversation.get("peer_user_id") or 0)
+        current_user_id = int(query.from_user.id or 0)
+        if current_user_id == owner_user_id:
+            recipient_user_id = peer_user_id
+        elif current_user_id == peer_user_id:
+            recipient_user_id = owner_user_id
+        else:
+            await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
+            return
+        touch_seen_fn = globals().get("db_touch_book_comment_relay_last_seen")
+        if callable(touch_seen_fn):
+            try:
+                await run_blocking(touch_seen_fn, conversation_id, current_user_id)
+            except Exception:
+                logger.debug("Failed to mark relay conversation seen from reply callback", exc_info=True)
+        peer_block_fn = globals().get("db_is_book_comment_peer_blocked")
+        if callable(peer_block_fn) and await run_blocking(peer_block_fn, recipient_user_id, current_user_id):
+            await safe_answer(
+                query,
+                MESSAGES[lang].get(
+                    "comments_relay_blocked_by_user",
+                    "🚫 This user is not accepting anonymous replies from you.",
+                ),
+                show_alert=True,
+            )
+            return
+        await _set_pending_comment_relay(
+            update,
+            context,
+            conversation=conversation,
+            recipient_user_id=recipient_user_id,
+            lang=lang,
+        )
+        await safe_answer(query)
+    except Exception as e:
+        logger.error("handle_book_comment_relay_reply_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_identity_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentwho:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, comment_id = data.split(":", 1)
+        get_comment_fn = globals().get("db_get_book_comment_by_id")
+        create_request_fn = globals().get("db_create_book_comment_identity_request")
+        if not callable(get_comment_fn) or not callable(create_request_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        comment = await run_blocking(get_comment_fn, comment_id)
+        if not comment or str(comment.get("status") or "") != "active":
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        commenter_id = int(comment.get("user_id") or 0)
+        if commenter_id == int(query.from_user.id or 0):
+            await safe_answer(query, MESSAGES[lang].get("comments_identity_request_self", "ℹ️ This is your own comment."), show_alert=True)
+            return
+        can_view_identity_fn = globals().get("db_viewer_can_see_book_comment_identity")
+        can_view_identity = False
+        if callable(can_view_identity_fn):
+            try:
+                can_view_identity = bool(await run_blocking(can_view_identity_fn, comment_id, query.from_user.id))
+            except Exception:
+                can_view_identity = False
+        if can_view_identity:
+            identity_text = _comment_identity_text(await run_blocking(get_user, commenter_id) if commenter_id else None)
+            await safe_answer(
+                query,
+                MESSAGES[lang].get("comments_identity_already_visible", "👤 Identity is already visible: {identity}").format(identity=identity_text),
+                show_alert=True,
+            )
+            return
+        request_row = await run_blocking(create_request_fn, comment_id, query.from_user.id)
+        if not request_row:
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        request_status = str(request_row.get("status") or "").strip().lower()
+        if request_status == "approved":
+            commenter = await run_blocking(get_user, int(request_row.get("commenter_user_id") or 0))
+            await safe_answer(
+                query,
+                MESSAGES[lang].get("comments_identity_already_visible", "👤 Identity is already visible: {identity}").format(identity=_comment_identity_text(commenter)),
+                show_alert=True,
+            )
+            return
+        if request_status == "pending" and bool(request_row.get("is_existing")):
+            await safe_answer(query, MESSAGES[lang].get("comments_identity_request_pending", "⏳ That identity request is already pending."), show_alert=True)
+            return
+        if request_status == "pending":
+            commenter_id = int(request_row.get("commenter_user_id") or 0)
+            commenter_user = await run_blocking(get_user, commenter_id) if commenter_id else None
+            commenter_lang = str((commenter_user or {}).get("language") or "en").strip() or "en"
+            requester_user = await run_blocking(get_user, query.from_user.id)
+            requester_name = _comment_identity_text(requester_user)
+            book = await run_blocking(db_get_book_by_id, str(comment.get("book_id") or ""))
+            prompt_text = MESSAGES[commenter_lang].get(
+                "comments_identity_request_incoming",
+                "👤 {requester} wants to know who wrote your comment on <b>{title}</b>.\n\n<blockquote>{text}</blockquote>",
+            ).format(
+                requester=html.escape(requester_name),
+                title=html.escape(get_display_name(book) if book else "book"),
+                text=html.escape(str(comment.get("text") or "")),
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=commenter_id,
+                    text=prompt_text,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(MESSAGES[commenter_lang].get("comments_identity_approve_button", "✅ Allow"), callback_data=f"commentreveal:{request_row.get('id')}:approve"),
+                                InlineKeyboardButton(MESSAGES[commenter_lang].get("comments_identity_reject_button", "❌ Reject"), callback_data=f"commentreveal:{request_row.get('id')}:reject"),
+                            ]
+                        ]
+                    ),
+                )
+            except Exception:
+                pass
+            await safe_answer(query, MESSAGES[lang].get("comments_identity_request_sent", "👤 Identity request sent."), show_alert=True)
+            return
+        await safe_answer(query, MESSAGES[lang].get("comments_identity_request_pending", "⏳ Identity request is already pending."), show_alert=True)
+    except Exception as e:
+        logger.error("handle_book_comment_identity_request_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_identity_resolve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentreveal:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, request_id, decision = parts
+        resolve_fn = globals().get("db_resolve_book_comment_identity_request")
+        get_comment_fn = globals().get("db_get_book_comment_by_id")
+        if not callable(resolve_fn) or not callable(get_comment_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        approved = str(decision or "").strip().lower() == "approve"
+        resolved = await run_blocking(resolve_fn, request_id, query.from_user.id, approved)
+        if not resolved:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        requester_id = int(resolved.get("requester_user_id") or 0)
+        commenter_user = await run_blocking(get_user, query.from_user.id)
+        requester_user = await run_blocking(get_user, requester_id) if requester_id else None
+        requester_lang = str((requester_user or {}).get("language") or "en").strip() or "en"
+        comment = await run_blocking(get_comment_fn, str(resolved.get("comment_id") or ""))
+        if requester_id:
+            try:
+                if approved:
+                    await context.bot.send_message(
+                        chat_id=requester_id,
+                        text=MESSAGES[requester_lang].get(
+                            "comments_identity_approved_requester",
+                            "✅ Identity was shared.\n{identity}",
+                        ).format(identity=_comment_identity_text(commenter_user)),
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=requester_id,
+                        text=MESSAGES[requester_lang].get(
+                            "comments_identity_rejected_requester",
+                            "❌ The commenter did not share their identity.",
+                        ),
+                    )
+            except Exception:
+                logger.debug("Failed to notify requester about identity decision", exc_info=True)
+        result_key = "comments_identity_resolved_owner_allow" if approved else "comments_identity_resolved_owner_reject"
+        updated_text = MESSAGES[lang].get(
+            result_key,
+            "✅ Identity request approved." if approved else "❌ Identity request rejected.",
+        )
+        if comment:
+            updated_text += "\n\n" + html.escape(str(comment.get("text") or ""))
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await safe_answer(query, MESSAGES[lang].get("comments_identity_resolve_done", "✅ Response saved."), show_alert=True)
+        try:
+            await query.message.reply_text(updated_text, parse_mode="HTML")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("handle_book_comment_identity_resolve_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentreport:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, comment_id = data.split(":", 1)
+        get_comment_fn = globals().get("db_get_book_comment_by_id")
+        report_fn = globals().get("db_create_book_comment_report")
+        request_target_fn = globals().get("get_request_target_id")
+        if not callable(get_comment_fn) or not callable(report_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        comment = await run_blocking(get_comment_fn, comment_id)
+        if not comment or str(comment.get("status") or "") != "active":
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        await run_blocking(report_fn, comment_id, query.from_user.id, "user_report")
+        report_target_id = request_target_fn() if callable(request_target_fn) else None
+        if report_target_id:
+            try:
+                book = await run_blocking(db_get_book_by_id, str(comment.get("book_id") or ""))
+                reporter = await run_blocking(get_user, query.from_user.id)
+                commenter_user_id = int(comment.get("user_id") or 0)
+                commenter = await run_blocking(get_user, commenter_user_id) if commenter_user_id else None
+                is_banned_fn = globals().get("db_is_book_comment_banned")
+                is_blocked = bool(
+                    callable(is_banned_fn)
+                    and commenter_user_id
+                    and await run_blocking(is_banned_fn, commenter_user_id)
+                )
+                await context.bot.send_message(
+                    chat_id=report_target_id,
+                    text=MESSAGES["en"].get(
+                        "comments_report_owner_notify",
+                        "⚠️ Comment reported\nBook: {title}\nCommenter: {commenter}\nReporter: {reporter}\nComment ID: {comment_id}\n\n{text}",
+                    ).format(
+                        title=get_display_name(book) if book else str(comment.get("book_id") or "book"),
+                        commenter=_comment_identity_text(commenter),
+                        reporter=_comment_identity_text(reporter),
+                        comment_id=str(comment.get("id") or ""),
+                        text=str(comment.get("text") or ""),
+                    ),
+                    reply_markup=_build_comment_admin_ban_markup(commenter_user_id, "en", is_blocked) if commenter_user_id else None,
+                )
+            except Exception:
+                logger.debug("Failed to notify owner about comment report", exc_info=True)
+        await safe_answer(query, MESSAGES[lang].get("comments_reported", "⚠️ Comment reported."), show_alert=True)
+    except Exception as e:
+        logger.error("handle_book_comment_report_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_relay_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentrelayreport:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, relay_message_id = data.split(":", 1)
+        get_relay_message_fn = globals().get("db_get_book_comment_relay_message")
+        request_target_fn = globals().get("get_request_target_id")
+        if not callable(get_relay_message_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        relay_message = await run_blocking(get_relay_message_fn, relay_message_id)
+        if not relay_message:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        report_target_id = request_target_fn() if callable(request_target_fn) else None
+        if report_target_id:
+            try:
+                reporter = await run_blocking(get_user, query.from_user.id)
+                sender_user_id = int(relay_message.get("sender_user_id") or 0)
+                sender = await run_blocking(get_user, sender_user_id) if sender_user_id else None
+                recipient = await run_blocking(get_user, int(relay_message.get("recipient_user_id") or 0))
+                book = await run_blocking(db_get_book_by_id, str(relay_message.get("book_id") or ""))
+                preview_text = str(relay_message.get("text") or relay_message.get("caption") or relay_message.get("message_type") or "").strip()
+                is_banned_fn = globals().get("db_is_book_comment_banned")
+                is_blocked = bool(
+                    callable(is_banned_fn)
+                    and sender_user_id
+                    and await run_blocking(is_banned_fn, sender_user_id)
+                )
+                await context.bot.send_message(
+                    chat_id=report_target_id,
+                    text=MESSAGES["en"].get(
+                        "comments_relay_report_notify",
+                        "⚠️ Anonymous reply reported\nBook: {title}\nSender: {sender}\nRecipient: {recipient}\nReporter: {reporter}\nRelay message ID: {relay_message_id}\n\n{preview}",
+                    ).format(
+                        title=get_display_name(book) if book else str(relay_message.get("book_id") or "book"),
+                        sender=_comment_identity_text(sender),
+                        recipient=_comment_identity_text(recipient),
+                        reporter=_comment_identity_text(reporter),
+                        relay_message_id=str(relay_message.get("id") or ""),
+                        preview=preview_text or "<no preview>",
+                    ),
+                    reply_markup=_build_comment_admin_ban_markup(sender_user_id, "en", is_blocked) if sender_user_id else None,
+                )
+            except Exception:
+                logger.debug("Failed to notify request target about relay report", exc_info=True)
+        await safe_answer(query, MESSAGES[lang].get("comments_reported", "⚠️ Comment reported."), show_alert=True)
+    except Exception as e:
+        logger.error("handle_book_comment_relay_report_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_user_ban_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        if not _can_manage_comments_for_user(query.from_user.id):
+            await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
+            return
+        data = str(query.data or "")
+        if not data.startswith("commentuserban:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, user_id_str = data.split(":", 1)
+        target_user_id = int(user_id_str or 0)
+        if target_user_id <= 0:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        is_banned_fn = globals().get("db_is_book_comment_banned")
+        set_ban_fn = globals().get("db_set_book_comment_ban")
+        clear_ban_fn = globals().get("db_clear_book_comment_ban")
+        if not callable(is_banned_fn) or not callable(set_ban_fn) or not callable(clear_ban_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        is_blocked = bool(await run_blocking(is_banned_fn, target_user_id))
+        if is_blocked:
+            await run_blocking(clear_ban_fn, target_user_id)
+            is_blocked = False
+            result_key = "comments_user_unblocked"
+        else:
+            await run_blocking(set_ban_fn, target_user_id, query.from_user.id, "comment_only_ban")
+            is_blocked = True
+            result_key = "comments_user_blocked"
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_build_comment_admin_ban_markup(target_user_id, "en", is_blocked)
+            )
+        except Exception:
+            logger.debug("Failed to update admin comment ban toggle markup", exc_info=True)
+        await safe_answer(
+            query,
+            MESSAGES[lang].get(
+                result_key,
+                "🚫 User blocked from comments." if is_blocked else "✅ User unblocked for comments.",
+            ),
+            show_alert=True,
+        )
+    except Exception as e:
+        logger.error("handle_book_comment_user_ban_toggle_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_relay_block_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentrelayblock:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, relay_message_id = data.split(":", 1)
+        get_relay_message_fn = globals().get("db_get_book_comment_relay_message")
+        peer_block_fn = globals().get("db_is_book_comment_peer_blocked")
+        set_peer_block_fn = globals().get("db_set_book_comment_peer_block")
+        clear_peer_block_fn = globals().get("db_clear_book_comment_peer_block")
+        if not callable(get_relay_message_fn) or not callable(peer_block_fn) or not callable(set_peer_block_fn) or not callable(clear_peer_block_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        relay_message = await run_blocking(get_relay_message_fn, relay_message_id)
+        if not relay_message:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        current_user_id = int(query.from_user.id or 0)
+        recipient_user_id = int(relay_message.get("recipient_user_id") or 0)
+        sender_user_id = int(relay_message.get("sender_user_id") or 0)
+        if not current_user_id or current_user_id != recipient_user_id or not sender_user_id:
+            await safe_answer(query, MESSAGES[lang].get("not_authorized", "Not authorized"), show_alert=True)
+            return
+        touch_seen_fn = globals().get("db_touch_book_comment_relay_last_seen")
+        if callable(touch_seen_fn):
+            try:
+                await run_blocking(touch_seen_fn, str(relay_message.get("conversation_id") or ""), current_user_id)
+            except Exception:
+                logger.debug("Failed to mark relay conversation seen from block callback", exc_info=True)
+        is_blocked = bool(await run_blocking(peer_block_fn, recipient_user_id, sender_user_id))
+        if is_blocked:
+            await run_blocking(clear_peer_block_fn, recipient_user_id, sender_user_id)
+            is_blocked = False
+            result_key = "comments_relay_user_unblocked"
+        else:
+            await run_blocking(set_peer_block_fn, recipient_user_id, sender_user_id)
+            is_blocked = True
+            result_key = "comments_relay_user_blocked"
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_build_comment_relay_reply_markup(
+                    str(relay_message.get("conversation_id") or ""),
+                    str(relay_message.get("id") or ""),
+                    lang,
+                    is_blocked_for_recipient=is_blocked,
+                )
+            )
+        except Exception:
+            logger.debug("Failed to update relay block markup", exc_info=True)
+        await safe_answer(
+            query,
+            MESSAGES[lang].get(
+                result_key,
+                "🚫 This user was blocked from anonymously messaging you." if is_blocked else "✅ This user can anonymously message you again.",
+            ),
+            show_alert=True,
+        )
+    except Exception as e:
+        logger.error("handle_book_comment_relay_block_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+
+
+async def handle_book_comment_moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    try:
+        data = str(query.data or "")
+        if not data.startswith("commentmod:"):
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        _, comment_id, action = parts
+        delete_fn = globals().get("db_delete_book_comment")
+        get_comment_fn = globals().get("db_get_book_comment_by_id")
+        set_ban_fn = globals().get("db_set_book_comment_ban")
+        if not callable(delete_fn) or not callable(get_comment_fn):
+            await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+            return
+        comment = await run_blocking(get_comment_fn, comment_id)
+        if not comment:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        current_user_id = int(query.from_user.id or 0)
+        comment_owner_user_id = int(comment.get("user_id") or 0)
+        can_manage = _can_manage_comments_for_user(current_user_id)
+        if action == "selfdelete":
+            if current_user_id != comment_owner_user_id:
+                await safe_answer(query, MESSAGES[lang].get("not_authorized", "Not authorized"), show_alert=True)
+                return
+            deleted = int(await run_blocking(delete_fn, comment_id, current_user_id, "self_deleted") or 0)
+            if deleted <= 0:
+                await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+                return
+            book_id = str(comment.get("book_id") or "").strip()
+            deleted_text = MESSAGES[lang].get("comments_deleted_self", "🗑️ Your comment was deleted.")
+            deleted_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(MESSAGES[lang].get("comments_back_button", "⬅️ All comments"), callback_data=f"bookcomments:{book_id}:0")]]
+            )
+            await query.edit_message_text(deleted_text, reply_markup=deleted_markup)
+            await safe_answer(query, MESSAGES[lang].get("comments_deleted_self", "🗑️ Your comment was deleted."), show_alert=True)
+            return
+        if not can_manage:
+            await safe_answer(query, MESSAGES[lang]["admin_only"], show_alert=True)
+            return
+        if action == "banuser":
+            clear_ban_fn = globals().get("db_clear_book_comment_ban")
+            is_banned_fn = globals().get("db_is_book_comment_banned")
+            if not callable(set_ban_fn) or not callable(clear_ban_fn) or not callable(is_banned_fn):
+                await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
+                return
+            if not comment_owner_user_id or comment_owner_user_id == current_user_id:
+                await safe_answer(query, MESSAGES[lang].get("comments_block_user_invalid", "⚠️ This user cannot be blocked from comments."), show_alert=True)
+                return
+            is_blocked = bool(await run_blocking(is_banned_fn, comment_owner_user_id))
+            if is_blocked:
+                await run_blocking(clear_ban_fn, comment_owner_user_id)
+                result_key = "comments_user_unblocked"
+            else:
+                await run_blocking(set_ban_fn, comment_owner_user_id, current_user_id, "comment_only_ban")
+                result_key = "comments_user_blocked"
+            refreshed_text, refreshed_markup = await _build_book_comment_thread_view(
+                str(comment.get("book_id") or "").strip(),
+                comment_id,
+                current_user_id,
+                lang,
+                True,
+            )
+            await query.edit_message_text(refreshed_text, reply_markup=refreshed_markup, parse_mode="HTML")
+            await safe_answer(
+                query,
+                MESSAGES[lang].get(
+                    result_key,
+                    "🚫 User blocked from comments." if not is_blocked else "✅ User unblocked for comments.",
+                ),
+                show_alert=True,
+            )
+            return
+        if action != "delete":
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        book_id = str(comment.get("book_id") or "").strip()
+        deleted = int(await run_blocking(delete_fn, comment_id, current_user_id, "owner_deleted") or 0)
+        if deleted <= 0:
+            await safe_answer(query, MESSAGES[lang]["page_expired"], show_alert=True)
+            return
+        deleted_text = MESSAGES[lang].get("comments_deleted", "🗑️ Comment deleted.")
+        deleted_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(MESSAGES[lang].get("comments_back_button", "⬅️ All comments"), callback_data=f"bookcomments:{book_id}:0")]]
+        )
+        await query.edit_message_text(deleted_text, reply_markup=deleted_markup)
+        await safe_answer(query, MESSAGES[lang].get("comments_deleted", "🗑️ Comment deleted."), show_alert=True)
+    except Exception as e:
+        logger.error("handle_book_comment_moderation_callback failed: %s", e, exc_info=True)
+        await safe_answer(query, MESSAGES[lang]["error"], show_alert=True)
 
 
 async def handle_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

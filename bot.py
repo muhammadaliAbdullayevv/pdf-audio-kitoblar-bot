@@ -69,6 +69,7 @@ from config import (
     TOKEN,
     OWNER_ID,
     REQUEST_CHAT_ID,
+    BOOK_NEGATIVE_ALERT_THRESHOLD,
     BOOK_STORAGE_CHANNEL_ID,
     COIN_SEARCH,
     COIN_DOWNLOAD,
@@ -80,6 +81,401 @@ from config import (
     AUDIO_UPLOAD_CHANNEL_ID,
     validate_runtime_config,
 )
+
+
+_PRIVATE_LIVE_STATUS_DRAFT_ID = 9001
+_SEND_MESSAGE_DRAFT_SUPPORTED: bool | None = None
+_NEGATIVE_REACTION_ALERT_THRESHOLD_SETTING_KEY = "book_negative_reaction_alert_threshold"
+_PRIVATE_DRAFT_TIME_SETTING_KEYS = {
+    "draft_searching": "private_draft_searching_min_seconds",
+    "draft_results_ready": "private_draft_results_ready_min_seconds",
+    "draft_preparing_book": "private_draft_preparing_book_min_seconds",
+    "draft_sending_book": "private_draft_sending_book_min_seconds",
+    "draft_search_total": "private_draft_search_total_min_seconds",
+}
+_PRIVATE_DRAFT_TIME_STAGE_ALIASES = {
+    "search": "draft_searching",
+    "searching": "draft_searching",
+    "results": "draft_results_ready",
+    "result": "draft_results_ready",
+    "ready": "draft_results_ready",
+    "prepare": "draft_preparing_book",
+    "preparing": "draft_preparing_book",
+    "book": "draft_preparing_book",
+    "send": "draft_sending_book",
+    "sending": "draft_sending_book",
+    "total": "draft_search_total",
+    "overall": "draft_search_total",
+}
+_PRIVATE_DRAFT_TIME_STAGE_LABELS = {
+    "draft_searching": "search",
+    "draft_results_ready": "results",
+    "draft_preparing_book": "prepare",
+    "draft_sending_book": "send",
+    "draft_search_total": "total",
+}
+_PRIVATE_DRAFT_TIME_DEFAULTS = {
+    "draft_searching": ("PRIVATE_DRAFT_SEARCHING_MIN_SECONDS", 0.75),
+    "draft_results_ready": ("PRIVATE_DRAFT_RESULTS_READY_MIN_SECONDS", 0.45),
+    "draft_preparing_book": ("PRIVATE_DRAFT_PREPARING_BOOK_MIN_SECONDS", 0.55),
+    "draft_sending_book": ("PRIVATE_DRAFT_SENDING_BOOK_MIN_SECONDS", 0.45),
+    "draft_search_total": ("PRIVATE_DRAFT_SEARCH_TOTAL_MIN_SECONDS", 1.6),
+}
+_PRIVATE_LIVE_STATUS_TIMINGS: dict[str, float] = {}
+_PRIVATE_TRANSIENT_DRAFT_MIN_SECONDS = {
+    "greeting": 1.25,
+    "search_guide": 1.15,
+}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return float(default)
+
+
+def _clamp_private_draft_seconds(value: float) -> float:
+    try:
+        return round(min(5.0, max(0.0, float(value))), 2)
+    except Exception:
+        return 0.0
+
+
+def _private_live_status_default_seconds(status_key: str) -> float:
+    env_name, default_value = _PRIVATE_DRAFT_TIME_DEFAULTS.get(status_key, ("", 0.0))
+    if not env_name:
+        return 0.0
+    return _clamp_private_draft_seconds(_env_float(env_name, default_value))
+
+
+def _private_live_status_min_seconds(status_key: str) -> float:
+    if status_key in _PRIVATE_LIVE_STATUS_TIMINGS:
+        return _clamp_private_draft_seconds(_PRIVATE_LIVE_STATUS_TIMINGS.get(status_key, 0.0))
+    return _private_live_status_default_seconds(status_key)
+
+
+def _format_private_draft_seconds(value: float) -> str:
+    text = f"{_clamp_private_draft_seconds(value):.2f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return f"{text}s"
+
+
+def _load_private_live_status_settings() -> None:
+    overrides: dict[str, float] = {}
+    for status_key, setting_key in _PRIVATE_DRAFT_TIME_SETTING_KEYS.items():
+        try:
+            raw = db_get_bot_setting(setting_key)
+        except Exception as e:
+            logger.warning("Failed to load draft timing setting %s: %s", setting_key, e)
+            continue
+        if raw is None:
+            continue
+        try:
+            overrides[status_key] = _clamp_private_draft_seconds(float(str(raw).strip()))
+        except Exception:
+            continue
+    _PRIVATE_LIVE_STATUS_TIMINGS.clear()
+    _PRIVATE_LIVE_STATUS_TIMINGS.update(overrides)
+
+
+def _resolve_private_draft_stage(raw: str | None) -> str | None:
+    key = str(raw or "").strip().lower()
+    return _PRIVATE_DRAFT_TIME_STAGE_ALIASES.get(key)
+
+
+def _set_private_live_status_timing(status_key: str, seconds: float) -> float:
+    clamped = _clamp_private_draft_seconds(seconds)
+    _PRIVATE_LIVE_STATUS_TIMINGS[status_key] = clamped
+    db_set_bot_setting(_PRIVATE_DRAFT_TIME_SETTING_KEYS[status_key], str(clamped))
+    return clamped
+
+
+def _reset_private_live_status_timing(status_key: str) -> float:
+    _PRIVATE_LIVE_STATUS_TIMINGS.pop(status_key, None)
+    db_delete_bot_setting(_PRIVATE_DRAFT_TIME_SETTING_KEYS[status_key])
+    return _private_live_status_default_seconds(status_key)
+
+
+def _build_drafttime_report_text(lang: str) -> str:
+    msgs = MESSAGES.get(lang, MESSAGES["en"])
+    lines = [msgs.get("drafttime_title", "⏱ Draft timing"), msgs.get("drafttime_inactive", "Only the greeting message uses a fixed draft animation now. No adjustable draft timings are active.")]
+    return "\n".join(lines).strip()
+
+
+def _clamp_negative_reaction_alert_threshold(value: int) -> int:
+    try:
+        return max(1, min(1000, int(value)))
+    except Exception:
+        return max(1, int(BOOK_NEGATIVE_ALERT_THRESHOLD or 2))
+
+
+def _default_negative_reaction_alert_threshold() -> int:
+    return _clamp_negative_reaction_alert_threshold(int(BOOK_NEGATIVE_ALERT_THRESHOLD or 2))
+
+
+def _get_negative_reaction_alert_threshold() -> int:
+    try:
+        raw = db_get_bot_setting(_NEGATIVE_REACTION_ALERT_THRESHOLD_SETTING_KEY)
+    except Exception as e:
+        logger.warning("Failed to load negative reaction alert threshold override: %s", e)
+        raw = None
+    if raw is None:
+        return _default_negative_reaction_alert_threshold()
+    try:
+        return _clamp_negative_reaction_alert_threshold(int(str(raw).strip()))
+    except Exception:
+        return _default_negative_reaction_alert_threshold()
+
+
+def _set_negative_reaction_alert_threshold(value: int) -> int:
+    clamped = _clamp_negative_reaction_alert_threshold(value)
+    db_set_bot_setting(_NEGATIVE_REACTION_ALERT_THRESHOLD_SETTING_KEY, str(clamped))
+    return clamped
+
+
+def _reset_negative_reaction_alert_threshold() -> int:
+    db_delete_bot_setting(_NEGATIVE_REACTION_ALERT_THRESHOLD_SETTING_KEY)
+    return _default_negative_reaction_alert_threshold()
+
+
+def _build_negalert_report_text(lang: str) -> str:
+    msgs = MESSAGES.get(lang, MESSAGES["en"])
+    current = _get_negative_reaction_alert_threshold()
+    fallback = _default_negative_reaction_alert_threshold()
+    return msgs.get(
+        "negalert_report",
+        "👎 Negative reaction alert threshold\nCurrent: {current}\nDefault (.env): {default}\n\nUsage:\n/negalert\n/negalert 10\n/negalert reset",
+    ).format(current=current, default=fallback)
+
+
+def _private_live_status_text(lang: str, key: str) -> str:
+    messages = MESSAGES.get(lang, MESSAGES["en"])
+    fallback_keys = {
+        "draft_searching": "processing_search",
+        "draft_results_ready": "processing_search",
+        "draft_preparing_book": "sending",
+        "draft_sending_book": "sending",
+    }
+    fallback_key = fallback_keys.get(key, key)
+    return str(
+        messages.get(key)
+        or messages.get(fallback_key)
+        or MESSAGES["en"].get(key)
+        or MESSAGES["en"].get(fallback_key)
+        or ""
+    ).strip()
+
+
+def _private_book_status_text(lang: str) -> str:
+    messages = MESSAGES.get(lang, MESSAGES["en"])
+    return str(
+        messages.get("private_book_sending_status")
+        or messages.get("draft_sending_book")
+        or messages.get("sending")
+        or MESSAGES["en"].get("private_book_sending_status")
+        or MESSAGES["en"].get("draft_sending_book")
+        or MESSAGES["en"].get("sending")
+        or ""
+    ).strip()
+
+
+def _plain_draft_text(text: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", "", str(text or ""))
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+async def push_private_live_status(
+    bot,
+    chat_id,
+    lang: str,
+    status_key: str,
+    *,
+    message_thread_id: int | None = None,
+) -> bool:
+    global _SEND_MESSAGE_DRAFT_SUPPORTED
+    try:
+        safe_chat_id = int(chat_id or 0)
+    except Exception:
+        return False
+    if safe_chat_id <= 0:
+        return False
+    if _SEND_MESSAGE_DRAFT_SUPPORTED is False:
+        return False
+    text = _private_live_status_text(lang, status_key)
+    if not text:
+        return False
+    payload: dict[str, Any] = {
+        "chat_id": safe_chat_id,
+        "draft_id": _PRIVATE_LIVE_STATUS_DRAFT_ID,
+        "text": text,
+    }
+    try:
+        if message_thread_id is not None:
+            payload["message_thread_id"] = int(message_thread_id)
+    except Exception:
+        pass
+    try:
+        await bot._post("sendMessageDraft", payload)
+        _SEND_MESSAGE_DRAFT_SUPPORTED = True
+        return True
+    except BadRequest as e:
+        error_text = str(e or "").lower()
+        if "method not found" in error_text or "unknown method" in error_text:
+            _SEND_MESSAGE_DRAFT_SUPPORTED = False
+        logger.debug("sendMessageDraft rejected for chat %s: %s", safe_chat_id, e)
+        return False
+    except Exception as e:
+        error_text = str(e or "").lower()
+        if "method not found" in error_text or "unknown method" in error_text:
+            _SEND_MESSAGE_DRAFT_SUPPORTED = False
+        logger.debug("sendMessageDraft failed for chat %s: %s", safe_chat_id, e)
+        return False
+
+
+async def push_private_text_draft(
+    bot,
+    chat_id,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    message_thread_id: int | None = None,
+) -> bool:
+    global _SEND_MESSAGE_DRAFT_SUPPORTED
+    try:
+        safe_chat_id = int(chat_id or 0)
+    except Exception:
+        return False
+    if safe_chat_id <= 0:
+        return False
+    if _SEND_MESSAGE_DRAFT_SUPPORTED is False:
+        return False
+    safe_text = str(text or "").strip()
+    if not safe_text:
+        return False
+    payload: dict[str, Any] = {
+        "chat_id": safe_chat_id,
+        "draft_id": _PRIVATE_LIVE_STATUS_DRAFT_ID,
+        "text": safe_text,
+    }
+    if parse_mode:
+        payload["parse_mode"] = str(parse_mode)
+    try:
+        if message_thread_id is not None:
+            payload["message_thread_id"] = int(message_thread_id)
+    except Exception:
+        pass
+    try:
+        await bot._post("sendMessageDraft", payload)
+        _SEND_MESSAGE_DRAFT_SUPPORTED = True
+        return True
+    except BadRequest as e:
+        error_text = str(e or "").lower()
+        if "method not found" in error_text or "unknown method" in error_text:
+            _SEND_MESSAGE_DRAFT_SUPPORTED = False
+        logger.debug("sendMessageDraft rejected for chat %s: %s", safe_chat_id, e)
+        return False
+    except Exception as e:
+        error_text = str(e or "").lower()
+        if "method not found" in error_text or "unknown method" in error_text:
+            _SEND_MESSAGE_DRAFT_SUPPORTED = False
+        logger.debug("sendMessageDraft failed for chat %s: %s", safe_chat_id, e)
+        return False
+
+
+async def hold_private_live_status(status_key: str, started_at: float | None) -> None:
+    if started_at is None:
+        return
+    minimum_seconds = _private_live_status_min_seconds(status_key)
+    if minimum_seconds <= 0:
+        return
+    elapsed = time.monotonic() - float(started_at)
+    remaining = minimum_seconds - elapsed
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+
+async def hold_private_transient_draft(kind: str, started_at: float | None) -> None:
+    if started_at is None:
+        return
+    minimum_seconds = float(_PRIVATE_TRANSIENT_DRAFT_MIN_SECONDS.get(str(kind or "").strip().lower(), 0.0) or 0.0)
+    if minimum_seconds <= 0:
+        return
+    elapsed = time.monotonic() - float(started_at)
+    remaining = minimum_seconds - elapsed
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+
+def _private_search_presentation_total_min_seconds() -> float:
+    configured_floor = _private_live_status_min_seconds("draft_search_total")
+    stage_total = (
+        _private_live_status_min_seconds("draft_searching")
+        + _private_live_status_min_seconds("draft_results_ready")
+    )
+    return max(configured_floor, stage_total)
+
+
+async def hold_private_search_presentation(started_at: float | None) -> None:
+    if started_at is None:
+        return
+    minimum_seconds = _private_search_presentation_total_min_seconds()
+    if minimum_seconds <= 0:
+        return
+    elapsed = time.monotonic() - float(started_at)
+    remaining = minimum_seconds - elapsed
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+
+async def send_private_book_status_message(
+    bot,
+    chat_id,
+    lang: str,
+    *,
+    reply_to_message_id: int | None = None,
+    message_thread_id: int | None = None,
+):
+    try:
+        safe_chat_id = int(chat_id or 0)
+    except Exception:
+        return None
+    if safe_chat_id <= 0:
+        return None
+    text = _private_book_status_text(lang)
+    if not text:
+        return None
+    payload: dict[str, Any] = {
+        "chat_id": safe_chat_id,
+        "text": text,
+    }
+    try:
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+    except Exception:
+        pass
+    try:
+        if message_thread_id is not None:
+            payload["message_thread_id"] = int(message_thread_id)
+    except Exception:
+        pass
+    try:
+        return await bot.send_message(**payload)
+    except Exception:
+        return None
+
+
+async def hold_private_book_status_message(started_at: float | None) -> None:
+    if started_at is None:
+        return
+    minimum_seconds = max(1.0, _private_live_status_min_seconds("draft_sending_book"))
+    elapsed = time.monotonic() - float(started_at)
+    remaining = minimum_seconds - elapsed
+    if remaining > 0:
+        await asyncio.sleep(remaining)
 
 from db import (
     init_db,
@@ -163,6 +559,13 @@ from db import (
     increment_book_download as db_increment_book_download,
     increment_book_searches as db_increment_book_searches,
     set_book_reaction as db_set_book_reaction,
+    set_book_reaction_display_counts as db_set_book_reaction_display_counts,
+    seed_all_book_display_stats_randomly as db_seed_all_book_display_stats_randomly,
+    clear_all_book_display_adjustments as db_clear_all_book_display_adjustments,
+    get_book_reaction_counts as db_get_book_reaction_counts,
+    get_book_negative_reaction_alert_state as db_get_book_negative_reaction_alert_state,
+    mark_book_negative_reaction_alert_sent as db_mark_book_negative_reaction_alert_sent,
+    clear_book_negative_reaction_alert as db_clear_book_negative_reaction_alert,
     get_book_delivery_snapshot as db_get_book_delivery_snapshot,
     get_book_stats as db_get_book_stats,
     get_top_books as db_get_top_books,
@@ -211,6 +614,50 @@ from db import (
     get_upload_receipt_by_id as db_get_upload_receipt_by_id,
     update_upload_receipt as db_update_upload_receipt,
     update_book_upload_meta as db_update_book_upload_meta,
+    set_bot_setting as db_set_bot_setting,
+    get_bot_setting as db_get_bot_setting,
+    delete_bot_setting as db_delete_bot_setting,
+    upsert_forbidden_books as db_upsert_forbidden_books,
+    get_forbidden_book_title as db_get_forbidden_book_title,
+    list_forbidden_book_titles as db_list_forbidden_book_titles,
+    list_forbidden_books as db_list_forbidden_books,
+    remove_forbidden_books as db_remove_forbidden_books,
+    get_book_reaction_policy as db_get_book_reaction_policy,
+    set_book_reaction_policy as db_set_book_reaction_policy,
+    get_book_comment_count as db_get_book_comment_count,
+    get_book_comment_thread_count as db_get_book_comment_thread_count,
+    get_user_book_comment_summary as db_get_user_book_comment_summary,
+    list_user_book_comments as db_list_user_book_comments,
+    update_book_comment_text as db_update_book_comment_text,
+    get_book_comment_by_id as db_get_book_comment_by_id,
+    add_book_comment as db_add_book_comment,
+    list_book_comment_threads as db_list_book_comment_threads,
+    list_book_comment_replies as db_list_book_comment_replies,
+    list_book_comment_thread_messages as db_list_book_comment_thread_messages,
+    viewer_can_see_book_comment_identity as db_viewer_can_see_book_comment_identity,
+    create_book_comment_identity_request as db_create_book_comment_identity_request,
+    resolve_book_comment_identity_request as db_resolve_book_comment_identity_request,
+    create_book_comment_report as db_create_book_comment_report,
+    delete_book_comment as db_delete_book_comment,
+    is_book_comment_banned as db_is_book_comment_banned,
+    set_book_comment_ban as db_set_book_comment_ban,
+    clear_book_comment_ban as db_clear_book_comment_ban,
+    is_book_comment_peer_blocked as db_is_book_comment_peer_blocked,
+    set_book_comment_peer_block as db_set_book_comment_peer_block,
+    clear_book_comment_peer_block as db_clear_book_comment_peer_block,
+    get_or_create_book_comment_relay_conversation as db_get_or_create_book_comment_relay_conversation,
+    get_book_comment_relay_conversation as db_get_book_comment_relay_conversation,
+    close_book_comment_relay_conversation as db_close_book_comment_relay_conversation,
+    acknowledge_book_comment_relay_closure as db_acknowledge_book_comment_relay_closure,
+    get_book_comment_relay_participant_state as db_get_book_comment_relay_participant_state,
+    touch_book_comment_relay_last_seen as db_touch_book_comment_relay_last_seen,
+    set_book_comment_relay_muted as db_set_book_comment_relay_muted,
+    get_book_comment_relay_unread_summary as db_get_book_comment_relay_unread_summary,
+    list_book_comment_relay_conversations_for_user as db_list_book_comment_relay_conversations_for_user,
+    count_book_comment_relay_conversations_for_user as db_count_book_comment_relay_conversations_for_user,
+    list_book_comment_relay_messages_for_user as db_list_book_comment_relay_messages_for_user,
+    create_book_comment_relay_message as db_create_book_comment_relay_message,
+    get_book_comment_relay_message as db_get_book_comment_relay_message,
     enqueue_background_job as db_enqueue_background_job,
     create_background_job as db_create_background_job,
     deserialize_background_job_payload as db_deserialize_background_job_payload,
@@ -425,6 +872,7 @@ _SEARCH_FLOW_DEP_KEYS = (
     "_is_owner_user",
     "_main_menu_keyboard",
     "_main_menu_text_action",
+    "_parse_seedbookstats_ranges",
     "_reply_search_menu_click_hint",
     "_today_str",
     "add_recent_download",
@@ -439,17 +887,63 @@ _SEARCH_FLOW_DEP_KEYS = (
     "is_allowed",
     "can_rename_books",
     "db_add_user_coin_adjustment",
+    "db_add_book_comment",
     "db_get_book_by_id",
+    "db_get_book_comment_by_id",
+    "db_get_book_comment_count",
+    "db_get_book_comment_thread_count",
+    "db_get_user_book_comment_summary",
+    "db_update_book_comment_text",
     "db_get_book_delivery_snapshot",
+    "db_get_book_reaction_policy",
+    "db_get_bot_setting",
+    "db_delete_bot_setting",
+    "db_get_forbidden_book_title",
+    "db_list_forbidden_book_titles",
+    "db_list_forbidden_books",
     "db_get_book_stats",
     "db_get_guest_group_delivery_capability",
     "db_get_guest_private_handoff_by_token",
     "db_get_user_reaction",
+    "db_is_book_comment_banned",
+    "db_set_book_comment_ban",
+    "db_clear_book_comment_ban",
+    "db_is_book_comment_peer_blocked",
+    "db_set_book_comment_peer_block",
+    "db_clear_book_comment_peer_block",
+    "db_get_book_comment_relay_participant_state",
+    "db_touch_book_comment_relay_last_seen",
+    "db_set_book_comment_relay_muted",
+    "db_get_book_comment_relay_unread_summary",
+    "db_list_book_comment_relay_conversations_for_user",
+    "db_count_book_comment_relay_conversations_for_user",
+    "db_list_book_comment_relay_messages_for_user",
     "db_increment_book_download",
     "db_increment_book_searches",
     "db_increment_counter",
     "db_insert_book",
+    "db_list_book_comment_replies",
+    "db_list_book_comment_thread_messages",
+    "db_list_book_comment_threads",
+    "db_list_user_book_comments",
     "db_list_requests",
+    "db_seed_all_book_display_stats_randomly",
+    "db_create_book_comment_identity_request",
+    "db_create_book_comment_report",
+    "db_create_book_comment_relay_message",
+    "db_delete_book_comment",
+    "db_close_book_comment_relay_conversation",
+    "db_acknowledge_book_comment_relay_closure",
+    "db_get_book_comment_relay_conversation",
+    "db_get_book_comment_relay_message",
+    "db_get_or_create_book_comment_relay_conversation",
+    "db_resolve_book_comment_identity_request",
+    "db_set_book_reaction_policy",
+    "db_set_book_reaction_display_counts",
+    "db_remove_forbidden_books",
+    "db_set_bot_setting",
+    "db_upsert_forbidden_books",
+    "db_viewer_can_see_book_comment_identity",
     "db_enqueue_book_local_download_job",
     "db_claim_book_local_download_job",
     "db_complete_book_local_download_job",
@@ -464,6 +958,8 @@ _SEARCH_FLOW_DEP_KEYS = (
     "format_user_name",
     "format_user_tag",
     "find_book_by_id",
+    "get_admin_id",
+    "get_request_target_id",
     "get_display_name",
     "get_audio_book_by_id",
     "list_audio_books_by_book_id",
@@ -488,6 +984,12 @@ _SEARCH_FLOW_DEP_KEYS = (
     "run_blocking_db_retry",
     "safe_answer",
     "safe_reply",
+    "hold_private_live_status",
+    "hold_private_book_status_message",
+    "hold_private_search_presentation",
+    "push_private_live_status",
+    "push_private_text_draft",
+    "send_private_book_status_message",
     "_schedule_application_task",
     "search_es",
     "send_request_to_admin",
@@ -625,11 +1127,13 @@ _ENGAGEMENT_OPTIONAL_DEP_KEYS = (
     "TOP_USERS_LIMIT",
     "_is_admin_user",
     "_is_owner_user",
+    "_get_negative_reaction_alert_threshold",
     "_send_with_retry",
     "add_favorite",
     "asyncio",
     "build_book_caption",
     "build_book_keyboard",
+    "BOOK_NEGATIVE_ALERT_THRESHOLD",
     "build_top_keyboard",
     "build_top_text",
     "build_top_users_keyboard",
@@ -647,14 +1151,20 @@ _ENGAGEMENT_OPTIONAL_DEP_KEYS = (
     "db_award_favorite_action",
     "db_award_reaction_action",
     "db_get_book_by_id",
+    "db_get_book_negative_reaction_alert_state",
+    "db_get_book_reaction_counts",
     "db_get_book_stats",
+    "db_get_book_reaction_policy",
     "db_get_book_summary",
     "db_get_top_books",
     "db_get_top_users",
     "db_get_user_reaction",
     "db_increment_counter",
+    "db_mark_book_negative_reaction_alert_sent",
     "db_set_book_reaction",
+    "db_set_book_reaction_policy",
     "db_upsert_book_summary",
+    "db_clear_book_negative_reaction_alert",
     "delete_audio_books_by_book_id",
     "delete_book_and_related",
     "es_available",
@@ -664,6 +1174,7 @@ _ENGAGEMENT_OPTIONAL_DEP_KEYS = (
     "get_display_name",
     "get_es",
     "get_result_title",
+    "get_request_target_id",
     "get_top_cache",
     "get_user",
     "hashlib",
@@ -683,6 +1194,10 @@ _ENGAGEMENT_OPTIONAL_DEP_KEYS = (
     "set_user_stopped",
     "socket",
     "spam_check_message",
+    "push_private_live_status",
+    "push_private_text_draft",
+    "hold_private_live_status",
+    "hold_private_search_presentation",
     "update_user_info",
     "urllib",
 )
@@ -900,6 +1415,21 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await language_command_handler(update, context)
 
 
+def _my_comments_excerpt(text: str, limit: int = 180) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    if len(cleaned) > limit:
+        cleaned = cleaned[: max(1, limit - 3)].rstrip() + "..."
+    return html.escape(cleaned)
+
+
+async def my_comments_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _search_flow.send_my_comments_panel(update, context)
+
+
+async def my_chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _search_flow.send_my_chats_panel(update, context)
+
+
 def _bot_public_handle() -> str:
     handle = str(BOT_PUBLIC_USERNAME or "").strip()
     if not handle:
@@ -1078,11 +1608,8 @@ async def _answer_guest_query(
 
 
 def _guest_open_button_text(lang: str) -> str:
-    return {
-        "uz": "📥 Botni ochish",
-        "ru": "📥 Открыть бота",
-        "en": "📥 Open Bot",
-    }.get(lang, "📥 Open Bot")
+    _ = lang
+    return "📥 Botni ochish"
 
 
 def _guest_open_bot_inline_keyboard(lang: str, bot_url: str) -> InlineKeyboardMarkup:
@@ -1407,6 +1934,43 @@ async def handle_guest_message_update(update: Update, context: ContextTypes.DEFA
             source_chat_username=guest_chat.get("username"),
             source_public_link=guest_chat.get("public_link"),
         )
+        reply_markup_obj: InlineKeyboardMarkup | None = None
+        source_guest_chat_id = guest_chat.get("chat_id")
+        try:
+            source_guest_chat_id = int(source_guest_chat_id or 0) or None
+        except Exception:
+            source_guest_chat_id = None
+        if source_guest_chat_id and query_token:
+            try:
+                delivery_capability = await run_blocking(
+                    db_get_guest_group_delivery_capability,
+                    source_guest_chat_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to load guest delivery capability while building guest results for group %s: %s",
+                    source_guest_chat_id,
+                    e,
+                    exc_info=True,
+                )
+                delivery_capability = {}
+            if bool((delivery_capability or {}).get("skip_same_chat_delivery")):
+                try:
+                    reply_markup_obj = await build_guest_private_handoff_reply_markup(
+                        context,
+                        handoff_token=query_token,
+                        selected_book_id="",
+                        actor_user_id=getattr(guest_message.from_user, "id", None),
+                        lang=lang,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to build remembered guest private handoff markup for group %s: %s",
+                        source_guest_chat_id,
+                        e,
+                        exc_info=True,
+                    )
+                    reply_markup_obj = None
         lines = [
             MESSAGES[lang].get("guest_results_header", MESSAGES["en"]["guest_results_header"]).format(query=effective_query),
             "",
@@ -1425,12 +1989,16 @@ async def handle_guest_message_update(update: Update, context: ContextTypes.DEFA
             "\n".join(lines).strip(),
             title=MESSAGES[lang].get("guest_results_title", MESSAGES["en"].get("guest_results_title", "Search results")),
             description=MESSAGES[lang].get("guest_results_description", MESSAGES["en"].get("guest_results_description", "{count} matches")).format(count=len(entries)),
-            reply_markup=_guest_results_markup(
-                entries,
-                lang,
-                bot_url,
-                query_token=query_token,
-                open_url=open_url or bot_url,
+            reply_markup=(
+                reply_markup_obj.to_dict()
+                if reply_markup_obj is not None
+                else _guest_results_markup(
+                    entries,
+                    lang,
+                    bot_url,
+                    query_token=query_token,
+                    open_url=open_url or bot_url,
+                )
             ),
         )
     except Exception as e:
@@ -1811,6 +2379,7 @@ async def _send_private_handoff_results(
     effective_query = str(query_text or "").strip()
     if not effective_query:
         return False
+    target_message = update.message or update.effective_message
     entries = await run_blocking(_search_guest_books, effective_query, 5)
     if not entries:
         await safe_reply(update, MESSAGES[lang]["not_found"])
@@ -1818,7 +2387,6 @@ async def _send_private_handoff_results(
     query_id = cache_search_results(context, effective_query, entries)
     result_text, page_entries, pages = build_results_text(effective_query, entries, 0, lang)
     reply_markup = build_results_keyboard(page_entries, 0, pages, query_id)
-    target_message = update.message or update.effective_message
     if target_message:
         await _send_with_retry(lambda: target_message.reply_text(result_text, reply_markup=reply_markup))
     else:
@@ -2080,6 +2648,7 @@ def build_book_keyboard(
     user_reaction: str | None = None,
     can_delete: bool = False,
     can_rename_book: bool = False,
+    can_edit_reactions: bool = False,
     lang: str = "en",
     has_audiobook: bool = False,
     can_add_audiobook: bool = False,
@@ -2087,7 +2656,11 @@ def build_book_keyboard(
     audiobook_request_count: int = 0,
     show_personal_state: bool = True,
     show_favorite_button: bool = True,
+    show_comments_button: bool = False,
     more_books_url: str | None = None,
+    more_books_label: str | None = None,
+    reactions_locked: bool = False,
+    dislikes_disabled: bool = False,
 ) -> InlineKeyboardMarkup:
     like = counts.get("like", 0)
     dislike = counts.get("dislike", 0)
@@ -2120,8 +2693,32 @@ def build_book_keyboard(
     if show_favorite_button:
         rows.append([InlineKeyboardButton(fav_label, callback_data=f"fav:toggle:{book_id}")])
 
+    if show_comments_button:
+        rows.append([InlineKeyboardButton(m.get("book_action_comments", "💬 Comments"), callback_data=f"bookcomments:{book_id}:0")])
+
     if can_rename_book:
         rows.append([InlineKeyboardButton(m.get("book_action_rename", "✏️ Edit name"), callback_data=f"bookrename:{book_id}")])
+
+    if can_edit_reactions:
+        rows.append([InlineKeyboardButton(m.get("book_action_edit_reactions", "🎛 Edit reactions"), callback_data=f"bookreactedit:{book_id}")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    m.get(
+                        "book_action_unlock_reactions" if reactions_locked else "book_action_lock_reactions",
+                        "🔓 Unlock reactions" if reactions_locked else "🔒 Lock reactions",
+                    ),
+                    callback_data=f"bookreactpolicy:{book_id}:lock",
+                ),
+                InlineKeyboardButton(
+                    m.get(
+                        "book_action_enable_dislikes" if dislikes_disabled else "book_action_disable_dislikes",
+                        "✅ Enable dislikes" if dislikes_disabled else "🚫 Disable dislikes",
+                    ),
+                    callback_data=f"bookreactpolicy:{book_id}:dislikes",
+                ),
+            ]
+        )
 
     if can_add_audiobook:
         add_label = m.get("audiobook_add_button", "➕ Add Audiobook")
@@ -2142,7 +2739,14 @@ def build_book_keyboard(
         rows.append([InlineKeyboardButton(m.get("book_action_delete", "🗑️ Delete book"), callback_data=f"delbook:{book_id}")])
 
     if more_books_url:
-        rows.append([InlineKeyboardButton(m.get("inline_more_books_button", "📚 More books"), url=more_books_url)])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    more_books_label or m.get("inline_more_books_button", "📚 More books"),
+                    url=more_books_url,
+                )
+            ]
+        )
 
     return InlineKeyboardMarkup(rows)
 
@@ -2213,6 +2817,13 @@ async def send_book(bot, chat_id, book, *, lang: str = "en", user_id: int | None
         chat_id_int = 0
     can_rename_book = bool(can_rename_books(user_id)) if user_id and chat_id_int > 0 else False
     is_owner_user = bool(_is_owner_user(user_id)) if user_id and callable(globals().get("_is_owner_user")) else False
+    can_edit_reactions = bool(is_owner_user and chat_id_int > 0 and book_id)
+    reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
+    if can_edit_reactions and book_id:
+        try:
+            reaction_policy = await run_blocking(db_get_book_reaction_policy, book_id) or reaction_policy
+        except Exception as e:
+            logger.warning("Failed to load reaction policy for %s: %s", book_id, e)
     show_listen_btn = has_ab if is_owner_user else True
     ab_request_count = 0
     if book_id and can_add_ab and is_owner_user:
@@ -2228,83 +2839,96 @@ async def send_book(bot, chat_id, book, *, lang: str = "en", user_id: int | None
             user_reaction,
             can_delete,
             can_rename_book,
+            can_edit_reactions,
             lang,
             has_audiobook=has_ab,
             can_add_audiobook=can_add_ab,
             show_listen_button=show_listen_btn,
             audiobook_request_count=ab_request_count,
+            show_comments_button=bool(chat_id_int > 0),
+            reactions_locked=bool(reaction_policy.get("reactions_locked")),
+            dislikes_disabled=bool(reaction_policy.get("dislikes_disabled")),
         )
         if book_id
         else None
     )
 
-    if book.get("file_id"):
-        # Prefer Telegram cache
+    if chat_id_int > 0:
         try:
-            sent_message = await bot.send_document(
-                chat_id=chat_id,
-                document=book["file_id"],
-                caption=caption,
-                reply_markup=reactions_kb,
-            )
-            return sent_message
-        except Exception as e:
-            logger.error("send_book failed by file_id for %s: %s", book_id, e)
+            await bot.send_chat_action(chat_id=chat_id_int, action="upload_document")
+        except Exception:
+            pass
 
-    if book_path and os.path.exists(book_path):
-        # Fallback to local file
-        thumbnail = get_book_thumbnail_input()
-        with open(book_path, "rb") as f:
-            sent_message = await bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(f, filename=_book_filename(book)),
-                caption=caption,
-                reply_markup=reactions_kb,
-                thumbnail=thumbnail,
-            )
-
-        # Capture file_id for future use
-        if sent_message and sent_message.document:
-            new_file_id = sent_message.document.file_id
-            new_file_unique_id = getattr(sent_message.document, "file_unique_id", None)
-            book["file_id"] = new_file_id
-            if new_file_unique_id:
-                book["file_unique_id"] = new_file_unique_id
-
-            # Save updated file_id in DB
+    try:
+        if book.get("file_id"):
+            # Prefer Telegram cache
             try:
-                if book.get("id"):
-                    await run_blocking(
-                        update_book_file_id,
-                        str(book.get("id")),
-                        new_file_id,
-                        True,
-                        new_file_unique_id,
-                    )
-                elif book_path:
-                    await run_blocking(update_book_by_path, book_path, file_id=new_file_id, indexed=True)
-                logger.debug(f"Updated file_id + indexed flag for {book.get('book_name')} in DB")
+                sent_message = await bot.send_document(
+                    chat_id=chat_id,
+                    document=book["file_id"],
+                    caption=caption,
+                    reply_markup=reactions_kb,
+                )
+                return sent_message
             except Exception as e:
-                logger.error(f"⚠️ Failed to update book file_id in DB: {e}")
+                logger.error("send_book failed by file_id for %s: %s", book_id, e)
 
-            # ✅ Index in Elasticsearch with stable UUID
-            if es_available():
+        if book_path and os.path.exists(book_path):
+            # Fallback to local file
+            thumbnail = get_book_thumbnail_input()
+            with open(book_path, "rb") as f:
+                sent_message = await bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(f, filename=_book_filename(book)),
+                    caption=caption,
+                    reply_markup=reactions_kb,
+                    thumbnail=thumbnail,
+                )
+
+            # Capture file_id for future use
+            if sent_message and sent_message.document:
+                new_file_id = sent_message.document.file_id
+                new_file_unique_id = getattr(sent_message.document, "file_unique_id", None)
+                book["file_id"] = new_file_id
+                if new_file_unique_id:
+                    book["file_unique_id"] = new_file_unique_id
+
+                # Save updated file_id in DB
                 try:
-                    await run_blocking(
-                        index_book,
-                        book["book_name"],
-                        new_file_id,
-                        book_path,
-                        book.get("id"),
-                        get_display_name(book),
-                        new_file_unique_id,
-                    )
+                    if book.get("id"):
+                        await run_blocking(
+                            update_book_file_id,
+                            str(book.get("id")),
+                            new_file_id,
+                            True,
+                            new_file_unique_id,
+                        )
+                    elif book_path:
+                        await run_blocking(update_book_by_path, book_path, file_id=new_file_id, indexed=True)
+                    logger.debug(f"Updated file_id + indexed flag for {book.get('book_name')} in DB")
                 except Exception as e:
-                    logger.warning("Failed to index book in ES for %s: %s", book.get("id"), e)
-            return sent_message
-    else:
-        await bot.send_message(chat_id=chat_id, text=MESSAGES[lang]["book_unavailable"])
-    return None
+                    logger.error(f"⚠️ Failed to update book file_id in DB: {e}")
+
+                # ✅ Index in Elasticsearch with stable UUID
+                if es_available():
+                    try:
+                        await run_blocking(
+                            index_book,
+                            book["book_name"],
+                            new_file_id,
+                            book_path,
+                            book.get("id"),
+                            get_display_name(book),
+                            new_file_unique_id,
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to index book in ES for %s: %s", book.get("id"), e)
+                return sent_message
+        else:
+            await bot.send_message(chat_id=chat_id, text=MESSAGES[lang]["book_unavailable"])
+        return None
+    except Exception:
+        raise
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -3517,6 +4141,350 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.send_message(chat_id=admin_id, text=text)
     except Exception:
         pass
+
+
+def _parse_forbidden_book_titles(raw_text: str) -> list[tuple[str, str]]:
+    clean_text = str(raw_text or "").strip()
+    if not clean_text:
+        return []
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for part in re.split(r"[\n,]+", clean_text):
+        title = str(part or "").strip()
+        if not title:
+            continue
+        normalized_title = normalize(title).lower().strip()
+        if not normalized_title or normalized_title in seen:
+            continue
+        seen.add(normalized_title)
+        entries.append((normalized_title, title))
+    return entries
+
+
+FORBIDDEN_BOOKS_WARNING_SETTING_KEY = "forbidden_books_warning_text"
+
+
+async def _save_forbidden_book_titles(raw_text: str, owner_user_id: int | None) -> int:
+    entries = _parse_forbidden_book_titles(raw_text)
+    if not entries:
+        return 0
+    return int(await run_blocking(db_upsert_forbidden_books, entries, owner_user_id))
+
+
+async def _remove_forbidden_book_titles(raw_text: str) -> int:
+    entries = _parse_forbidden_book_titles(raw_text)
+    if not entries:
+        return 0
+    normalized_titles = [normalized_title for normalized_title, _title in entries]
+    return int(await run_blocking(db_remove_forbidden_books, normalized_titles))
+
+
+async def _build_forbidden_books_list_text(lang: str, *, limit: int = 100) -> str:
+    items = await run_blocking(db_list_forbidden_books)
+    if not items:
+        return MESSAGES[lang]["forbidden_books_list_empty"]
+    max_items = max(1, int(limit))
+    lines = [MESSAGES[lang]["forbidden_books_list_header"].format(count=len(items))]
+    visible_count = 0
+    for item in items[:max_items]:
+        title = str((item or {}).get("title") or "").strip()
+        if title:
+            candidate = f"{visible_count + 1}. {title}"
+            if len("\n".join(lines + [candidate])) > 3500:
+                break
+            lines.append(candidate)
+            visible_count += 1
+    hidden_count = max(0, len(items) - visible_count)
+    if hidden_count:
+        lines.append(MESSAGES[lang]["forbidden_books_list_more"].format(count=hidden_count))
+    return "\n".join(lines)
+
+
+async def _get_forbidden_warning_text(lang: str) -> str:
+    custom_text = await run_blocking(db_get_bot_setting, FORBIDDEN_BOOKS_WARNING_SETTING_KEY)
+    custom_text = str(custom_text or "").strip()
+    return custom_text or MESSAGES[lang]["forbidden_books_blocked"]
+
+
+async def _set_forbidden_warning_text(text: str) -> str:
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return ""
+    await run_blocking(db_set_bot_setting, FORBIDDEN_BOOKS_WARNING_SETTING_KEY, clean_text)
+    return clean_text
+
+
+async def _reset_forbidden_warning_text() -> None:
+    await run_blocking(db_delete_bot_setting, FORBIDDEN_BOOKS_WARNING_SETTING_KEY)
+
+
+def _set_pending_forbidden_books_action(context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    context.user_data["pending_forbidden_books"] = {
+        "mode": str(mode or "add").strip().lower(),
+        "expires_at": time.time() + 300,
+    }
+
+
+async def _forbidden_books_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    raw_text = " ".join(args).strip()
+    if not raw_text:
+        _set_pending_forbidden_books_action(context, "add")
+        await target_message.reply_text(MESSAGES[lang]["forbidden_books_prompt"])
+        return
+
+    action = args[0].lower()
+    rest_text = " ".join(args[1:]).strip() if len(args) > 1 else ""
+
+    if action in {"list", "ls"}:
+        context.user_data.pop("pending_forbidden_books", None)
+        context.user_data.pop("awaiting_forbidden_books_input_until", None)
+        await target_message.reply_text(await _build_forbidden_books_list_text(lang))
+        return
+
+    if action in {"remove", "rm", "delete", "del"}:
+        if not rest_text:
+            _set_pending_forbidden_books_action(context, "remove")
+            await target_message.reply_text(MESSAGES[lang]["forbidden_books_remove_prompt"])
+            return
+        removed_count = await _remove_forbidden_book_titles(rest_text)
+        context.user_data.pop("pending_forbidden_books", None)
+        context.user_data.pop("awaiting_forbidden_books_input_until", None)
+        if removed_count <= 0:
+            await target_message.reply_text(MESSAGES[lang]["forbidden_books_remove_none"])
+            return
+        await target_message.reply_text(MESSAGES[lang]["forbidden_books_removed"].format(count=removed_count))
+        return
+
+    if action in {"warning", "warn", "text"}:
+        if rest_text.lower() in {"reset", "default"}:
+            await _reset_forbidden_warning_text()
+            context.user_data.pop("pending_forbidden_books", None)
+            context.user_data.pop("awaiting_forbidden_books_input_until", None)
+            await target_message.reply_text(MESSAGES[lang]["forbidden_books_warning_reset"])
+            return
+        if rest_text:
+            await _set_forbidden_warning_text(rest_text)
+            context.user_data.pop("pending_forbidden_books", None)
+            context.user_data.pop("awaiting_forbidden_books_input_until", None)
+            await target_message.reply_text(MESSAGES[lang]["forbidden_books_warning_saved"])
+            return
+        current_text = await _get_forbidden_warning_text(lang)
+        _set_pending_forbidden_books_action(context, "warning")
+        await target_message.reply_text(
+            MESSAGES[lang]["forbidden_books_warning_prompt"].format(text=html.escape(current_text)),
+            parse_mode="HTML",
+        )
+        return
+
+    count = await _save_forbidden_book_titles(raw_text, update.effective_user.id if update.effective_user else None)
+    context.user_data.pop("pending_forbidden_books", None)
+    context.user_data.pop("awaiting_forbidden_books_input_until", None)
+    if count <= 0:
+        await target_message.reply_text(MESSAGES[lang]["forbidden_books_invalid"])
+        return
+    await target_message.reply_text(MESSAGES[lang]["forbidden_books_saved"].format(count=count))
+
+
+async def forbidden_books_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _forbidden_books_command_impl)
+
+
+async def drafttime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    if not update.effective_user or not _is_owner_user(update.effective_user.id):
+        await safe_reply(update, MESSAGES[lang].get("owner_only", MESSAGES[lang]["admin_only"]))
+        return
+    await target_message.reply_text(_build_drafttime_report_text(lang))
+
+
+async def negalert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    if not update.effective_user or not _is_owner_user(update.effective_user.id):
+        await safe_reply(update, MESSAGES[lang].get("owner_only", MESSAGES[lang]["admin_only"]))
+        return
+
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if not args:
+        await target_message.reply_text(_build_negalert_report_text(lang))
+        return
+
+    first = args[0].lower()
+    if first in {"reset", "default"}:
+        value = _reset_negative_reaction_alert_threshold()
+        await target_message.reply_text(
+            MESSAGES[lang].get(
+                "negalert_reset_done",
+                "✅ Negative reaction alert threshold reset to default: {value}",
+            ).format(value=value)
+        )
+        return
+
+    try:
+        value = int(first)
+    except Exception:
+        await target_message.reply_text(
+            MESSAGES[lang].get(
+                "negalert_invalid",
+                "⚠️ Send a whole number or `reset`.\nExample:\n/negalert 10",
+            )
+        )
+        return
+
+    if value < 1:
+        await target_message.reply_text(
+            MESSAGES[lang].get(
+                "negalert_invalid",
+                "⚠️ Send a whole number or `reset`.\nExample:\n/negalert 10",
+            )
+        )
+        return
+
+    applied = _set_negative_reaction_alert_threshold(value)
+    await target_message.reply_text(
+        MESSAGES[lang].get(
+            "negalert_set_done",
+            "✅ Negative reaction alert threshold set to: {value}",
+        ).format(value=applied)
+    )
+
+
+def _parse_stat_range_token(raw: str) -> tuple[int, int] | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    match = re.fullmatch(r"(-?\d+)\s*[-:]\s*(-?\d+)", text)
+    if not match:
+        return None
+    left = int(match.group(1))
+    right = int(match.group(2))
+    low, high = sorted((left, right))
+    if high < 0:
+        return None
+    return max(0, low), max(0, high)
+
+
+def _parse_seedbookstats_ranges(args: list[str]) -> dict[str, tuple[int, int]] | None:
+    defaults = {
+        "downloads": (20, 50),
+        "favorites": (10, 60),
+        "positive": (10, 60),
+        "negative": (0, 10),
+    }
+    if not args:
+        return defaults
+
+    if any("=" in token for token in args):
+        parsed = dict(defaults)
+        aliases = {
+            "downloads": "downloads",
+            "download": "downloads",
+            "d": "downloads",
+            "favorites": "favorites",
+            "favorite": "favorites",
+            "fav": "favorites",
+            "f": "favorites",
+            "positive": "positive",
+            "positives": "positive",
+            "positive_reactions": "positive",
+            "reactions": "positive",
+            "pos": "positive",
+            "p": "positive",
+            "negative": "negative",
+            "negatives": "negative",
+            "negative_reactions": "negative",
+            "dislike": "negative",
+            "dislikes": "negative",
+            "neg": "negative",
+            "n": "negative",
+        }
+        for token in args:
+            if "=" not in token:
+                return None
+            key_raw, value_raw = token.split("=", 1)
+            key = aliases.get(str(key_raw or "").strip().lower())
+            if not key:
+                return None
+            value = _parse_stat_range_token(value_raw)
+            if value is None:
+                return None
+            parsed[key] = value
+        return parsed
+
+    ranges = [_parse_stat_range_token(token) for token in args]
+    if any(item is None for item in ranges):
+        return None
+    resolved = [item for item in ranges if item is not None]
+    if len(resolved) == 2:
+        downloads, positive = resolved
+        return {
+            "downloads": downloads,
+            "favorites": positive,
+            "positive": positive,
+            "negative": defaults["negative"],
+        }
+    if len(resolved) == 3:
+        downloads, positive, negative = resolved
+        return {
+            "downloads": downloads,
+            "favorites": positive,
+            "positive": positive,
+            "negative": negative,
+        }
+    if len(resolved) == 4:
+        downloads, favorites, positive, negative = resolved
+        return {
+            "downloads": downloads,
+            "favorites": favorites,
+            "positive": positive,
+            "negative": negative,
+        }
+    return None
+
+
+async def seedbookstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = ensure_user_language(update, context)
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    if not update.effective_user or not _is_owner_user(update.effective_user.id):
+        await safe_reply(update, MESSAGES[lang].get("owner_only", MESSAGES[lang]["admin_only"]))
+        return
+
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if args and args[0].lower() in {"reset", "clear"}:
+        cleared = await run_blocking(db_clear_all_book_display_adjustments)
+        await target_message.reply_text(
+            MESSAGES[lang].get(
+                "seedbookstats_reset_done",
+                "✅ Randomized display stats cleared.\nCounter rows removed: {counter_rows}\nReaction rows removed: {reaction_rows}",
+            ).format(
+                counter_rows=int((cleared or {}).get("counter_rows", 0) or 0),
+                reaction_rows=int((cleared or {}).get("reaction_rows", 0) or 0),
+            )
+        )
+        return
+    context.user_data["pending_seedbookstats"] = {
+        "expires_at": time.time() + 300,
+    }
+    await target_message.reply_text(
+        MESSAGES[lang].get(
+            "seedbookstats_prompt",
+            "🎲 Endi stat diapazonlarini yuboring.\n\nMisollar:\n<blockquote>20-50 100-3000</blockquote>\n<blockquote>20-50 100-3000 0-10</blockquote>\n<blockquote>20-50 50-200 100-3000 0-10</blockquote>\n<blockquote>downloads=20-50 favorites=50-200 positive=100-3000 negative=0-10</blockquote>\n\nBekor qilish: cancel",
+        ),
+        parse_mode="HTML",
+    )
 
 
 def get_public_commands(lang: str = "en"):
@@ -4978,14 +5946,6 @@ def _build_start_greeting_text(lang: str, tg_user) -> str:
         return template
 
 
-def _build_start_greeting_intro(lang: str, tg_user) -> str:
-    first_name = (getattr(tg_user, "first_name", None) or "").strip() or "Friend"
-    return {
-        "uz": f"Assalomu alaykum, {first_name} 👋\n✨ Bot tayyorlanmoqda...",
-        "ru": f"Здравствуйте, {first_name} 👋\n✨ Готовлю бота...",
-        "en": f"Welcome, {first_name} 👋\n✨ Getting things ready...",
-    }.get(lang, f"Welcome, {first_name} 👋\n✨ Getting things ready...")
-
 def _admin_control_guide_text() -> str:
     return _menu_ui_admin_control_guide_text(_ADMIN_MENU_LABELS)
 
@@ -5122,6 +6082,21 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
         context.user_data["awaiting_request"] = False
         context.user_data.pop("awaiting_request_until", None)
         cancelled = True
+    if context.user_data.get("pending_book_reaction_edit"):
+        context.user_data.pop("pending_book_reaction_edit", None)
+        cancelled = True
+    if context.user_data.get("pending_book_comment"):
+        context.user_data.pop("pending_book_comment", None)
+        cancelled = True
+    if context.user_data.get("pending_comment_relay"):
+        context.user_data.pop("pending_comment_relay", None)
+        cancelled = True
+    if context.user_data.get("pending_forbidden_books"):
+        context.user_data.pop("pending_forbidden_books", None)
+        cancelled = True
+    if context.user_data.get("pending_seedbookstats"):
+        context.user_data.pop("pending_seedbookstats", None)
+        cancelled = True
     if context.user_data.get("admin_menu_prompt"):
         context.user_data.pop("admin_menu_prompt", None)
         cancelled = True
@@ -5138,8 +6113,9 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
     if action == "search":
         context.user_data["awaiting_book_search"] = True
         context.user_data["search_mode"] = "book"
+        search_prompt_text = m.get("menu_search_prompt", "Send a book name to search.")
         await update.message.reply_text(
-            m.get("menu_search_prompt", "Send a book name to search."),
+            search_prompt_text,
             reply_markup=_main_menu_keyboard(lang, "main", user_id),
             parse_mode="HTML",
         )
@@ -5238,6 +6214,20 @@ async def _send_animated_start_greeting(update: Update, context: ContextTypes.DE
     if not update.message:
         return False
     final_text = _build_start_greeting_text(lang, update.effective_user)
+    draft_started_at: float | None = None
+    if getattr(update.effective_chat, "type", None) == "private":
+        try:
+            if await push_private_text_draft(
+                context.bot,
+                update.effective_chat.id,
+                final_text,
+                parse_mode="HTML",
+                message_thread_id=getattr(update.message, "message_thread_id", None),
+            ):
+                draft_started_at = time.monotonic()
+        except Exception:
+            draft_started_at = None
+    await hold_private_transient_draft("greeting", draft_started_at)
     uid = update.effective_user.id if update.effective_user else None
     sent = await _send_with_retry(
         lambda: update.message.reply_text(
@@ -5266,6 +6256,20 @@ async def _edit_or_send_animated_start_greeting(query, context: ContextTypes.DEF
     uid = getattr(getattr(query, "from_user", None), "id", None)
     target_chat_id = getattr(getattr(target_message, "chat", None), "id", None) or uid
     reply_markup = _main_menu_keyboard(lang, "main", uid)
+    draft_started_at: float | None = None
+    if target_chat_id:
+        try:
+            if await push_private_text_draft(
+                context.bot,
+                target_chat_id,
+                final_text,
+                parse_mode="HTML",
+                message_thread_id=getattr(target_message, "message_thread_id", None) if target_message else None,
+            ):
+                draft_started_at = time.monotonic()
+        except Exception:
+            draft_started_at = None
+    await hold_private_transient_draft("greeting", draft_started_at)
 
     async def _cleanup_old_picker():
         if not target_message:
@@ -5404,16 +6408,28 @@ sync_unindexed_books = _upload_flow.sync_unindexed_books
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fallback photo handler for the core bot."""
+    relay_handler = getattr(_search_flow, "handle_pending_comment_relay_message", None)
+    if callable(relay_handler) and context.user_data.get("pending_comment_relay"):
+        if await relay_handler(update, context):
+            return
     await _raw_handle_photo_message(update, context)
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fallback document handler for uploads and book search."""
+    relay_handler = getattr(_search_flow, "handle_pending_comment_relay_message", None)
+    if callable(relay_handler) and context.user_data.get("pending_comment_relay"):
+        if await relay_handler(update, context):
+            return
     await _raw_handle_file(update, context)
 
 
 async def handle_video_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ignore standalone video/GIF media for the core bot."""
+    """Ignore standalone video/GIF media for the core bot unless a comment relay is pending."""
+    relay_handler = getattr(_search_flow, "handle_pending_comment_relay_message", None)
+    if callable(relay_handler) and context.user_data.get("pending_comment_relay"):
+        if await relay_handler(update, context):
+            return
     return
 
 
@@ -5840,6 +6856,32 @@ handle_audiobook_page_callback = _search_flow.handle_audiobook_page_callback
 handle_audiobook_part_play_callback = _search_flow.handle_audiobook_part_play_callback
 handle_audiobook_add_callback = _search_flow.handle_audiobook_add_callback
 handle_book_rename_callback = _search_flow.handle_book_rename_callback
+handle_book_reaction_edit_callback = _search_flow.handle_book_reaction_edit_callback
+handle_book_reaction_policy_callback = _search_flow.handle_book_reaction_policy_callback
+handle_book_comments_callback = _search_flow.handle_book_comments_callback
+handle_book_comment_thread_callback = _search_flow.handle_book_comment_thread_callback
+handle_book_comment_add_callback = _search_flow.handle_book_comment_add_callback
+handle_book_comment_reply_callback = _search_flow.handle_book_comment_reply_callback
+handle_my_comments_page_callback = _search_flow.handle_my_comments_page_callback
+handle_my_comment_view_callback = _search_flow.handle_my_comment_view_callback
+handle_my_comment_edit_callback = _search_flow.handle_my_comment_edit_callback
+handle_my_comment_delete_callback = _search_flow.handle_my_comment_delete_callback
+handle_my_chats_page_callback = _search_flow.handle_my_chats_page_callback
+handle_my_chat_view_callback = _search_flow.handle_my_chat_view_callback
+handle_my_chat_delete_callback = _search_flow.handle_my_chat_delete_callback
+comment_inbox_command = _search_flow.send_comments_inbox
+my_chats_command = _search_flow.send_my_chats_panel
+handle_comment_inbox_callback = _search_flow.handle_comment_inbox_callback
+handle_comment_conversation_callback = _search_flow.handle_comment_conversation_callback
+handle_comment_conversation_mute_callback = _search_flow.handle_comment_conversation_mute_callback
+handle_book_comment_relay_reply_callback = _search_flow.handle_book_comment_relay_reply_callback
+handle_book_comment_identity_request_callback = _search_flow.handle_book_comment_identity_request_callback
+handle_book_comment_identity_resolve_callback = _search_flow.handle_book_comment_identity_resolve_callback
+handle_book_comment_report_callback = _search_flow.handle_book_comment_report_callback
+handle_book_comment_user_ban_toggle_callback = _search_flow.handle_book_comment_user_ban_toggle_callback
+handle_book_comment_relay_block_callback = _search_flow.handle_book_comment_relay_block_callback
+handle_book_comment_relay_report_callback = _search_flow.handle_book_comment_relay_report_callback
+handle_book_comment_moderation_callback = _search_flow.handle_book_comment_moderation_callback
 handle_abook_audio = _search_flow.handle_abook_audio
 handle_page_callback = _search_flow.handle_page_callback
 handle_user_page_callback = _search_flow.handle_user_page_callback
@@ -7095,6 +8137,10 @@ def main():
         # Initialize DB
         init_db()
         logger.debug("DB connected")
+        try:
+            _load_private_live_status_settings()
+        except Exception as e:
+            logger.warning("Failed to load private draft timing settings: %s", e, exc_info=True)
         try:
             db_backfill_counters_if_empty()
         except Exception as e:

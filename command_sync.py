@@ -14,7 +14,7 @@ from telegram import (
 )
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
-_PUBLIC_PREFERRED_ORDER = ("start", "help", "settings", "random", "request", "top_users", "contact_admin")
+_PUBLIC_PREFERRED_ORDER = ("start", "help", "settings", "my_commands", "my_chats", "random", "request", "top_users", "contact_admin")
 _COMMAND_SYNC_BACKOFF_KEY = "command_sync_backoff_until"
 _USER_COMMANDS_LANG_CACHE_KEY = "user_commands_lang_cache"
 _USER_COMMANDS_LAST_SYNC_KEY = "user_commands_last_sync"
@@ -27,6 +27,8 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("start", "🚀 Start / choose language"),
             BotCommand("help", "❓ How to use the bot"),
             BotCommand("settings", "⚙️ Language and preferences"),
+            BotCommand("my_commands", "💬 View your book comments"),
+            BotCommand("my_chats", "📥 View your comment chats"),
             BotCommand("random", "🎲 Get 10 random books"),
             BotCommand("request", "📝 Request a missing book"),
             BotCommand("top_users", "🏆 View top users"),
@@ -36,6 +38,8 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("start", "🚀 Запуск / выбор языка"),
             BotCommand("help", "❓ Как пользоваться ботом"),
             BotCommand("settings", "⚙️ Язык и настройки"),
+            BotCommand("my_commands", "💬 Мои комментарии к книгам"),
+            BotCommand("my_chats", "📥 Мои чаты по комментариям"),
             BotCommand("random", "🎲 10 случайных книг"),
             BotCommand("request", "📝 Запросить книгу"),
             BotCommand("top_users", "🏆 Топ пользователей"),
@@ -45,6 +49,8 @@ def get_public_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("start", "🚀 Botni ishga tushirish / til tanlash"),
             BotCommand("help", "❓ Botdan foydalanish"),
             BotCommand("settings", "⚙️ Til va sozlamalar"),
+            BotCommand("my_commands", "💬 Kitob izohlarim"),
+            BotCommand("my_chats", "📥 Izoh chatlarim"),
             BotCommand("random", "🎲 10 ta tasodifiy kitob"),
             BotCommand("request", "📝 Yetishmayotgan kitobni so‘rash"),
             BotCommand("top_users", "🏆 Top foydalanuvchilar"),
@@ -112,9 +118,14 @@ def get_admin_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("start", "🚀 Start / choose language"),
             BotCommand("help", "❓ How to use the bot"),
             BotCommand("settings", "⚙️ Language and preferences"),
+            BotCommand("my_commands", "💬 View your book comments"),
+            BotCommand("my_chats", "📥 View your comment chats"),
             BotCommand("admin", "🛠 Open admin control"),
             BotCommand("upload", "⬆️ Upload books"),
             BotCommand("audit", "🧾 System audit report"),
+            BotCommand("negalert", "👎 Set negative reaction alert"),
+            BotCommand("seedbookstats", "🎲 Seed visible book stats"),
+            BotCommand("forbidden_books", "🛡 Manage forbidden book titles"),
             BotCommand("random", "🎲 Get 10 random books"),
             BotCommand("request", "📝 Request a missing book"),
             BotCommand("top_users", "🏆 View top users"),
@@ -124,9 +135,14 @@ def get_admin_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("start", "🚀 Запуск / выбор языка"),
             BotCommand("help", "❓ Как пользоваться ботом"),
             BotCommand("settings", "⚙️ Язык и настройки"),
+            BotCommand("my_commands", "💬 Мои комментарии к книгам"),
+            BotCommand("my_chats", "📥 Мои чаты по комментариям"),
             BotCommand("admin", "🛠 Открыть админ-панель"),
             BotCommand("upload", "⬆️ Загрузить книги"),
             BotCommand("audit", "🧾 Системный аудит"),
+            BotCommand("negalert", "👎 Порог отрицательных реакций"),
+            BotCommand("seedbookstats", "🎲 Заполнить видимую статистику"),
+            BotCommand("forbidden_books", "🛡 Управлять запрещёнными книгами"),
             BotCommand("random", "🎲 10 случайных книг"),
             BotCommand("request", "📝 Запросить книгу"),
             BotCommand("top_users", "🏆 Топ пользователей"),
@@ -136,9 +152,14 @@ def get_admin_commands(lang: str = "en") -> list[BotCommand]:
             BotCommand("start", "🚀 Botni ishga tushirish / til tanlash"),
             BotCommand("help", "❓ Botdan foydalanish"),
             BotCommand("settings", "⚙️ Til va sozlamalar"),
+            BotCommand("my_commands", "💬 Kitob izohlarim"),
+            BotCommand("my_chats", "📥 Izoh chatlarim"),
             BotCommand("admin", "🛠 Admin boshqaruvi"),
             BotCommand("upload", "⬆️ Kitob yuklash"),
             BotCommand("audit", "🧾 Tizim auditi"),
+            BotCommand("negalert", "👎 Salbiy reaksiya chegarasi"),
+            BotCommand("seedbookstats", "🎲 Ko‘rinadigan kitob statlarini to‘ldirish"),
+            BotCommand("forbidden_books", "🛡 Taqiqlangan kitoblarni boshqarish"),
             BotCommand("random", "🎲 10 ta tasodifiy kitob"),
             BotCommand("request", "📝 Yetishmayotgan kitobni so‘rash"),
             BotCommand("top_users", "🏆 Top foydalanuvchilar"),
@@ -198,6 +219,18 @@ async def set_bot_commands(
                 await application.bot.set_my_commands(
                     admin_commands,
                     scope=BotCommandScopeAllChatAdministrators(),
+                    language_code=lang,
+                )
+        if owner_id:
+            owner_chat_scope = BotCommandScopeChat(chat_id=int(owner_id))
+            await application.bot.set_my_commands(
+                get_admin_commands("en"),
+                scope=owner_chat_scope,
+            )
+            for lang in ("en", "ru", "uz"):
+                await application.bot.set_my_commands(
+                    get_admin_commands(lang),
+                    scope=owner_chat_scope,
                     language_code=lang,
                 )
         logger.debug("Bot commands set successfully")

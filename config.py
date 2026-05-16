@@ -86,6 +86,7 @@ COIN_REACTION = _env_int("COIN_REACTION", 1)
 COIN_FAVORITE = _env_int("COIN_FAVORITE", 1)
 COIN_REFERRAL = _env_int("COIN_REFERRAL", 15)
 TOP_USERS_LIMIT = _env_int("TOP_USERS_LIMIT", 10)
+BOOK_NEGATIVE_ALERT_THRESHOLD = max(2, _env_int("BOOK_NEGATIVE_ALERT_THRESHOLD", 2))
 
 
 def validate_runtime_config() -> list[str]:
