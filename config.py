@@ -121,6 +121,17 @@ def validate_runtime_config() -> list[str]:
 
 def validate_white_label_config() -> list[str]:
     errors: list[str] = []
-    if ENABLE_WHITE_LABEL and not CONNECTED_BOT_TOKEN_ENCRYPTION_KEY:
-        errors.append("CONNECTED_BOT_TOKEN_ENCRYPTION_KEY is required when ENABLE_WHITE_LABEL=true")
+    if ENABLE_WHITE_LABEL:
+        if not CONNECTED_BOT_TOKEN_ENCRYPTION_KEY:
+            errors.append("CONNECTED_BOT_TOKEN_ENCRYPTION_KEY is required when ENABLE_WHITE_LABEL=true")
+        else:
+            try:
+                from white_label.crypto import validate_encryption_key
+
+                validate_encryption_key(CONNECTED_BOT_TOKEN_ENCRYPTION_KEY)
+            except Exception:
+                errors.append(
+                    "CONNECTED_BOT_TOKEN_ENCRYPTION_KEY must be generated with "
+                    "cryptography.fernet.Fernet.generate_key()"
+                )
     return errors

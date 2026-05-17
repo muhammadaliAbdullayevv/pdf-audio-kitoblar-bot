@@ -77,6 +77,7 @@ async def send_book_via_connected_bot(
     requesting_message_id: int | None,
     bot,
     wait_seconds: int,
+    preparing_text: str | None = None,
 ) -> dict[str, Any]:
     expire_stale_connected_bot_cache_seed_jobs()
     current_book = dict(db_get_book_by_id(str(book_id or "").strip()) or {})
@@ -105,7 +106,7 @@ async def send_book_via_connected_bot(
         increment_connected_bot_usage(connected_bot_id, cache_misses=1)
         await bot.send_message(
             chat_id=int(chat_id),
-            text="Kitob tayyorlanmoqda, bir necha soniya kuting...",
+            text=str(preparing_text or "Kitob tayyorlanmoqda, bir necha soniya kuting..."),
         )
 
         seed_job = get_active_connected_bot_cache_seed_job(connected_bot_id, str(book_id or "").strip())

@@ -879,6 +879,7 @@ _SEARCH_FLOW_DEP_KEYS = (
     "_parse_seedbookstats_ranges",
     "_reply_search_menu_click_hint",
     "_today_str",
+    "process_pending_white_label_owner_input",
     "add_recent_download",
     "broadcast",
     "build_book_caption",
@@ -1351,6 +1352,12 @@ from white_label.db_helpers import (
     upsert_connected_bot as db_upsert_connected_bot,
 )
 from white_label.runtime_utils import build_bot_client as wl_build_bot_client
+from white_label.runtime_control import (
+    format_runtime_status as wl_format_runtime_status,
+    get_connected_bot_runtime_status as wl_get_runtime_status,
+    start_connected_bot_runtime as wl_start_runtime,
+    stop_connected_bot_runtime as wl_stop_runtime,
+)
 
 
 async def run_blocking(func, *args, **kwargs):
@@ -4860,7 +4867,20 @@ async def _white_label_activate_bot_impl(update: Update, context: ContextTypes.D
         await _verify_white_label_bot_token(decrypted_token)
         updated = await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ACTIVE, clear_error=True)
         await run_blocking(db_record_connected_bot_verification, str(row.get("id") or ""), last_error=None)
-        await target_message.reply_text(f"✅ Connected bot activated: {format_connected_bot_reference(updated or row)}")
+        runtime_result = await wl_start_runtime(context.application.bot_data, dict(updated or row))
+        if not runtime_result.get("ok"):
+            runtime_line = f"Runtime: start failed ({runtime_result.get('error') or 'unknown error'})"
+        else:
+            runtime_line = "Runtime: already running" if runtime_result.get("already_running") else f"Runtime: started, PID {runtime_result.get('pid') or '-'}"
+        await target_message.reply_text(
+            "\n".join(
+                [
+                    f"✅ Connected bot activated: {format_connected_bot_reference(updated or row)}",
+                    runtime_line,
+                    f"Stop later: /wl_stop_bot {format_connected_bot_reference(updated or row)}",
+                ]
+            )
+        )
     except Exception as exc:
         error_text = wl_redact_token_like_strings(str(exc))
         await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ERROR, last_error=error_text)
@@ -4884,7 +4904,16 @@ async def _white_label_suspend_bot_impl(update: Update, context: ContextTypes.DE
         await target_message.reply_text("⚠️ Connected bot not found.")
         return
     updated = await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_SUSPENDED, clear_error=False)
-    await target_message.reply_text(f"⏸️ Connected bot suspended: {format_connected_bot_reference(updated or row)}")
+    runtime_result = await wl_stop_runtime(context.application.bot_data, str(row.get("id") or ""))
+    runtime_line = "Runtime: already stopped" if runtime_result.get("already_stopped") else f"Runtime: {runtime_result.get('state') or 'STOPPED'}"
+    await target_message.reply_text(
+        "\n".join(
+            [
+                f"⏸️ Connected bot suspended: {format_connected_bot_reference(updated or row)}",
+                runtime_line,
+            ]
+        )
+    )
 
 
 async def _white_label_delete_bot_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4903,11 +4932,122 @@ async def _white_label_delete_bot_impl(update: Update, context: ContextTypes.DEF
     if not row:
         await target_message.reply_text("⚠️ Connected bot not found.")
         return
+    await wl_stop_runtime(context.application.bot_data, str(row.get("id") or ""))
     deleted = await run_blocking(db_delete_connected_bot, str(row.get("id") or ""))
     if int(deleted or 0) <= 0:
         await target_message.reply_text("⚠️ Connected bot could not be deleted.")
         return
     await target_message.reply_text(f"🗑️ Connected bot deleted: {format_connected_bot_reference(row)}")
+
+
+async def _white_label_start_bot_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if not args:
+        await target_message.reply_text("⚠️ Usage: /wl_start_bot @botusername")
+        return
+    row = await run_blocking(db_get_connected_bot_by_identifier, normalize_connected_bot_identifier(args[0]))
+    if not row:
+        await target_message.reply_text("⚠️ Connected bot not found.")
+        return
+    if str(row.get("status") or "").upper() != WL_STATUS_ACTIVE:
+        await target_message.reply_text("⚠️ Activate this connected bot first with /wl_activate_bot @botusername.")
+        return
+    if not int(row.get("cache_channel_id") or 0):
+        await target_message.reply_text("⚠️ Set the cache channel first with /wl_set_cache_channel.")
+        return
+    try:
+        result = await wl_start_runtime(context.application.bot_data, dict(row))
+        if not result.get("ok"):
+            await target_message.reply_text(f"⚠️ Connected bot runtime did not start.\n{result.get('error') or 'unknown error'}")
+            return
+        if result.get("already_running"):
+            await target_message.reply_text(
+                "\n".join(
+                    [
+                        f"✅ Connected bot runtime is already running: {format_connected_bot_reference(row)}",
+                        f"PID: {result.get('pid') or '-'}",
+                    ]
+                )
+            )
+            return
+        await target_message.reply_text(
+            "\n".join(
+                [
+                    f"✅ Connected bot runtime started: {format_connected_bot_reference(row)}",
+                    f"PID: {result.get('pid') or '-'}",
+                    f"Stop: /wl_stop_bot {format_connected_bot_reference(row)}",
+                ]
+            )
+        )
+    except Exception as exc:
+        error_text = wl_redact_token_like_strings(str(exc))
+        await target_message.reply_text(f"⚠️ Could not start connected bot runtime.\n{error_text}")
+
+
+async def _white_label_stop_bot_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if not args:
+        await target_message.reply_text("⚠️ Usage: /wl_stop_bot @botusername")
+        return
+    row = await run_blocking(db_get_connected_bot_by_identifier, normalize_connected_bot_identifier(args[0]))
+    if not row:
+        await target_message.reply_text("⚠️ Connected bot not found.")
+        return
+    result = await wl_stop_runtime(context.application.bot_data, str(row.get("id") or ""))
+    if result.get("already_stopped"):
+        await target_message.reply_text(f"ℹ️ Connected bot runtime was already stopped: {format_connected_bot_reference(row)}")
+        return
+    await target_message.reply_text(
+        "\n".join(
+            [
+                f"🛑 Connected bot runtime stopped: {format_connected_bot_reference(row)}",
+                f"Result: {result.get('state') or 'STOPPED'}",
+                f"PID: {result.get('pid') or '-'}",
+            ]
+        )
+    )
+
+
+async def _white_label_runtime_status_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    args = [str(arg or "").strip() for arg in (context.args or []) if str(arg or "").strip()]
+    if args:
+        row = await run_blocking(db_get_connected_bot_by_identifier, normalize_connected_bot_identifier(args[0]))
+        if not row:
+            await target_message.reply_text("⚠️ Connected bot not found.")
+            return
+        status = await wl_get_runtime_status(context.application.bot_data, str(row.get("id") or ""))
+        await target_message.reply_text(wl_format_runtime_status(row, status))
+        return
+    rows = await run_blocking(db_list_connected_bots)
+    if not rows:
+        await target_message.reply_text("No connected bots yet.")
+        return
+    blocks = ["🤖 Connected bot runtimes"]
+    for row in rows:
+        status = await wl_get_runtime_status(context.application.bot_data, str(row.get("id") or ""))
+        blocks.append(wl_format_runtime_status(row, status))
+    await target_message.reply_text("\n\n".join(blocks))
 
 
 async def _white_label_test_cache_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4953,7 +5093,12 @@ async def _white_label_test_cache_impl(update: Update, context: ContextTypes.DEF
         return
     deadline = time.monotonic() + max(5, int(WHITE_LABEL_CACHE_WAIT_SECONDS))
     while time.monotonic() < deadline:
-        cache_row = await run_blocking(db_get_connected_bot_file_cache, str(row.get("id") or ""), str(book.get("id") or ""), True)
+        cache_row = await run_blocking(
+            db_get_connected_bot_file_cache,
+            str(row.get("id") or ""),
+            str(book.get("id") or ""),
+            only_valid=True,
+        )
         if cache_row and str(cache_row.get("telegram_file_id") or "").strip():
             await target_message.reply_text(
                 "\n".join(
@@ -4969,7 +5114,7 @@ async def _white_label_test_cache_impl(update: Update, context: ContextTypes.DEF
         await asyncio.sleep(1.0)
     await target_message.reply_text(
         "⚠️ Cache seed was sent, but the connected bot did not confirm the cached file within the wait window.\n"
-        "Make sure the connected bot runtime is running and both bots are admins in the cache channel."
+        "Make sure the connected bot runtime is running with /wl_start_bot and both bots are admins in the cache channel."
     )
 
 
@@ -4991,6 +5136,18 @@ async def wl_suspend_bot_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def wl_activate_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await owner_only_command(update, context, _white_label_activate_bot_impl)
+
+
+async def wl_start_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_start_bot_impl)
+
+
+async def wl_stop_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_stop_bot_impl)
+
+
+async def wl_runtime_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _white_label_runtime_status_impl)
 
 
 async def wl_delete_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

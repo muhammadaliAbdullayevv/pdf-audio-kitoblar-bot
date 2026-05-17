@@ -46,9 +46,10 @@ from .runtime_utils import configure_application_builder
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("white_label.runtime")
 _LOCK_FH = None
+_SUPPORTED_LANGS = {"uz", "en", "ru"}
 
 
-def _lang_from_update(update: Update) -> str:
+def _default_lang_from_update(update: Update) -> str:
     code = str(getattr(getattr(update, "effective_user", None), "language_code", "") or "").strip().lower()
     if code.startswith("uz"):
         return "uz"
@@ -57,20 +58,101 @@ def _lang_from_update(update: Update) -> str:
     return "en"
 
 
+def _lang_from_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    user_id = int(getattr(getattr(update, "effective_user", None), "id", 0) or 0)
+    user_languages = context.application.bot_data.setdefault("_wl_user_languages", {})
+    lang = str(user_languages.get(user_id) or "").strip().lower()
+    if lang in _SUPPORTED_LANGS:
+        return lang
+    return _default_lang_from_update(update)
+
+
+def _set_user_lang(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> None:
+    user_id = int(getattr(getattr(update, "effective_user", None), "id", 0) or 0)
+    if not user_id:
+        return
+    lang = str(lang or "").strip().lower()
+    if lang not in _SUPPORTED_LANGS:
+        return
+    context.application.bot_data.setdefault("_wl_user_languages", {})[user_id] = lang
+
+
 def _messages(lang: str) -> dict[str, str]:
-    defaults = {
-        "start": "👋 Welcome.\nSend a book name and I will search the catalog for you.",
-        "help": "📚 Send a book name in private chat to search.\nThen tap one of the numbered buttons to receive the PDF.",
-        "private_only": "💬 This bot works in private chat only for now.",
-        "results_empty": "❌ No matching PDF books were found.",
-        "limit_reached": "Bugungi limit tugadi. Bot egasi bilan bog‘laning.",
-        "book_unavailable": "⚠️ This book is not available for this bot right now.",
-        "retry_later": "Kitob tayyorlanmoqda. Iltimos, birozdan keyin qayta urinib ko‘ring.",
-        "send_failed": "⚠️ Kitobni yuborib bo‘lmadi. Keyinroq qayta urinib ko‘ring.",
-        "suspended": "⚠️ This connected bot is not active right now.",
+    localized_defaults = {
+        "uz": {
+            "start": "👋 Xush kelibsiz.\nTilni tanlang yoki kitob nomini yuboring.",
+            "help": "📚 Kitob qidirish uchun shaxsiy chatda kitob nomini yuboring.\nPDF olish uchun raqamli tugmalardan birini bosing.",
+            "choose_language": "🌐 Tilni tanlang:",
+            "language_saved": "✅ Til tanlandi.",
+            "private_only": "💬 Bu bot hozircha faqat shaxsiy chatda ishlaydi.",
+            "results_empty": "❌ Mos PDF kitob topilmadi.",
+            "limit_reached": "Bugungi limit tugadi. Bot egasi bilan bog‘laning.",
+            "book_unavailable": "⚠️ Bu kitob hozircha ushbu botda mavjud emas.",
+            "preparing": "Kitob tayyorlanmoqda, bir necha soniya kuting...",
+            "retry_later": "Kitob tayyorlanmoqda. Iltimos, birozdan keyin qayta urinib ko‘ring.",
+            "send_failed": "⚠️ Kitobni yuborib bo‘lmadi. Keyinroq qayta urinib ko‘ring.",
+            "suspended": "⚠️ Bu ulangan bot hozir faol emas.",
+        },
+        "en": {
+            "start": "👋 Welcome.\nChoose a language or send a book name.",
+            "help": "📚 Send a book name in private chat to search.\nThen tap one of the numbered buttons to receive the PDF.",
+            "choose_language": "🌐 Choose language:",
+            "language_saved": "✅ Language saved.",
+            "private_only": "💬 This bot works in private chat only for now.",
+            "results_empty": "❌ No matching PDF books were found.",
+            "limit_reached": "Today's limit is finished. Please contact the bot owner.",
+            "book_unavailable": "⚠️ This book is not available for this bot right now.",
+            "preparing": "The book is being prepared. Please wait a few seconds...",
+            "retry_later": "The book is still being prepared. Please try again later.",
+            "send_failed": "⚠️ Could not send the book. Please try again later.",
+            "suspended": "⚠️ This connected bot is not active right now.",
+        },
+        "ru": {
+            "start": "👋 Добро пожаловать.\nВыберите язык или отправьте название книги.",
+            "help": "📚 Отправьте название книги в личном чате.\nЗатем нажмите одну из цифровых кнопок, чтобы получить PDF.",
+            "choose_language": "🌐 Выберите язык:",
+            "language_saved": "✅ Язык сохранен.",
+            "private_only": "💬 Сейчас бот работает только в личном чате.",
+            "results_empty": "❌ Подходящие PDF-книги не найдены.",
+            "limit_reached": "Дневной лимит закончился. Свяжитесь с владельцем бота.",
+            "book_unavailable": "⚠️ Эта книга сейчас недоступна в этом боте.",
+            "preparing": "Книга готовится. Подождите несколько секунд...",
+            "retry_later": "Книга все еще готовится. Пожалуйста, попробуйте позже.",
+            "send_failed": "⚠️ Не удалось отправить книгу. Попробуйте позже.",
+            "suspended": "⚠️ Этот подключенный бот сейчас не активен.",
+        },
     }
+    defaults = localized_defaults.get(lang, localized_defaults["en"])
     language_messages = MESSAGES.get(lang, MESSAGES.get("en", {}))
     return {key: language_messages.get(f"white_label_{key}", value) for key, value in defaults.items()}
+
+
+def _language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🇺🇿 Uzbek", callback_data="wllang:uz"),
+                InlineKeyboardButton("🇬🇧 English", callback_data="wllang:en"),
+                InlineKeyboardButton("🇷🇺 Русский", callback_data="wllang:ru"),
+            ]
+        ]
+    )
+
+
+def _numbered_keyboard(books: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, book in enumerate(books, start=1):
+        book_id = str(book.get("id") or "").strip()
+        if not book_id:
+            continue
+        row.append(InlineKeyboardButton(str(idx), callback_data=f"wlbook:{book_id}"))
+        if len(row) >= 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
 
 
 def _acquire_instance_lock(connected_bot_id: str) -> bool:
@@ -147,8 +229,13 @@ async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     if getattr(update.effective_chat, "type", "") != "private":
         return
-    lang = _lang_from_update(update)
-    await update.message.reply_text(_messages(lang)["start"])
+    lang = _lang_from_context(update, context)
+    _set_user_lang(update, context, lang)
+    text_bundle = _messages(lang)
+    await update.message.reply_text(
+        f"{text_bundle['choose_language']}\n\n{text_bundle['start']}",
+        reply_markup=_language_keyboard(),
+    )
 
 
 async def _handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -156,14 +243,40 @@ async def _handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if getattr(update.effective_chat, "type", "") != "private":
         return
-    lang = _lang_from_update(update)
-    await update.message.reply_text(_messages(lang)["help"])
+    lang = _lang_from_context(update, context)
+    await update.message.reply_text(_messages(lang)["help"], reply_markup=_language_keyboard())
+
+
+async def _handle_language_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    data = str(query.data or "")
+    if not data.startswith("wllang:"):
+        await query.answer()
+        return
+    lang = data.split(":", 1)[1].strip().lower()
+    if lang not in _SUPPORTED_LANGS:
+        await query.answer()
+        return
+    _set_user_lang(update, context, lang)
+    text_bundle = _messages(lang)
+    await query.answer(text_bundle["language_saved"])
+    if query.message:
+        try:
+            await query.message.edit_text(
+                f"{text_bundle['language_saved']}\n\n{text_bundle['start']}",
+                reply_markup=_language_keyboard(),
+            )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
 
 
 async def _handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
-    lang = _lang_from_update(update)
+    lang = _lang_from_context(update, context)
     text_bundle = _messages(lang)
     if getattr(update.effective_chat, "type", "") != "private":
         await update.message.reply_text(text_bundle["private_only"])
@@ -188,16 +301,15 @@ async def _handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(text_bundle["results_empty"])
         return
 
-    result_text = build_results_message(query, books, page=1, pages=1)
-    buttons = [[InlineKeyboardButton(str(idx), callback_data=f"wlbook:{str(book.get('id') or '').strip()}")] for idx, book in enumerate(books, start=1)]
-    await update.message.reply_text(result_text, reply_markup=InlineKeyboardMarkup(buttons))
+    result_text = build_results_message(query, books, page=1, pages=1, lang=lang)
+    await update.message.reply_text(result_text, reply_markup=_numbered_keyboard(books))
 
 
 async def _handle_book_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
         return
-    lang = _lang_from_update(update)
+    lang = _lang_from_context(update, context)
     text_bundle = _messages(lang)
     try:
         data = str(query.data or "")
@@ -222,6 +334,7 @@ async def _handle_book_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             requesting_message_id=int(query.message.message_id) if query.message else None,
             bot=context.bot,
             wait_seconds=WHITE_LABEL_CACHE_WAIT_SECONDS,
+            preparing_text=text_bundle["preparing"],
         )
         if result.get("ok"):
             _record_send(context.application, connected_bot)
@@ -297,6 +410,8 @@ def build_application(token: str, connected_bot_id: str):
     application.bot_data["connected_bot_id"] = connected_bot_id
     application.add_handler(CommandHandler("start", _handle_start))
     application.add_handler(CommandHandler("help", _handle_help))
+    application.add_handler(CommandHandler("language", _handle_start))
+    application.add_handler(CallbackQueryHandler(_handle_language_pick, pattern=r"^wllang:"))
     application.add_handler(CallbackQueryHandler(_handle_book_pick, pattern=r"^wlbook:"))
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, _handle_cache_channel_post))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, _handle_search))

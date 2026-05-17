@@ -173,10 +173,30 @@ def search_connected_books(query: str, limit: int = 5) -> list[dict]:
     return results[:limit]
 
 
-def build_results_message(query: str, books: list[dict], *, page: int = 1, pages: int = 1) -> str:
-    lines = [f"📚 {len(books)} ta natija topildi", f"{query}", f"Sahifa {page}/{pages}", ""]
+def build_results_message(query: str, books: list[dict], *, page: int = 1, pages: int = 1, lang: str = "uz") -> str:
+    labels = {
+        "uz": {
+            "found": f"📚 {len(books)} ta natija topildi",
+            "page": f"Sahifa {page}/{pages}",
+            "hint": "👇 Pastdagi raqamli tugmalardan birini bosing.",
+        },
+        "en": {
+            "found": f"📚 {len(books)} results found",
+            "page": f"Page {page}/{pages}",
+            "hint": "👇 Tap one of the numbered buttons below.",
+        },
+        "ru": {
+            "found": f"📚 Найдено результатов: {len(books)}",
+            "page": f"Страница {page}/{pages}",
+            "hint": "👇 Нажмите одну из цифровых кнопок ниже.",
+        },
+    }.get(str(lang or "").strip().lower(), {
+        "found": f"📚 {len(books)} results found",
+        "page": f"Page {page}/{pages}",
+        "hint": "👇 Tap one of the numbered buttons below.",
+    })
+    lines = [labels["found"], f"{query}", labels["page"], ""]
     for idx, book in enumerate(books, start=1):
         lines.append(f"{idx}. {_title_for_book(book)}")
-    lines.extend(["", "👇 Pastdagi raqamli tugmalardan birini bosing."])
+    lines.extend(["", labels["hint"]])
     return "\n".join(lines)
-

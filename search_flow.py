@@ -4442,13 +4442,24 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
+        has_pending_white_label = bool(
+            context.user_data.get("pending_wl_add_bot")
+            or context.user_data.get("pending_wl_set_cache_channel")
+        )
         pending_white_label_fn = globals().get("process_pending_white_label_owner_input")
         if callable(pending_white_label_fn):
             try:
                 if await pending_white_label_fn(update, context, lang):
                     return
-            except Exception:
+            except Exception as e:
+                if has_pending_white_label and callable(globals().get("_is_owner_user")) and _is_owner_user(update.effective_user.id):
+                    logger.warning("white-label pending owner input failed: %s", e, exc_info=True)
+                    await update.message.reply_text(MESSAGES[lang]["error"])
+                    return
                 pass
+        elif has_pending_white_label and callable(globals().get("_is_owner_user")) and _is_owner_user(update.effective_user.id):
+            await update.message.reply_text(MESSAGES[lang]["error"])
+            return
 
         if await _reply_private_language_picker_again(update, context):
             return

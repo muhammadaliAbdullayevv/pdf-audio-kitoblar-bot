@@ -90,6 +90,9 @@ REQUIRED_DEP_KEYS = (
     "wl_list_bots_command",
     "wl_suspend_bot_command",
     "wl_activate_bot_command",
+    "wl_start_bot_command",
+    "wl_stop_bot_command",
+    "wl_runtime_status_command",
     "wl_delete_bot_command",
     "wl_test_bot_command",
     "wl_test_cache_command",
@@ -211,6 +214,9 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CommandHandler("wl_list_bots", d["wl_list_bots_command"]))
     app.add_handler(CommandHandler("wl_suspend_bot", d["wl_suspend_bot_command"]))
     app.add_handler(CommandHandler("wl_activate_bot", d["wl_activate_bot_command"]))
+    app.add_handler(CommandHandler("wl_start_bot", d["wl_start_bot_command"]))
+    app.add_handler(CommandHandler("wl_stop_bot", d["wl_stop_bot_command"]))
+    app.add_handler(CommandHandler("wl_runtime_status", d["wl_runtime_status_command"]))
     app.add_handler(CommandHandler("wl_delete_bot", d["wl_delete_bot_command"]))
     app.add_handler(CommandHandler("wl_test_bot", d["wl_test_bot_command"]))
     app.add_handler(CommandHandler("wl_test_cache", d["wl_test_cache_command"]))
