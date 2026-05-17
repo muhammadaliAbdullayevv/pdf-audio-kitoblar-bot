@@ -2730,16 +2730,6 @@ def build_book_keyboard(
         ],
     ]
 
-    if open_private_url:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    open_private_label or m.get("group_open_private_results", "Open in bot"),
-                    url=open_private_url,
-                )
-            ]
-        )
-
     if show_listen_button:
         listen_label = m.get("audiobook_listen_button", "🎧 Listen Audiobook")
         rows.append([InlineKeyboardButton(listen_label, callback_data=f"abook:{book_id}")])
@@ -2798,6 +2788,16 @@ def build_book_keyboard(
                 InlineKeyboardButton(
                     more_books_label or m.get("inline_more_books_button", "📚 More books"),
                     url=more_books_url,
+                )
+            ]
+        )
+
+    if open_private_url:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    open_private_label or m.get("group_open_private_results", "Open in bot"),
+                    url=open_private_url,
                 )
             ]
         )
