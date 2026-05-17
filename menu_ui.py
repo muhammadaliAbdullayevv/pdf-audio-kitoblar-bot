@@ -24,6 +24,7 @@ ADMIN_MENU_LABELS = {
     "admin_cancel_task": "🛑 Cancel Task",
     "admin_worker_status": "📈 Worker Status",
     "admin_live_activity": "📡 Live Activity",
+    "admin_white_label": "🤖 White Label",
 }
 
 
@@ -201,6 +202,7 @@ def main_menu_text_action(
         "menu_myprofile": "myprofile",
         "menu_top_books": "top_books",
         "menu_top_users": "top_users",
+        "menu_connect_book_bot": "connect_book_bot",
         "menu_upload": "upload",
         "menu_contact_admin": "contact_admin",
         "menu_help": "help",
@@ -235,6 +237,7 @@ def main_menu_text_action(
         "admin_cancel_task": "admin_cancel_task",
         "admin_worker_status": "admin_worker_status",
         "admin_live_activity": "admin_live_activity",
+        "admin_white_label": "admin_white_label",
     }
     for label_key, action in admin_action_map.items():
         if text == labels[label_key]:

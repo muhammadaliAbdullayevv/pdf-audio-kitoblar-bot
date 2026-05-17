@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from collections import defaultdict, deque
+from datetime import datetime
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -92,6 +93,7 @@ def _messages(lang: str) -> dict[str, str]:
             "retry_later": "Kitob tayyorlanmoqda. Iltimos, birozdan keyin qayta urinib ko‘ring.",
             "send_failed": "⚠️ Kitobni yuborib bo‘lmadi. Keyinroq qayta urinib ko‘ring.",
             "suspended": "⚠️ Bu ulangan bot hozir faol emas.",
+            "trial_expired": "Trial muddati tugadi. Davom ettirish uchun bot egasiga murojaat qiling.",
         },
         "en": {
             "start": "👋 Welcome.\nChoose a language or send a book name.",
@@ -106,6 +108,7 @@ def _messages(lang: str) -> dict[str, str]:
             "retry_later": "The book is still being prepared. Please try again later.",
             "send_failed": "⚠️ Could not send the book. Please try again later.",
             "suspended": "⚠️ This connected bot is not active right now.",
+            "trial_expired": "The trial period has ended. Please contact the bot owner to continue.",
         },
         "ru": {
             "start": "👋 Добро пожаловать.\nВыберите язык или отправьте название книги.",
@@ -120,6 +123,7 @@ def _messages(lang: str) -> dict[str, str]:
             "retry_later": "Книга все еще готовится. Пожалуйста, попробуйте позже.",
             "send_failed": "⚠️ Не удалось отправить книгу. Попробуйте позже.",
             "suspended": "⚠️ Этот подключенный бот сейчас не активен.",
+            "trial_expired": "Trial закончился. Для продолжения свяжитесь с владельцем бота.",
         },
     }
     defaults = localized_defaults.get(lang, localized_defaults["en"])
@@ -224,6 +228,25 @@ def _daily_limit_reached(connected_bot: dict, usage: dict | None, *, for_send: b
     return int(usage.get("searches") or 0) >= int(connected_bot.get("daily_search_limit") or 0)
 
 
+def _connected_bot_trial_expired(connected_bot: dict) -> bool:
+    plan = str((connected_bot or {}).get("plan") or "").strip().upper()
+    subscription_status = str((connected_bot or {}).get("subscription_status") or "").strip().upper()
+    if subscription_status == "EXPIRED":
+        return True
+    if plan != "TRIAL":
+        return False
+    trial_ends_at = (connected_bot or {}).get("trial_ends_at")
+    if not trial_ends_at:
+        return False
+    try:
+        if isinstance(trial_ends_at, datetime):
+            return datetime.utcnow() > trial_ends_at.replace(tzinfo=None)
+        text = str(trial_ends_at).replace("Z", "").split("+", 1)[0].strip()
+        return datetime.utcnow() > datetime.fromisoformat(text).replace(tzinfo=None)
+    except Exception:
+        return False
+
+
 async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -285,6 +308,9 @@ async def _handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not connected_bot or str(connected_bot.get("status") or "").upper() != WL_STATUS_ACTIVE:
         await update.message.reply_text(text_bundle["suspended"])
         return
+    if _connected_bot_trial_expired(connected_bot):
+        await update.message.reply_text(text_bundle["trial_expired"])
+        return
     usage = await asyncio.to_thread(get_connected_bot_usage, str(connected_bot.get("id") or ""))
     if _daily_limit_reached(connected_bot, usage, for_send=False):
         await update.message.reply_text(text_bundle["limit_reached"])
@@ -320,6 +346,9 @@ async def _handle_book_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         connected_bot = await _load_connected_bot_config(context)
         if not connected_bot or str(connected_bot.get("status") or "").upper() != WL_STATUS_ACTIVE:
             await query.answer(text_bundle["suspended"], show_alert=True)
+            return
+        if _connected_bot_trial_expired(connected_bot):
+            await query.answer(text_bundle["trial_expired"], show_alert=True)
             return
         usage = await asyncio.to_thread(get_connected_bot_usage, str(connected_bot.get("id") or ""))
         if _daily_limit_reached(connected_bot, usage, for_send=True) or not _can_send_now(context.application, connected_bot):

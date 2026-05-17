@@ -20,13 +20,17 @@ from white_label.crypto import (
     redact_token_like_strings,
 )
 from white_label.db_helpers import (
+    accept_connected_bot_request,
     create_connected_bot_cache_seed_job,
+    create_connected_bot_request,
     delete_connected_bot,
+    find_existing_connected_bot_request_or_bot,
     get_active_connected_bot_cache_seed_job,
     get_connected_bot_file_cache,
     get_connected_bot_usage,
     increment_connected_bot_usage,
     mark_connected_bot_file_cache_invalid,
+    reject_connected_bot_request,
     upsert_connected_bot,
     upsert_connected_bot_file_cache,
 )
@@ -80,6 +84,14 @@ def _cleanup_db_rows(connected_bot_id: str) -> None:
             cur.execute("DELETE FROM connected_bots WHERE id=%s", (connected_bot_id,))
 
 
+def _cleanup_db_request(request_id: str, connected_bot_id: str | None = None) -> None:
+    with db.db_conn() as conn:
+        with conn.cursor() as cur:
+            if connected_bot_id:
+                cur.execute("DELETE FROM connected_bots WHERE id=%s", (connected_bot_id,))
+            cur.execute("DELETE FROM connected_bot_requests WHERE id=%s", (request_id,))
+
+
 def _test_db_helpers() -> None:
     key = base64.urlsafe_b64encode(b"2" * 32).decode()
     token = f"654321:{uuid.uuid4().hex}"
@@ -87,6 +99,65 @@ def _test_db_helpers() -> None:
     bot_username = f"wltestbot_{uuid.uuid4().hex[:8]}"
     encrypted = encrypt_bot_token(token, key) if is_crypto_available() else "encrypted-token-placeholder"
     fingerprint = fingerprint_bot_token(token, key)
+
+    request_token = f"777777:{uuid.uuid4().hex}"
+    request_encrypted = encrypt_bot_token(request_token, key) if is_crypto_available() else "encrypted-request-token-placeholder"
+    request_fingerprint = fingerprint_bot_token(request_token, key)
+    request_bot_id = 920000000 + (uuid.uuid4().int % 100000)
+    request_row = create_connected_bot_request(
+        requesting_user_id=999999002,
+        requesting_username="requester",
+        requesting_first_name="Requester",
+        bot_telegram_id=request_bot_id,
+        bot_username=f"wlrequestbot_{uuid.uuid4().hex[:8]}",
+        bot_first_name="WL Request Bot",
+        bot_token_encrypted=request_encrypted,
+        bot_token_fingerprint=request_fingerprint,
+        token_masked="777777:***test",
+    )
+    request_id = str(request_row.get("id") or "")
+    accepted_bot_id = ""
+    try:
+        duplicate = find_existing_connected_bot_request_or_bot(
+            token_fingerprint=request_fingerprint,
+            bot_telegram_id=request_bot_id,
+        )
+        _assert(duplicate is not None and str(duplicate.get("source") or "") == "request", "pending request duplicate should be found")
+        accepted = accept_connected_bot_request(
+            request_id,
+            accepted_by_owner_id=999999000,
+            cache_channel_id=-1001234567890,
+            trial_days=3,
+            daily_search_limit=100,
+            daily_send_limit=20,
+            per_minute_send_limit=10,
+        )
+        accepted_bot_id = str((accepted or {}).get("id") or "")
+        _assert(accepted_bot_id, "accepting request should create a connected bot")
+        _assert(str((accepted or {}).get("plan") or "") == "TRIAL", "accepted bot should start on TRIAL plan")
+        _assert(int((accepted or {}).get("daily_send_limit") or 0) == 20, "accepted bot should use trial send limit")
+    finally:
+        _cleanup_db_request(request_id, accepted_bot_id or None)
+
+    reject_token = f"888888:{uuid.uuid4().hex}"
+    reject_fp = fingerprint_bot_token(reject_token, key)
+    reject_req = create_connected_bot_request(
+        requesting_user_id=999999003,
+        requesting_username=None,
+        requesting_first_name="Rejecter",
+        bot_telegram_id=930000000 + (uuid.uuid4().int % 100000),
+        bot_username=f"wlrejectbot_{uuid.uuid4().hex[:8]}",
+        bot_first_name="WL Reject Bot",
+        bot_token_encrypted=encrypt_bot_token(reject_token, key) if is_crypto_available() else "encrypted-reject-token-placeholder",
+        bot_token_fingerprint=reject_fp,
+        token_masked="888888:***test",
+    )
+    reject_request_id = str(reject_req.get("id") or "")
+    try:
+        rejected = reject_connected_bot_request(reject_request_id, rejected_by_owner_id=999999000, reason="test")
+        _assert(str((rejected or {}).get("status") or "") == "REJECTED", "reject helper should mark request rejected")
+    finally:
+        _cleanup_db_request(reject_request_id)
 
     books = db.list_books()
     if not books:

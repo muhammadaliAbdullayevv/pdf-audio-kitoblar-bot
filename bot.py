@@ -1323,7 +1323,13 @@ import user_interactions as _user_interactions
 import upload_flow as _upload_flow
 import command_sync as _command_sync
 import handler_registry as _handler_registry
-from white_label import WL_STATUS_ACTIVE, WL_STATUS_ERROR, WL_STATUS_SUSPENDED
+from white_label import (
+    WL_PLAN_TRIAL,
+    WL_REQUEST_STATUS_PENDING,
+    WL_STATUS_ACTIVE,
+    WL_STATUS_ERROR,
+    WL_STATUS_SUSPENDED,
+)
 from white_label.cache_seeding import seed_connected_bot_cache
 from white_label.commands import (
     build_connected_bot_list_text,
@@ -1339,14 +1345,24 @@ from white_label.crypto import (
     redact_token_like_strings as wl_redact_token_like_strings,
 )
 from white_label.db_helpers import (
+    accept_connected_bot_request as db_accept_connected_bot_request,
+    count_connected_bot_requests as db_count_connected_bot_requests,
+    count_connected_bots as db_count_connected_bots,
     create_connected_bot_cache_seed_job as db_create_connected_bot_cache_seed_job,
+    create_connected_bot_request as db_create_connected_bot_request,
     delete_connected_bot as db_delete_connected_bot,
+    find_existing_connected_bot_request_or_bot as db_find_existing_connected_bot_request_or_bot,
     get_connected_bot_by_id as db_get_connected_bot_by_id,
     get_connected_bot_by_identifier as db_get_connected_bot_by_identifier,
     get_connected_bot_cache_seed_job_by_token as db_get_connected_bot_cache_seed_job_by_token,
     get_connected_bot_file_cache as db_get_connected_bot_file_cache,
+    get_connected_bot_request_by_id as db_get_connected_bot_request_by_id,
+    get_connected_bot_usage as db_get_connected_bot_usage,
+    list_connected_bot_requests as db_list_connected_bot_requests,
     list_connected_bots as db_list_connected_bots,
+    list_connected_bots_page as db_list_connected_bots_page,
     record_connected_bot_verification as db_record_connected_bot_verification,
+    reject_connected_bot_request as db_reject_connected_bot_request,
     update_connected_bot_cache_channel as db_update_connected_bot_cache_channel,
     update_connected_bot_status as db_update_connected_bot_status,
     upsert_connected_bot as db_upsert_connected_bot,
@@ -4559,6 +4575,572 @@ def _white_label_feature_error() -> str | None:
     return None
 
 
+_WL_REQUEST_PAGE_SIZE = 10
+_WL_CONNECTED_BOT_PAGE_SIZE = 10
+_WL_PUBLIC_TOKEN_TTL_SECONDS = 10 * 60
+_WL_OWNER_FLOW_TTL_SECONDS = 10 * 60
+_WL_TRIAL_DAYS = 3
+_WL_TRIAL_DAILY_SEARCH_LIMIT = 100
+_WL_TRIAL_DAILY_SEND_LIMIT = 20
+_WL_TRIAL_PER_MINUTE_SEND_LIMIT = 10
+
+
+def _wl_text(lang: str, key: str, default: str) -> str:
+    return MESSAGES.get(lang, MESSAGES["en"]).get(key, default)
+
+
+def _wl_user_line(user: Any) -> str:
+    if not user:
+        return "-"
+    first_name = str(getattr(user, "first_name", "") or "").strip()
+    username = str(getattr(user, "username", "") or "").strip()
+    user_id = int(getattr(user, "id", 0) or 0)
+    label = first_name or "User"
+    if username:
+        label = f"{label} (@{username})"
+    if user_id:
+        label = f"{label} / ID {user_id}"
+    return label
+
+
+def _wl_requester_line(row: dict | None) -> str:
+    if not row:
+        return "-"
+    first_name = str((row or {}).get("requesting_first_name") or (row or {}).get("requested_by_first_name") or "").strip() or "User"
+    username = str((row or {}).get("requesting_username") or (row or {}).get("requested_by_username") or "").strip()
+    user_id = int((row or {}).get("requesting_user_id") or (row or {}).get("requested_by_user_id") or 0)
+    label = first_name
+    if username:
+        label = f"{label} (@{username})"
+    if user_id:
+        label = f"{label} / ID {user_id}"
+    return label
+
+
+def _wl_bot_reference(row: dict | None) -> str:
+    username = str((row or {}).get("bot_username") or "").strip().lstrip("@")
+    if username:
+        return f"@{username}"
+    return str((row or {}).get("id") or "-")
+
+
+def _wl_format_dt(value: Any) -> str:
+    if not value:
+        return "-"
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(value)
+    return str(value)[:16]
+
+
+def _wl_escape(value: Any) -> str:
+    return html.escape(str(value or "").strip())
+
+
+def _wl_token_request_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(_wl_text(lang, "wlreq_send_token_button", "🔐 Send token"), callback_data="wlreq:sendtoken")],
+            [InlineKeyboardButton(_wl_text(lang, "wlreq_cancel_button", "❌ Cancel"), callback_data="wlreq:cancel")],
+        ]
+    )
+
+
+def _wl_owner_menu_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(_wl_text(lang, "wlreq_pending_title", "🤖 Connection requests"), callback_data="wlreqpage:0")],
+            [InlineKeyboardButton(_wl_text(lang, "wlreq_connected_title", "🤖 Connected bots"), callback_data="wlbotpage:0")],
+        ]
+    )
+
+
+def _wl_number_rows(items: list[dict], prefix: str, id_key: str = "id") -> list[list[InlineKeyboardButton]]:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, item in enumerate(items, start=1):
+        item_id = str((item or {}).get(id_key) or "").strip()
+        if not item_id:
+            continue
+        row.append(InlineKeyboardButton(str(idx), callback_data=f"{prefix}:{item_id}"))
+        if len(row) >= 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return rows
+
+
+async def _reply_or_edit_wl(update: Update, text: str, *, reply_markup: InlineKeyboardMarkup | None = None, parse_mode: str | None = "HTML") -> None:
+    query = update.callback_query
+    if query and query.message:
+        try:
+            await query.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            return
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+            try:
+                await query.message.edit_reply_markup(reply_markup=reply_markup)
+                return
+            except Exception:
+                pass
+    message = update.message or (query.message if query else None)
+    if message:
+        await message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+
+
+async def _start_white_label_public_request_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> None:
+    feature_error = _white_label_feature_error()
+    target_message = update.message or (update.callback_query.message if update.callback_query else None)
+    if not target_message:
+        return
+    if feature_error:
+        await target_message.reply_text(feature_error)
+        return
+    context.user_data["pending_wl_connect_request"] = {"expires_at": time.time() + _WL_PUBLIC_TOKEN_TTL_SECONDS}
+    await target_message.reply_text(
+        _wl_text(lang, "wlreq_guide", "You can connect your own Telegram book searcher bot."),
+        reply_markup=_wl_token_request_keyboard(lang),
+    )
+
+
+def _looks_like_bot_token(raw: str) -> bool:
+    return bool(re.match(r"^\d{6,12}:[A-Za-z0-9_-]{20,}$", str(raw or "").strip()))
+
+
+async def _notify_owner_connected_bot_request(context: ContextTypes.DEFAULT_TYPE, request_row: dict, lang: str) -> None:
+    if not OWNER_ID:
+        return
+    text = _wl_text(
+        lang,
+        "wlreq_owner_notify",
+        "🤖 New white-label bot connection request.\n\nUser: {user}\nBot: @{bot_username}\nBot name: {bot_name}\n\nOpen: /botconnectreq",
+    ).format(
+        user=_wl_escape(_wl_requester_line(request_row)),
+        bot_username=_wl_escape(str(request_row.get("bot_username") or "").lstrip("@")),
+        bot_name=_wl_escape(str(request_row.get("bot_first_name") or "-")),
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=int(OWNER_ID),
+            text=text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(_wl_text(lang, "wlreq_owner_view_button", "👁 View"), callback_data=f"wlreqview:{request_row.get('id')}")]]
+            ),
+        )
+    except Exception:
+        logger.debug("Failed to notify owner about connected bot request", exc_info=True)
+
+
+async def _perform_white_label_public_request_token(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    raw_token: str,
+    lang: str,
+) -> None:
+    if not update.message or not update.effective_user:
+        return
+    token = str(raw_token or "").strip()
+    if not _looks_like_bot_token(token):
+        await update.message.reply_text(_wl_text(lang, "wlreq_invalid_token", "⚠️ Invalid bot token."))
+        return
+    try:
+        verified = await _verify_white_label_bot_token(token)
+        if int(verified.get("bot_telegram_id") or 0) == int(getattr(context.bot, "id", 0) or 0):
+            await update.message.reply_text(_wl_text(lang, "wlreq_invalid_token", "⚠️ Invalid bot token."))
+            return
+        encrypted = encrypt_bot_token(token, CONNECTED_BOT_TOKEN_ENCRYPTION_KEY)
+        fingerprint = fingerprint_bot_token(token, CONNECTED_BOT_TOKEN_ENCRYPTION_KEY)
+        existing = await run_blocking(
+            db_find_existing_connected_bot_request_or_bot,
+            token_fingerprint=fingerprint,
+            bot_telegram_id=int(verified.get("bot_telegram_id") or 0),
+        )
+        if existing:
+            await update.message.reply_text(_wl_text(lang, "wlreq_duplicate", "⚠️ A request for this bot already exists."))
+            return
+        request_row = await run_blocking(
+            db_create_connected_bot_request,
+            requesting_user_id=int(update.effective_user.id),
+            requesting_username=str(update.effective_user.username or "").strip() or None,
+            requesting_first_name=str(update.effective_user.first_name or "").strip() or None,
+            bot_telegram_id=int(verified.get("bot_telegram_id") or 0),
+            bot_username=str(verified.get("bot_username") or "").strip(),
+            bot_first_name=str(verified.get("bot_first_name") or "").strip() or None,
+            bot_token_encrypted=encrypted,
+            bot_token_fingerprint=fingerprint,
+            token_masked=describe_token_for_owner(token),
+        )
+        context.user_data.pop("pending_wl_connect_request", None)
+        await update.message.reply_text(_wl_text(lang, "wlreq_sent", "✅ Your request has been sent to the owner."))
+        await _notify_owner_connected_bot_request(context, dict(request_row or {}), lang)
+    except Exception as exc:
+        logger.warning("Public white-label bot request failed: %s", wl_redact_token_like_strings(str(exc)), exc_info=True)
+        await update.message.reply_text(_wl_text(lang, "wlreq_invalid_token", "⚠️ Invalid bot token."))
+
+
+async def _show_white_label_owner_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> None:
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await _reply_or_edit_wl(update, feature_error, parse_mode=None)
+        return
+    pending_count = await run_blocking(db_count_connected_bot_requests, WL_REQUEST_STATUS_PENDING)
+    connected_count = await run_blocking(db_count_connected_bots)
+    text = "\n".join(
+        [
+            "🤖 <b>White Label</b>",
+            "",
+            f"Pending requests: <b>{int(pending_count or 0)}</b>",
+            f"Connected bots: <b>{int(connected_count or 0)}</b>",
+            "",
+            "Choose a section below.",
+        ]
+    )
+    await _reply_or_edit_wl(update, text, reply_markup=_wl_owner_menu_keyboard(lang))
+
+
+async def _build_wl_requests_list_view(lang: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    page = max(0, int(page or 0))
+    total = int(await run_blocking(db_count_connected_bot_requests, WL_REQUEST_STATUS_PENDING) or 0)
+    pages = max(1, math.ceil(total / _WL_REQUEST_PAGE_SIZE))
+    if page >= pages:
+        page = pages - 1
+    rows = await run_blocking(
+        db_list_connected_bot_requests,
+        status=WL_REQUEST_STATUS_PENDING,
+        limit=_WL_REQUEST_PAGE_SIZE,
+        offset=page * _WL_REQUEST_PAGE_SIZE,
+    )
+    lines = [
+        f"<b>{_wl_escape(_wl_text(lang, 'wlreq_pending_title', '🤖 Connection requests'))}</b>",
+        f"Jami: {total} • Sahifa {page + 1}/{pages}",
+        "",
+    ]
+    if not rows:
+        lines.append("📭 Pending requests are empty.")
+    else:
+        for idx, row in enumerate(rows, start=1):
+            lines.extend(
+                [
+                    f"{idx}. {_wl_escape(_wl_bot_reference(row))} — {_wl_escape(row.get('bot_first_name') or '-')}",
+                    f"   User: {_wl_escape(_wl_requester_line(row))}",
+                    f"   Date: {_wl_escape(_wl_format_dt(row.get('created_at')))}",
+                    f"   Status: {_wl_escape(row.get('status') or '-')}",
+                ]
+            )
+    button_rows = _wl_number_rows(list(rows or []), "wlreqview")
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(_wl_text(lang, "wlreq_prev_button", "⬅️ Prev"), callback_data=f"wlreqpage:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(_wl_text(lang, "wlreq_next_button", "Next ➡️"), callback_data=f"wlreqpage:{page + 1}"))
+    if nav:
+        button_rows.append(nav)
+    button_rows.append(
+        [
+            InlineKeyboardButton(_wl_text(lang, "wlreq_refresh_button", "🔄 Refresh"), callback_data=f"wlreqpage:{page}"),
+            InlineKeyboardButton(_wl_text(lang, "wlreq_back_button", "⬅️ Back"), callback_data="wlmenu"),
+        ]
+    )
+    return "\n".join(lines), InlineKeyboardMarkup(button_rows)
+
+
+async def _show_wl_requests_page(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, page: int = 0) -> None:
+    del context
+    text, markup = await _build_wl_requests_list_view(lang, page)
+    await _reply_or_edit_wl(update, text, reply_markup=markup)
+
+
+def _build_wl_request_detail_text(row: dict) -> str:
+    return "\n".join(
+        [
+            "🤖 <b>Connection request</b>",
+            "",
+            f"Request ID: <code>{_wl_escape(row.get('id'))}</code>",
+            f"Requester: {_wl_escape(_wl_requester_line(row))}",
+            f"Requester ID: <code>{int(row.get('requesting_user_id') or 0)}</code>",
+            "",
+            f"Bot ID: <code>{int(row.get('bot_telegram_id') or 0)}</code>",
+            f"Bot: {_wl_escape(_wl_bot_reference(row))}",
+            f"Bot name: {_wl_escape(row.get('bot_first_name') or '-')}",
+            f"Status: <b>{_wl_escape(row.get('status') or '-')}</b>",
+            f"Requested: {_wl_escape(_wl_format_dt(row.get('created_at')))}",
+            f"Token: <code>{_wl_escape(row.get('token_masked') or 'masked')}</code>",
+        ]
+    )
+
+
+async def _show_wl_request_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, request_id: str) -> None:
+    del context
+    row = await run_blocking(db_get_connected_bot_request_by_id, str(request_id or "").strip())
+    if not row:
+        await _reply_or_edit_wl(update, "⚠️ Request not found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(_wl_text(lang, "wlreq_back_button", "⬅️ Back"), callback_data="wlreqpage:0")]]))
+        return
+    buttons: list[list[InlineKeyboardButton]] = []
+    if str(row.get("status") or "").upper() == WL_REQUEST_STATUS_PENDING:
+        buttons.append(
+            [
+                InlineKeyboardButton(_wl_text(lang, "wlreq_accept_button", "✅ Accept"), callback_data=f"wlreqaccept:{row.get('id')}"),
+                InlineKeyboardButton(_wl_text(lang, "wlreq_reject_button", "❌ Reject"), callback_data=f"wlreqreject:{row.get('id')}"),
+            ]
+        )
+    buttons.append([InlineKeyboardButton(_wl_text(lang, "wlreq_back_button", "⬅️ Back"), callback_data="wlreqpage:0")])
+    await _reply_or_edit_wl(update, _build_wl_request_detail_text(dict(row)), reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def _validate_wl_cache_channel_for_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    request_row: dict,
+    cache_channel_id: int,
+) -> tuple[bool, str | None, str | None]:
+    decrypted_token = decrypt_bot_token(str(request_row.get("bot_token_encrypted") or ""), CONNECTED_BOT_TOKEN_ENCRYPTION_KEY)
+    connected_bot_client = wl_build_bot_client(decrypted_token)
+    try:
+        main_member = await context.bot.get_chat_member(cache_channel_id, context.bot.id)
+        connected_member = await connected_bot_client.get_chat_member(cache_channel_id, int(request_row.get("bot_telegram_id") or 0))
+        chat_info = await context.bot.get_chat(cache_channel_id)
+        main_status = str(getattr(main_member, "status", "") or "").lower()
+        connected_status = str(getattr(connected_member, "status", "") or "").lower()
+        if main_status not in {"administrator", "creator"} or connected_status not in {"administrator", "creator"}:
+            return False, None, "Both the main bot and the connected bot must be admins in the cache channel."
+        return True, str(getattr(chat_info, "username", "") or "").strip() or None, None
+    finally:
+        try:
+            await connected_bot_client.shutdown()
+        except Exception:
+            pass
+
+
+async def _perform_wl_accept_cache_channel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    cache_channel_raw: str,
+    lang: str,
+) -> bool:
+    pending = context.user_data.get("pending_wl_accept_cache_channel")
+    if not pending:
+        return False
+    if time.time() > float((pending or {}).get("expires_at", 0) or 0):
+        context.user_data.pop("pending_wl_accept_cache_channel", None)
+        return False
+    if not update.message:
+        return True
+    text = str(cache_channel_raw or "").strip()
+    if text.lower() in {"cancel", "stop", "/cancel"}:
+        context.user_data.pop("pending_wl_accept_cache_channel", None)
+        await update.message.reply_text(_wl_text(lang, "menu_flow_cancelled", "❌ Cancelled."))
+        return True
+    try:
+        cache_channel_id = int(text)
+    except Exception:
+        await update.message.reply_text("⚠️ Send a valid cache channel ID, for example -1001234567890.")
+        return True
+    request_id = str((pending or {}).get("request_id") or "").strip()
+    request_row = await run_blocking(db_get_connected_bot_request_by_id, request_id)
+    if not request_row:
+        context.user_data.pop("pending_wl_accept_cache_channel", None)
+        await update.message.reply_text("⚠️ Request not found.")
+        return True
+    try:
+        ok, cache_username, error_text = await _validate_wl_cache_channel_for_request(context, dict(request_row), cache_channel_id)
+        if not ok:
+            await update.message.reply_text(f"⚠️ {error_text or 'Cache channel could not be verified.'}")
+            return True
+        connected_bot = await run_blocking(
+            db_accept_connected_bot_request,
+            request_id,
+            accepted_by_owner_id=int(update.effective_user.id or 0),
+            cache_channel_id=cache_channel_id,
+            cache_channel_username=cache_username,
+            trial_days=_WL_TRIAL_DAYS,
+            daily_search_limit=_WL_TRIAL_DAILY_SEARCH_LIMIT,
+            daily_send_limit=_WL_TRIAL_DAILY_SEND_LIMIT,
+            per_minute_send_limit=_WL_TRIAL_PER_MINUTE_SEND_LIMIT,
+        )
+        context.user_data.pop("pending_wl_accept_cache_channel", None)
+        if not connected_bot:
+            await update.message.reply_text("⚠️ Request could not be accepted. It may already be processed.")
+            return True
+        try:
+            await context.bot.send_message(
+                chat_id=int(request_row.get("requesting_user_id") or 0),
+                text=_wl_text(lang, "wlreq_approved_user", "✅ Your bot was approved. It will be started soon."),
+            )
+        except Exception:
+            logger.debug("Failed to notify connected bot requester about approval", exc_info=True)
+        await update.message.reply_text(
+            "\n".join(
+                [
+                    _wl_text(lang, "wlreq_saved", "✅ Bot saved and added on TRIAL plan."),
+                    _wl_text(lang, "wlreq_trial_started", "🎁 Trial started: {days} days.").format(days=_WL_TRIAL_DAYS),
+                    f"Bot: {format_connected_bot_reference(connected_bot)}",
+                    f"Cache channel: {cache_channel_id}",
+                    "Status: STOPPED. Press Start from /connected_bots.",
+                ]
+            )
+        )
+        return True
+    except Exception as exc:
+        logger.error("White-label request accept failed: %s", wl_redact_token_like_strings(str(exc)), exc_info=True)
+        await update.message.reply_text(f"⚠️ Could not accept request.\n{wl_redact_token_like_strings(str(exc))}")
+        return True
+
+
+async def _perform_wl_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE, *, reason_raw: str, lang: str) -> bool:
+    pending = context.user_data.get("pending_wl_reject_request")
+    if not pending:
+        return False
+    if time.time() > float((pending or {}).get("expires_at", 0) or 0):
+        context.user_data.pop("pending_wl_reject_request", None)
+        return False
+    if not update.message:
+        return True
+    text = str(reason_raw or "").strip()
+    if text.lower() in {"cancel", "stop", "/cancel"}:
+        context.user_data.pop("pending_wl_reject_request", None)
+        await update.message.reply_text(_wl_text(lang, "menu_flow_cancelled", "❌ Cancelled."))
+        return True
+    reason = "" if text.lower() == "/skip" else text
+    request_id = str((pending or {}).get("request_id") or "").strip()
+    request_row = await run_blocking(db_get_connected_bot_request_by_id, request_id)
+    rejected = await run_blocking(db_reject_connected_bot_request, request_id, rejected_by_owner_id=int(update.effective_user.id or 0), reason=reason)
+    context.user_data.pop("pending_wl_reject_request", None)
+    if not rejected:
+        await update.message.reply_text("⚠️ Request could not be rejected. It may already be processed.")
+        return True
+    try:
+        notify_text = (
+            _wl_text(lang, "wlreq_rejected_user_reason", "❌ Your bot connection request was rejected.\nReason: {reason}").format(reason=reason)
+            if reason
+            else _wl_text(lang, "wlreq_rejected_user", "❌ Your bot connection request was rejected.")
+        )
+        await context.bot.send_message(chat_id=int((request_row or rejected).get("requesting_user_id") or 0), text=notify_text)
+    except Exception:
+        logger.debug("Failed to notify connected bot requester about rejection", exc_info=True)
+    await update.message.reply_text("✅ Request rejected.")
+    return True
+
+
+async def _build_wl_connected_bots_view(context: ContextTypes.DEFAULT_TYPE, lang: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    page = max(0, int(page or 0))
+    total = int(await run_blocking(db_count_connected_bots) or 0)
+    pages = max(1, math.ceil(total / _WL_CONNECTED_BOT_PAGE_SIZE))
+    if page >= pages:
+        page = pages - 1
+    rows = await run_blocking(db_list_connected_bots_page, limit=_WL_CONNECTED_BOT_PAGE_SIZE, offset=page * _WL_CONNECTED_BOT_PAGE_SIZE)
+    lines = [
+        f"<b>{_wl_escape(_wl_text(lang, 'wlreq_connected_title', '🤖 Connected bots'))}</b>",
+        f"Jami: {total} • Sahifa {page + 1}/{pages}",
+        "",
+    ]
+    if not rows:
+        lines.append("📭 Connected bots are empty.")
+    else:
+        for idx, row in enumerate(rows, start=1):
+            usage = await run_blocking(db_get_connected_bot_usage, str(row.get("id") or ""))
+            runtime_status = await wl_get_runtime_status(context.application.bot_data, str(row.get("id") or ""))
+            is_running = bool(runtime_status.get("running"))
+            status_text = "RUNNING" if is_running else ("STOPPED" if str(row.get("status") or "").upper() == WL_STATUS_SUSPENDED else str(row.get("status") or "-"))
+            lines.extend(
+                [
+                    f"{idx}. {_wl_escape(_wl_bot_reference(row))} — {_wl_escape(row.get('bot_first_name') or '-')}",
+                    f"   Status: {status_text} • Plan: {_wl_escape(row.get('plan') or '-')}",
+                    f"   Trial end: {_wl_escape(_wl_format_dt(row.get('trial_ends_at')))}",
+                    f"   Today: searches {int((usage or {}).get('searches') or 0)} / sends {int((usage or {}).get('sends') or 0)}",
+                ]
+            )
+    button_rows = _wl_number_rows(list(rows or []), "wlbotview")
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(_wl_text(lang, "wlreq_prev_button", "⬅️ Prev"), callback_data=f"wlbotpage:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(_wl_text(lang, "wlreq_next_button", "Next ➡️"), callback_data=f"wlbotpage:{page + 1}"))
+    if nav:
+        button_rows.append(nav)
+    button_rows.append(
+        [
+            InlineKeyboardButton(_wl_text(lang, "wlreq_refresh_button", "🔄 Refresh"), callback_data=f"wlbotpage:{page}"),
+            InlineKeyboardButton(_wl_text(lang, "wlreq_back_button", "⬅️ Back"), callback_data="wlmenu"),
+        ]
+    )
+    return "\n".join(lines), InlineKeyboardMarkup(button_rows)
+
+
+async def _show_wl_connected_bots_page(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, page: int = 0) -> None:
+    text, markup = await _build_wl_connected_bots_view(context, lang, page)
+    await _reply_or_edit_wl(update, text, reply_markup=markup)
+
+
+async def _build_wl_connected_bot_detail(context: ContextTypes.DEFAULT_TYPE, row: dict, lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    usage = await run_blocking(db_get_connected_bot_usage, str(row.get("id") or ""))
+    runtime_status = await wl_get_runtime_status(context.application.bot_data, str(row.get("id") or ""))
+    running = bool(runtime_status.get("running"))
+    status_text = "RUNNING" if running else ("STOPPED" if str(row.get("status") or "").upper() == WL_STATUS_SUSPENDED else str(row.get("status") or "-"))
+    text = "\n".join(
+        [
+            "🤖 <b>Connected bot</b>",
+            "",
+            f"ID: <code>{_wl_escape(row.get('id'))}</code>",
+            f"Bot: {_wl_escape(_wl_bot_reference(row))}",
+            f"Bot name: {_wl_escape(row.get('bot_first_name') or '-')}",
+            f"Telegram ID: <code>{int(row.get('bot_telegram_id') or 0)}</code>",
+            f"Requester: {_wl_escape(_wl_requester_line(row))}",
+            f"Status: <b>{_wl_escape(status_text)}</b>",
+            f"Plan: <b>{_wl_escape(row.get('plan') or '-')}</b>",
+            f"Subscription: {_wl_escape(row.get('subscription_status') or '-')}",
+            f"Trial end: {_wl_escape(_wl_format_dt(row.get('trial_ends_at')))}",
+            f"Cache channel: <code>{_wl_escape(row.get('cache_channel_id') or '-')}</code>",
+            f"Today: searches {int((usage or {}).get('searches') or 0)} / sends {int((usage or {}).get('sends') or 0)}",
+            f"Cache: hits {int((usage or {}).get('cache_hits') or 0)} / misses {int((usage or {}).get('cache_misses') or 0)}",
+            f"Last error: {_wl_escape(row.get('last_error') or '-')}",
+            f"Token: <code>masked</code>",
+        ]
+    )
+    bot_id = str(row.get("id") or "")
+    buttons = [
+        [
+            InlineKeyboardButton(_wl_text(lang, "wlbot_start_button", "▶️ Start"), callback_data=f"wlbotstart:{bot_id}"),
+            InlineKeyboardButton(_wl_text(lang, "wlbot_stop_button", "⏸ Stop"), callback_data=f"wlbotstop:{bot_id}"),
+        ],
+        [
+            InlineKeyboardButton(_wl_text(lang, "wlbot_restart_button", "🔄 Restart"), callback_data=f"wlbotrestart:{bot_id}"),
+            InlineKeyboardButton(_wl_text(lang, "wlbot_test_cache_button", "🧪 Test cache"), callback_data=f"wlbottest:{bot_id}"),
+        ],
+        [
+            InlineKeyboardButton(_wl_text(lang, "wlbot_suspend_button", "⛔ Suspend"), callback_data=f"wlbotsuspend:{bot_id}"),
+            InlineKeyboardButton(_wl_text(lang, "wlbot_resume_button", "✅ Resume"), callback_data=f"wlbotresume:{bot_id}"),
+        ],
+        [InlineKeyboardButton(_wl_text(lang, "wlbot_delete_button", "🗑 Delete"), callback_data=f"wlbotdelete:{bot_id}")],
+        [InlineKeyboardButton(_wl_text(lang, "wlreq_back_button", "⬅️ Back"), callback_data="wlbotpage:0")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def _show_wl_connected_bot_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, connected_bot_id: str) -> None:
+    row = await run_blocking(db_get_connected_bot_by_id, str(connected_bot_id or "").strip())
+    if not row:
+        await _reply_or_edit_wl(update, "⚠️ Connected bot not found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(_wl_text(lang, "wlreq_back_button", "⬅️ Back"), callback_data="wlbotpage:0")]]))
+        return
+    text, markup = await _build_wl_connected_bot_detail(context, dict(row), lang)
+    await _reply_or_edit_wl(update, text, reply_markup=markup)
+
+
+async def _start_wl_connected_bot_from_row(context: ContextTypes.DEFAULT_TYPE, row: dict) -> dict:
+    if not int(row.get("cache_channel_id") or 0):
+        return {"ok": False, "error": "cache channel is not configured"}
+    updated = await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ACTIVE, clear_error=True)
+    result = await wl_start_runtime(context.application.bot_data, dict(updated or row))
+    if not result.get("ok"):
+        await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ERROR, last_error=str(result.get("error") or "runtime start failed"))
+    return result
+
+
 async def _verify_white_label_bot_token(token: str) -> dict[str, Any]:
     clean_token = str(token or "").strip()
     if not clean_token or ":" not in clean_token:
@@ -4703,17 +5285,51 @@ async def _pick_white_label_test_book() -> dict[str, Any] | None:
 
 
 async def process_pending_white_label_owner_input(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> bool:
-    if not update.message or not update.effective_user or not _is_owner_user(update.effective_user.id):
+    if not update.message or not update.effective_user:
         return False
-    had_pending = bool(context.user_data.get("pending_wl_add_bot") or context.user_data.get("pending_wl_set_cache_channel"))
+    user_is_owner = _is_owner_user(update.effective_user.id)
+    had_pending = bool(
+        context.user_data.get("pending_wl_connect_request")
+        or context.user_data.get("pending_wl_accept_cache_channel")
+        or context.user_data.get("pending_wl_reject_request")
+        or context.user_data.get("pending_wl_add_bot")
+        or context.user_data.get("pending_wl_set_cache_channel")
+    )
     feature_error = _white_label_feature_error()
     if feature_error:
+        context.user_data.pop("pending_wl_connect_request", None)
+        context.user_data.pop("pending_wl_accept_cache_channel", None)
+        context.user_data.pop("pending_wl_reject_request", None)
         context.user_data.pop("pending_wl_add_bot", None)
         context.user_data.pop("pending_wl_set_cache_channel", None)
         if had_pending:
             await update.message.reply_text(feature_error)
             return True
         return False
+
+    pending_public = context.user_data.get("pending_wl_connect_request")
+    if pending_public:
+        if time.time() > float((pending_public or {}).get("expires_at", 0) or 0):
+            context.user_data.pop("pending_wl_connect_request", None)
+            return False
+        token_text = str(update.message.text or "").strip()
+        if _main_menu_text_action(token_text):
+            return False
+        if token_text.lower() in {"cancel", "stop", "/cancel"}:
+            context.user_data.pop("pending_wl_connect_request", None)
+            await update.message.reply_text(_wl_text(lang, "wlreq_cancelled", "❌ Bot connection request cancelled."))
+            return True
+        await _perform_white_label_public_request_token(update, context, raw_token=token_text, lang=lang)
+        return True
+
+    if not user_is_owner:
+        return False
+
+    if context.user_data.get("pending_wl_accept_cache_channel"):
+        return await _perform_wl_accept_cache_channel(update, context, cache_channel_raw=str(update.message.text or ""), lang=lang)
+
+    if context.user_data.get("pending_wl_reject_request"):
+        return await _perform_wl_reject_reason(update, context, reason_raw=str(update.message.text or ""), lang=lang)
 
     pending_add = context.user_data.get("pending_wl_add_bot")
     if pending_add:
@@ -4760,6 +5376,7 @@ async def process_pending_white_label_owner_input(update: Update, context: Conte
 
 
 async def _white_label_list_bots_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang = ensure_user_language(update, context)
     target_message = update.message or (update.callback_query.message if update.callback_query else None)
     if not target_message:
         return
@@ -4767,8 +5384,7 @@ async def _white_label_list_bots_impl(update: Update, context: ContextTypes.DEFA
     if feature_error:
         await target_message.reply_text(feature_error)
         return
-    rows = await run_blocking(db_list_connected_bots)
-    await target_message.reply_text(build_connected_bot_list_text(rows))
+    await _show_wl_connected_bots_page(update, context, lang, 0)
 
 
 async def _white_label_add_bot_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4956,13 +5572,12 @@ async def _white_label_start_bot_impl(update: Update, context: ContextTypes.DEFA
     if not row:
         await target_message.reply_text("⚠️ Connected bot not found.")
         return
-    if str(row.get("status") or "").upper() != WL_STATUS_ACTIVE:
-        await target_message.reply_text("⚠️ Activate this connected bot first with /wl_activate_bot @botusername.")
-        return
     if not int(row.get("cache_channel_id") or 0):
         await target_message.reply_text("⚠️ Set the cache channel first with /wl_set_cache_channel.")
         return
     try:
+        if str(row.get("status") or "").upper() != WL_STATUS_ACTIVE:
+            row = await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ACTIVE, clear_error=True) or row
         result = await wl_start_runtime(context.application.bot_data, dict(row))
         if not result.get("ok"):
             await target_message.reply_text(f"⚠️ Connected bot runtime did not start.\n{result.get('error') or 'unknown error'}")
@@ -5007,6 +5622,7 @@ async def _white_label_stop_bot_impl(update: Update, context: ContextTypes.DEFAU
     if not row:
         await target_message.reply_text("⚠️ Connected bot not found.")
         return
+    await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_SUSPENDED, clear_error=False)
     result = await wl_stop_runtime(context.application.bot_data, str(row.get("id") or ""))
     if result.get("already_stopped"):
         await target_message.reply_text(f"ℹ️ Connected bot runtime was already stopped: {format_connected_bot_reference(row)}")
@@ -5160,6 +5776,236 @@ async def wl_test_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def wl_test_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await owner_only_command(update, context, _white_label_test_cache_impl)
+
+
+async def _botconnectreq_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang = ensure_user_language(update, context)
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await safe_reply(update, feature_error)
+        return
+    await _show_wl_requests_page(update, context, lang, 0)
+
+
+async def _connected_bots_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang = ensure_user_language(update, context)
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await safe_reply(update, feature_error)
+        return
+    await _show_wl_connected_bots_page(update, context, lang, 0)
+
+
+async def botconnectreq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _botconnectreq_impl)
+
+
+async def connected_bots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await owner_only_command(update, context, _connected_bots_impl)
+
+
+async def handle_white_label_public_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    data = str(query.data or "")
+    await query.answer()
+    if data == "wlreq:sendtoken":
+        context.user_data["pending_wl_connect_request"] = {"expires_at": time.time() + _WL_PUBLIC_TOKEN_TTL_SECONDS}
+        await query.message.reply_text(_wl_text(lang, "wlreq_send_token_prompt", "🔐 Send the API token from BotFather.\nCancel: /cancel")) if query.message else None
+        return
+    if data == "wlreq:cancel":
+        context.user_data.pop("pending_wl_connect_request", None)
+        if query.message:
+            await query.message.edit_text(_wl_text(lang, "wlreq_cancelled", "❌ Bot connection request cancelled."))
+
+
+async def handle_white_label_owner_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    if not update.effective_user or not _is_owner_user(update.effective_user.id):
+        await query.answer(MESSAGES[lang].get("owner_only", "Owner only."), show_alert=True)
+        return
+    await query.answer()
+    await _show_white_label_owner_menu(update, context, lang)
+
+
+async def handle_white_label_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    if not update.effective_user or not _is_owner_user(update.effective_user.id):
+        await query.answer(MESSAGES[lang].get("owner_only", "Owner only."), show_alert=True)
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await query.answer(feature_error, show_alert=True)
+        return
+    data = str(query.data or "")
+    await query.answer()
+    if data.startswith("wlreqpage:"):
+        try:
+            page = int(data.split(":", 1)[1])
+        except Exception:
+            page = 0
+        await _show_wl_requests_page(update, context, lang, page)
+        return
+    if data.startswith("wlreqview:"):
+        await _show_wl_request_detail(update, context, lang, data.split(":", 1)[1])
+        return
+    if data.startswith("wlreqaccept:"):
+        request_id = data.split(":", 1)[1].strip()
+        row = await run_blocking(db_get_connected_bot_request_by_id, request_id)
+        if not row:
+            await _reply_or_edit_wl(update, "⚠️ Request not found.", parse_mode=None)
+            return
+        context.user_data["pending_wl_accept_cache_channel"] = {
+            "request_id": request_id,
+            "expires_at": time.time() + _WL_OWNER_FLOW_TTL_SECONDS,
+        }
+        if query.message:
+            await query.message.reply_text(_wl_text(lang, "wlreq_accept_cache_prompt", "Send the cache channel ID."))
+        return
+    if data.startswith("wlreqreject:"):
+        request_id = data.split(":", 1)[1].strip()
+        row = await run_blocking(db_get_connected_bot_request_by_id, request_id)
+        if not row:
+            await _reply_or_edit_wl(update, "⚠️ Request not found.", parse_mode=None)
+            return
+        context.user_data["pending_wl_reject_request"] = {
+            "request_id": request_id,
+            "expires_at": time.time() + _WL_OWNER_FLOW_TTL_SECONDS,
+        }
+        if query.message:
+            await query.message.reply_text(_wl_text(lang, "wlreq_reject_reason_prompt", "Send the rejection reason or /skip."))
+
+
+async def _run_wl_cache_test_for_row(update: Update, context: ContextTypes.DEFAULT_TYPE, row: dict, lang: str) -> None:
+    query = update.callback_query
+    if not int(row.get("cache_channel_id") or 0):
+        await _reply_or_edit_wl(update, "⚠️ Cache channel is not configured.", parse_mode=None)
+        return
+    book = await _pick_white_label_test_book()
+    if not book:
+        await _reply_or_edit_wl(update, "⚠️ No accessible PDF test book was found.", parse_mode=None)
+        return
+    seed_token = uuid.uuid4().hex
+    seed_job = await run_blocking(
+        db_create_connected_bot_cache_seed_job,
+        connected_bot_id=str(row.get("id") or ""),
+        book_id=str(book.get("id") or ""),
+        requesting_chat_id=int(query.message.chat_id if query and query.message else OWNER_ID),
+        requesting_user_id=int(update.effective_user.id if update.effective_user else OWNER_ID),
+        requesting_message_id=int(query.message.message_id) if query and query.message else None,
+        cache_channel_id=int(row.get("cache_channel_id") or 0),
+        seed_token=seed_token,
+    )
+    result = await seed_connected_bot_cache(row, dict(book), seed_job, main_bot=context.bot)
+    if not result.get("ok"):
+        await _reply_or_edit_wl(update, f"⚠️ Cache seed send failed.\n{result.get('error') or 'unknown error'}", parse_mode=None)
+        return
+    deadline = time.monotonic() + max(5, int(WHITE_LABEL_CACHE_WAIT_SECONDS))
+    while time.monotonic() < deadline:
+        cache_row = await run_blocking(
+            db_get_connected_bot_file_cache,
+            str(row.get("id") or ""),
+            str(book.get("id") or ""),
+            only_valid=True,
+        )
+        if cache_row and str(cache_row.get("telegram_file_id") or "").strip():
+            await _reply_or_edit_wl(
+                update,
+                "\n".join(
+                    [
+                        "✅ Cache test succeeded.",
+                        f"Bot: {format_connected_bot_reference(row)}",
+                        f"Book: {_wl_escape(get_display_name(book))}",
+                        f"Cache message: {cache_row.get('cache_message_id') or '-'}",
+                    ]
+                ),
+            )
+            return
+        await asyncio.sleep(1.0)
+    await _reply_or_edit_wl(
+        update,
+        "⚠️ Cache seed was sent, but the connected bot did not confirm the cached file within the wait window.\n"
+        "Make sure the connected bot runtime is running and both bots are admins in the cache channel.",
+        parse_mode=None,
+    )
+
+
+async def handle_white_label_connected_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    if not update.effective_user or not _is_owner_user(update.effective_user.id):
+        await query.answer(MESSAGES[lang].get("owner_only", "Owner only."), show_alert=True)
+        return
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await query.answer(feature_error, show_alert=True)
+        return
+    data = str(query.data or "")
+    await query.answer()
+    if data.startswith("wlbotpage:"):
+        try:
+            page = int(data.split(":", 1)[1])
+        except Exception:
+            page = 0
+        await _show_wl_connected_bots_page(update, context, lang, page)
+        return
+    if data.startswith("wlbotview:"):
+        await _show_wl_connected_bot_detail(update, context, lang, data.split(":", 1)[1])
+        return
+    action, _, connected_bot_id = data.partition(":")
+    row = await run_blocking(db_get_connected_bot_by_id, connected_bot_id)
+    if not row:
+        await _reply_or_edit_wl(update, "⚠️ Connected bot not found.", parse_mode=None)
+        return
+    if action == "wlbotstart" or action == "wlbotresume":
+        result = await _start_wl_connected_bot_from_row(context, dict(row))
+        if not result.get("ok"):
+            await _reply_or_edit_wl(update, f"⚠️ Runtime did not start.\n{wl_redact_token_like_strings(str(result.get('error') or 'unknown error'))}", parse_mode=None)
+            return
+        await _show_wl_connected_bot_detail(update, context, lang, connected_bot_id)
+        return
+    if action == "wlbotstop" or action == "wlbotsuspend":
+        await run_blocking(db_update_connected_bot_status, connected_bot_id, WL_STATUS_SUSPENDED, clear_error=False)
+        await wl_stop_runtime(context.application.bot_data, connected_bot_id)
+        await _show_wl_connected_bot_detail(update, context, lang, connected_bot_id)
+        return
+    if action == "wlbotrestart":
+        await wl_stop_runtime(context.application.bot_data, connected_bot_id)
+        result = await _start_wl_connected_bot_from_row(context, dict(row))
+        if not result.get("ok"):
+            await _reply_or_edit_wl(update, f"⚠️ Runtime did not restart.\n{wl_redact_token_like_strings(str(result.get('error') or 'unknown error'))}", parse_mode=None)
+            return
+        await _show_wl_connected_bot_detail(update, context, lang, connected_bot_id)
+        return
+    if action == "wlbottest":
+        await _run_wl_cache_test_for_row(update, context, dict(row), lang)
+        return
+    if action == "wlbotdelete":
+        await _reply_or_edit_wl(
+            update,
+            f"🗑 Delete connected bot {_wl_escape(_wl_bot_reference(row))}?\nCentral books will not be deleted.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("✅ Confirm delete", callback_data=f"wlbotdeleteconfirm:{connected_bot_id}")],
+                    [InlineKeyboardButton(_wl_text(lang, "wlreq_back_button", "⬅️ Back"), callback_data=f"wlbotview:{connected_bot_id}")],
+                ]
+            ),
+        )
+        return
+    if action == "wlbotdeleteconfirm":
+        await wl_stop_runtime(context.application.bot_data, connected_bot_id)
+        await run_blocking(db_delete_connected_bot, connected_bot_id)
+        await _show_wl_connected_bots_page(update, context, lang, 0)
 
 
 def get_public_commands(lang: str = "en"):
@@ -6633,6 +7479,8 @@ def _main_menu_keyboard(lang: str, section: str = "main", user_id: int | None = 
         messages=MESSAGES,
         is_admin_user_fn=_is_admin_user,
         admin_labels=_ADMIN_MENU_LABELS,
+        is_owner_user_fn=_is_owner_user,
+        white_label_enabled=ENABLE_WHITE_LABEL,
     )
 
 
@@ -6778,6 +7626,15 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
     if context.user_data.get("pending_wl_set_cache_channel"):
         context.user_data.pop("pending_wl_set_cache_channel", None)
         cancelled = True
+    if context.user_data.get("pending_wl_connect_request"):
+        context.user_data.pop("pending_wl_connect_request", None)
+        cancelled = True
+    if context.user_data.get("pending_wl_accept_cache_channel"):
+        context.user_data.pop("pending_wl_accept_cache_channel", None)
+        cancelled = True
+    if context.user_data.get("pending_wl_reject_request"):
+        context.user_data.pop("pending_wl_reject_request", None)
+        cancelled = True
     if context.user_data.get("admin_menu_prompt"):
         context.user_data.pop("admin_menu_prompt", None)
         cancelled = True
@@ -6810,6 +7667,11 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
             m.get("request_prompt", "✍️ Send the title of the book you need."),
             reply_markup=_main_menu_keyboard(lang, "main", user_id),
         )
+        return True
+    if action == "connect_book_bot":
+        context.user_data["main_menu_section"] = "main"
+        context.user_data["_skip_spam_check_once"] = True
+        await _start_white_label_public_request_flow(update, context, lang)
         return True
     context.user_data["awaiting_book_search"] = False
     context.user_data.pop("search_mode", None)
@@ -6860,6 +7722,14 @@ async def _handle_main_menu_action(update: Update, context: ContextTypes.DEFAULT
         context.user_data["main_menu_section"] = "main"
         context.user_data["_skip_spam_check_once"] = True
         await contact_admin_command(update, context)
+        return True
+    if action == "admin_white_label":
+        if not user_id or not _is_owner_user(user_id):
+            await update.message.reply_text(m.get("owner_only", m.get("admin_only", "Owner only.")))
+            return True
+        context.user_data["main_menu_section"] = "admin"
+        context.user_data["_skip_spam_check_once"] = True
+        await _show_white_label_owner_menu(update, context, lang)
         return True
     handled_admin = await _admin_tools_handle_admin_menu_action(
         update=update,

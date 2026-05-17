@@ -4443,7 +4443,10 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         has_pending_white_label = bool(
-            context.user_data.get("pending_wl_add_bot")
+            context.user_data.get("pending_wl_connect_request")
+            or context.user_data.get("pending_wl_accept_cache_channel")
+            or context.user_data.get("pending_wl_reject_request")
+            or context.user_data.get("pending_wl_add_bot")
             or context.user_data.get("pending_wl_set_cache_channel")
         )
         pending_white_label_fn = globals().get("process_pending_white_label_owner_input")

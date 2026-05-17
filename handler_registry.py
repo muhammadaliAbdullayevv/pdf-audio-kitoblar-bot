@@ -96,6 +96,12 @@ REQUIRED_DEP_KEYS = (
     "wl_delete_bot_command",
     "wl_test_bot_command",
     "wl_test_cache_command",
+    "botconnectreq_command",
+    "connected_bots_command",
+    "handle_white_label_public_request_callback",
+    "handle_white_label_owner_menu_callback",
+    "handle_white_label_request_callback",
+    "handle_white_label_connected_bot_callback",
     "handle_upload_help_callback",
     "handle_upload_request_status_callback",
     "handle_delete_book_callback",
@@ -220,6 +226,8 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CommandHandler("wl_delete_bot", d["wl_delete_bot_command"]))
     app.add_handler(CommandHandler("wl_test_bot", d["wl_test_bot_command"]))
     app.add_handler(CommandHandler("wl_test_cache", d["wl_test_cache_command"]))
+    app.add_handler(CommandHandler("botconnectreq", d["botconnectreq_command"]))
+    app.add_handler(CommandHandler("connected_bots", d["connected_bots_command"]))
     app.add_handler(CommandHandler("prune", d["prune_command"]))
     app.add_handler(CommandHandler("missing", d["missing_command"]))
     app.add_handler(CommandHandler("db_dupes", d["db_dupes_command"]))
@@ -261,6 +269,10 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["handle_book_comment_relay_block_callback"], pattern=r"^commentrelayblock:"))
     app.add_handler(CallbackQueryHandler(d["handle_book_comment_relay_report_callback"], pattern=r"^commentrelayreport:"))
     app.add_handler(CallbackQueryHandler(d["handle_book_comment_moderation_callback"], pattern=r"^commentmod:"))
+    app.add_handler(CallbackQueryHandler(d["handle_white_label_public_request_callback"], pattern=r"^wlreq:(?:sendtoken|cancel)$"))
+    app.add_handler(CallbackQueryHandler(d["handle_white_label_owner_menu_callback"], pattern=r"^wlmenu$"))
+    app.add_handler(CallbackQueryHandler(d["handle_white_label_request_callback"], pattern=r"^wlreq(?:page|view|accept|reject):"))
+    app.add_handler(CallbackQueryHandler(d["handle_white_label_connected_bot_callback"], pattern=r"^wlbot(?:page|view|start|stop|restart|test|suspend|resume|delete|deleteconfirm):"))
     app.add_handler(
         CallbackQueryHandler(
             d["handle_book_selection"],

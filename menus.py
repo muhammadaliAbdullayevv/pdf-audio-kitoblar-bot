@@ -35,10 +35,13 @@ def build_main_menu_keyboard(
     messages: dict,
     is_admin_user_fn: Callable[[int], bool],
     admin_labels: dict[str, str] | None = None,
+    is_owner_user_fn: Callable[[int], bool] | None = None,
+    white_label_enabled: bool = False,
 ) -> ReplyKeyboardMarkup:
     m = messages.get(lang, messages["en"])
     labels = admin_labels or ADMIN_MENU_LABELS
     is_admin = bool(user_id and is_admin_user_fn(user_id))
+    is_owner = bool(user_id and is_owner_user_fn and is_owner_user_fn(user_id))
 
     if section == "admin":
         admin_items = [
@@ -60,6 +63,8 @@ def build_main_menu_keyboard(
             labels["admin_es_dupes"],
             labels["admin_missing_confirm"],
         ]
+        if is_owner and white_label_enabled:
+            admin_items.append(labels["admin_white_label"])
         keyboard = _pack_compact_rows(admin_items)
         keyboard.append([m.get("menu_back", "⬅️ Back")])
     elif section == "admin_maintenance":
@@ -86,6 +91,8 @@ def build_main_menu_keyboard(
             [m.get("menu_favorites", "⭐ Favorites")],
             [m.get("menu_myprofile", "👤 My Profile"), m.get("menu_top_books", "🔥 Top Books")],
         ]
+        if white_label_enabled:
+            keyboard.insert(1, [m.get("menu_connect_book_bot", "🤖 Create my own book bot")])
         if is_admin:
             keyboard.insert(1, [labels["admin_panel"]])
 
