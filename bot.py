@@ -1132,6 +1132,7 @@ _ENGAGEMENT_OPTIONAL_DEP_KEYS = (
     "TOP_USERS_LIMIT",
     "_is_admin_user",
     "_is_owner_user",
+    "_create_guest_private_handoff_start",
     "_get_negative_reaction_alert_threshold",
     "_send_with_retry",
     "add_favorite",
@@ -2700,6 +2701,8 @@ def build_book_keyboard(
     show_comments_button: bool = False,
     more_books_url: str | None = None,
     more_books_label: str | None = None,
+    open_private_url: str | None = None,
+    open_private_label: str | None = None,
     reactions_locked: bool = False,
     dislikes_disabled: bool = False,
 ) -> InlineKeyboardMarkup:
@@ -2726,6 +2729,16 @@ def build_book_keyboard(
             InlineKeyboardButton(label("dislike", REACTION_EMOJI["dislike"], dislike), callback_data=f"react:{book_id}:dislike"),
         ],
     ]
+
+    if open_private_url:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    open_private_label or m.get("group_open_private_results", "Open in bot"),
+                    url=open_private_url,
+                )
+            ]
+        )
 
     if show_listen_button:
         listen_label = m.get("audiobook_listen_button", "🎧 Listen Audiobook")

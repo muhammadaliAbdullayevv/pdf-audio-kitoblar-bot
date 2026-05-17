@@ -107,6 +107,46 @@ def _is_callback_reaction_latest(context: ContextTypes.DEFAULT_TYPE, state_key: 
     return int(state.get(state_key, 0) or 0) == int(state_seq)
 
 
+async def _group_private_results_url_for_book(update: Update, context: ContextTypes.DEFAULT_TYPE, book: dict | None) -> str | None:
+    is_group_chat_fn = globals().get("_is_group_chat")
+    if not callable(is_group_chat_fn) or not is_group_chat_fn(update):
+        return None
+    create_handoff_fn = globals().get("_create_guest_private_handoff_start")
+    if not callable(create_handoff_fn):
+        return None
+    chat = getattr(update, "effective_chat", None)
+    if chat is None and getattr(update, "callback_query", None) and getattr(update.callback_query, "message", None):
+        chat = getattr(update.callback_query.message, "chat", None)
+    username = str(getattr(chat, "username", "") or "").strip()
+    title_fn = globals().get("get_display_name") or globals().get("get_result_title")
+    query_text = ""
+    if callable(title_fn):
+        try:
+            query_text = str(title_fn(book or {}) or "").strip()
+        except Exception:
+            query_text = ""
+    if not query_text:
+        query_text = str((book or {}).get("book_name") or (book or {}).get("display_name") or "").strip()
+    if not query_text:
+        return None
+    try:
+        open_url, _token = await create_handoff_fn(
+            context,
+            handoff_type="query",
+            creator_user_id=int(getattr(getattr(update, "effective_user", None), "id", 0) or 0) or None,
+            query_text=query_text,
+            source_chat_id=int(getattr(chat, "id", 0) or 0) or None,
+            source_chat_type=str(getattr(chat, "type", "") or "").strip() or None,
+            source_chat_title=str(getattr(chat, "title", "") or "").strip() or None,
+            source_chat_username=username or None,
+            source_public_link=f"https://t.me/{username}" if username else None,
+        )
+        return open_url or None
+    except Exception as e:
+        logger.warning("Failed to build group private results URL after reaction: %s", e, exc_info=True)
+        return None
+
+
 def _negative_reaction_alert_threshold() -> int:
     resolver = globals().get("_get_negative_reaction_alert_threshold")
     if callable(resolver):
@@ -906,6 +946,8 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     reaction_policy = await run_blocking(get_reaction_policy_fn, book_id) or reaction_policy
                 except Exception:
                     reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
+            open_private_url = await _group_private_results_url_for_book(update, context, book) if is_group_chat else None
+            open_private_label = MESSAGES.get(lang, MESSAGES["en"]).get("group_open_private_results", "Open in bot") if open_private_url else None
             await query.message.edit_caption(
                 caption=build_book_caption(book, downloads, fav_count, counts),
                 reply_markup=build_book_keyboard(
@@ -925,6 +967,8 @@ async def handle_favorite_callback(update: Update, context: ContextTypes.DEFAULT
                     show_favorite_button=not is_group_chat,
                     show_comments_button=not is_group_chat,
                     more_books_url=more_books_url,
+                    open_private_url=open_private_url,
+                    open_private_label=open_private_label,
                     reactions_locked=bool(reaction_policy.get("reactions_locked")),
                     dislikes_disabled=bool(reaction_policy.get("dislikes_disabled")),
                 ),
@@ -1120,6 +1164,8 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     reaction_policy = await run_blocking(get_reaction_policy_fn, book_id) or reaction_policy
                 except Exception:
                     reaction_policy = {"reactions_locked": False, "dislikes_disabled": False}
+            open_private_url = await _group_private_results_url_for_book(update, context, book) if is_group_chat else None
+            open_private_label = MESSAGES.get(lang, MESSAGES["en"]).get("group_open_private_results", "Open in bot") if open_private_url else None
             await query.message.edit_caption(
                 caption=build_book_caption(book, downloads, fav_count, counts),
                 reply_markup=build_book_keyboard(
@@ -1139,6 +1185,8 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
                     show_favorite_button=not is_group_chat,
                     more_books_url=more_books_url,
                     more_books_label=more_books_label,
+                    open_private_url=open_private_url,
+                    open_private_label=open_private_label,
                     show_comments_button=not is_group_chat,
                     reactions_locked=bool(reaction_policy.get("reactions_locked")),
                     dislikes_disabled=bool(reaction_policy.get("dislikes_disabled")),

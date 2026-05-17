@@ -1776,13 +1776,12 @@ def build_results_keyboard(entries: list, page: int, pages: int, query_id: str):
     return InlineKeyboardMarkup(keyboard)
 
 
-async def _build_group_private_results_keyboard(
+async def _build_group_private_results_url(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
     query_text: str,
-    lang: str,
-) -> InlineKeyboardMarkup | None:
+) -> str | None:
     create_handoff_fn = globals().get("_create_guest_private_handoff_start")
     if not callable(create_handoff_fn):
         return None
@@ -1805,10 +1804,7 @@ async def _build_group_private_results_keyboard(
     except Exception as e:
         logger.warning("Failed to build group private search handoff: %s", e, exc_info=True)
         return None
-    if not open_url:
-        return None
-    button_text = MESSAGES.get(lang, MESSAGES["en"]).get("group_open_private_results", "Open in bot")
-    return InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=open_url)]])
+    return open_url or None
 
 
 def _entry_title_normalized(entry: dict) -> str:
@@ -5417,30 +5413,20 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if suggestions:
                 suggestion_lines = [f"{i + 1}. {s['title']}" for i, s in enumerate(suggestions)]
                 text = MESSAGES[lang]["suggestions"] + "\n\n" + "\n".join(suggestion_lines)
-                reply_markup = None
-                if is_group_chat:
-                    reply_markup = await _build_group_private_results_keyboard(
-                        update,
-                        context,
-                        query_text=query,
-                        lang=lang,
-                    )
-                else:
-                    keyboard = []
-                    row = []
-                    for idx, s in enumerate(suggestions, start=1):
-                        row.append(InlineKeyboardButton(str(idx), callback_data=f"book:{s['id']}"))
-                        if idx % 5 == 0:
-                            keyboard.append(row)
-                            row = []
-                    if row:
+                keyboard = []
+                row = []
+                for idx, s in enumerate(suggestions, start=1):
+                    row.append(InlineKeyboardButton(str(idx), callback_data=f"book:{s['id']}"))
+                    if idx % 5 == 0:
                         keyboard.append(row)
-                    reply_markup = InlineKeyboardMarkup(keyboard)
+                        row = []
+                if row:
+                    keyboard.append(row)
                 await _edit_progress_or_reply(
                     progress_message,
                     update.message,
                     text,
-                    reply_markup=reply_markup,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
                 )
             else:
                 request_id = uuid.uuid4().hex[:10]
@@ -5530,21 +5516,11 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             related_query_id = cache_search_results(context, query, related_entries)
-            related_markup = (
-                await _build_group_private_results_keyboard(
-                    update,
-                    context,
-                    query_text=query,
-                    lang=lang,
-                )
-                if is_group_chat
-                else build_results_keyboard(related_entries, 0, 1, related_query_id)
-            )
             await _edit_progress_or_reply(
                 progress_message,
                 update.message,
                 build_forbidden_related_text(related_entries, lang, blocked_message),
-                reply_markup=related_markup,
+                reply_markup=build_results_keyboard(related_entries, 0, 1, related_query_id),
             )
             return
 
@@ -5553,16 +5529,7 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Build page 0
         result_text, page_entries, pages = build_results_text(query, entries, 0, lang)
-        reply_markup = (
-            await _build_group_private_results_keyboard(
-                update,
-                context,
-                query_text=query,
-                lang=lang,
-            )
-            if is_group_chat
-            else build_results_keyboard(page_entries, 0, pages, query_id)
-        )
+        reply_markup = build_results_keyboard(page_entries, 0, pages, query_id)
 
         # Count searches for books shown on this page
         page_ids = [e.get("id") for e in page_entries if e.get("id")]
@@ -5790,6 +5757,25 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             can_delete = await _can_show_delete_button(update, query.from_user.id)
             is_group_chat = _is_group_chat(update)
             allow_management_buttons = not is_group_chat
+        group_private_results_url = None
+        group_private_results_label = None
+        if is_group_chat and not guest_inline_delivery:
+            cached_query = ""
+            try:
+                last_search_id = str(context.user_data.get("last_search_id") or "").strip()
+                if last_search_id:
+                    cached_search = get_search_cache(context, last_search_id) or {}
+                    cached_query = str((cached_search or {}).get("query") or "").strip()
+            except Exception:
+                cached_query = ""
+            if not cached_query:
+                cached_query = str(get_display_name(book) or get_result_title(book) or "").strip()
+            group_private_results_url = await _build_group_private_results_url(
+                update,
+                context,
+                query_text=cached_query,
+            )
+            group_private_results_label = MESSAGES.get(lang, MESSAGES["en"]).get("group_open_private_results", "Open in bot")
         # Audiobook flags: show listen if audiobook exists; allow add for admins
         has_ab = bool(book.get("has_audiobook"))
         can_add_ab = False
@@ -5841,6 +5827,8 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
             show_comments_button=not is_group_chat,
             more_books_url=more_books_url,
             more_books_label=more_books_label,
+            open_private_url=group_private_results_url,
+            open_private_label=group_private_results_label,
             reactions_locked=bool(reaction_policy.get("reactions_locked")),
             dislikes_disabled=bool(reaction_policy.get("dislikes_disabled")),
         )
@@ -6046,6 +6034,8 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             show_comments_button=False,
                             more_books_url=more_books_url,
                             more_books_label=MESSAGES["uz"].get("inline_more_books_button", "📚 Ko‘proq kitoblar") if guest_inline_delivery else None,
+                            open_private_url=group_private_results_url,
+                            open_private_label=group_private_results_label,
                         ),
                     )
                 elif sent:
@@ -6093,6 +6083,8 @@ async def handle_book_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             show_personal_state=not is_group_chat,
                             show_favorite_button=not is_group_chat,
                             show_comments_button=not is_group_chat,
+                            open_private_url=group_private_results_url,
+                            open_private_label=group_private_results_label,
                             reactions_locked=bool(reaction_policy2.get("reactions_locked")),
                             dislikes_disabled=bool(reaction_policy2.get("dislikes_disabled")),
                         ),
