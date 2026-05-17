@@ -883,6 +883,7 @@ _SEARCH_FLOW_DEP_KEYS = (
     "broadcast",
     "build_book_caption",
     "build_book_keyboard",
+    "_create_guest_private_handoff_start",
     "build_guest_private_handoff_reply_markup",
     "build_upload_admin_keyboard",
     "can_delete_books",
@@ -1378,6 +1379,11 @@ async def owner_only_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def upload_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Upload permission is controlled by DB "allowed" and owner check inside upload flow.
+    lang = ensure_user_language(update, context)
+    chat_type = str(getattr(update.effective_chat, "type", "") or "").lower()
+    if chat_type in {"group", "supergroup"}:
+        await safe_reply(update, MESSAGES[lang].get("group_upload_not_needed", MESSAGES["en"]["group_upload_not_needed"]))
+        return
     await upload_command(update, context)
 
 
@@ -2453,9 +2459,11 @@ async def _handle_guest_private_start_payload(
 
     selected_lang = str(user_record.get("language") or "").strip()
     language_selected = bool(user_record.get("language_selected")) and bool(selected_lang)
-    lang = detect_language_code(selected_lang) if language_selected else "uz"
+    source_chat_type = str((handoff or {}).get("source_chat_type") or "").strip().lower()
+    force_uz_for_group_handoff = source_chat_type in {"group", "supergroup"}
+    lang = "uz" if force_uz_for_group_handoff else (detect_language_code(selected_lang) if language_selected else "uz")
 
-    if not language_selected:
+    if force_uz_for_group_handoff or not language_selected:
         context.user_data["language"] = lang
         try:
             await run_blocking_db_retry(
@@ -6911,6 +6919,11 @@ sync_unindexed_books = _upload_flow.sync_unindexed_books
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fallback photo handler for the core bot."""
+    lang = ensure_user_language(update, context)
+    chat_type = str(getattr(update.effective_chat, "type", "") or "").lower()
+    if chat_type in {"group", "supergroup"}:
+        await safe_reply(update, MESSAGES[lang].get("group_upload_not_needed", MESSAGES["en"]["group_upload_not_needed"]))
+        return
     relay_handler = getattr(_search_flow, "handle_pending_comment_relay_message", None)
     if callable(relay_handler) and context.user_data.get("pending_comment_relay"):
         if await relay_handler(update, context):
@@ -6920,6 +6933,11 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fallback document handler for uploads and book search."""
+    lang = ensure_user_language(update, context)
+    chat_type = str(getattr(update.effective_chat, "type", "") or "").lower()
+    if chat_type in {"group", "supergroup"}:
+        await safe_reply(update, MESSAGES[lang].get("group_upload_not_needed", MESSAGES["en"]["group_upload_not_needed"]))
+        return
     relay_handler = getattr(_search_flow, "handle_pending_comment_relay_message", None)
     if callable(relay_handler) and context.user_data.get("pending_comment_relay"):
         if await relay_handler(update, context):

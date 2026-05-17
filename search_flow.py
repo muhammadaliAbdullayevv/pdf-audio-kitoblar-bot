@@ -1776,6 +1776,41 @@ def build_results_keyboard(entries: list, page: int, pages: int, query_id: str):
     return InlineKeyboardMarkup(keyboard)
 
 
+async def _build_group_private_results_keyboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    query_text: str,
+    lang: str,
+) -> InlineKeyboardMarkup | None:
+    create_handoff_fn = globals().get("_create_guest_private_handoff_start")
+    if not callable(create_handoff_fn):
+        return None
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    username = str(getattr(chat, "username", "") or "").strip()
+    public_link = f"https://t.me/{username}" if username else None
+    try:
+        open_url, _token = await create_handoff_fn(
+            context,
+            handoff_type="query",
+            creator_user_id=int(getattr(user, "id", 0) or 0) or None,
+            query_text=str(query_text or "").strip(),
+            source_chat_id=int(getattr(chat, "id", 0) or 0) or None,
+            source_chat_type=str(getattr(chat, "type", "") or "").strip() or None,
+            source_chat_title=str(getattr(chat, "title", "") or "").strip() or None,
+            source_chat_username=username or None,
+            source_public_link=public_link,
+        )
+    except Exception as e:
+        logger.warning("Failed to build group private search handoff: %s", e, exc_info=True)
+        return None
+    if not open_url:
+        return None
+    button_text = MESSAGES.get(lang, MESSAGES["en"]).get("group_open_private_results", "Open in bot")
+    return InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=open_url)]])
+
+
 def _entry_title_normalized(entry: dict) -> str:
     return normalize(str((entry or {}).get("title") or "")).lower().strip()
 
@@ -5382,20 +5417,30 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if suggestions:
                 suggestion_lines = [f"{i + 1}. {s['title']}" for i, s in enumerate(suggestions)]
                 text = MESSAGES[lang]["suggestions"] + "\n\n" + "\n".join(suggestion_lines)
-                keyboard = []
-                row = []
-                for idx, s in enumerate(suggestions, start=1):
-                    row.append(InlineKeyboardButton(str(idx), callback_data=f"book:{s['id']}"))
-                    if idx % 5 == 0:
+                reply_markup = None
+                if is_group_chat:
+                    reply_markup = await _build_group_private_results_keyboard(
+                        update,
+                        context,
+                        query_text=query,
+                        lang=lang,
+                    )
+                else:
+                    keyboard = []
+                    row = []
+                    for idx, s in enumerate(suggestions, start=1):
+                        row.append(InlineKeyboardButton(str(idx), callback_data=f"book:{s['id']}"))
+                        if idx % 5 == 0:
+                            keyboard.append(row)
+                            row = []
+                    if row:
                         keyboard.append(row)
-                        row = []
-                if row:
-                    keyboard.append(row)
+                    reply_markup = InlineKeyboardMarkup(keyboard)
                 await _edit_progress_or_reply(
                     progress_message,
                     update.message,
                     text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    reply_markup=reply_markup,
                 )
             else:
                 request_id = uuid.uuid4().hex[:10]
@@ -5485,11 +5530,21 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             related_query_id = cache_search_results(context, query, related_entries)
+            related_markup = (
+                await _build_group_private_results_keyboard(
+                    update,
+                    context,
+                    query_text=query,
+                    lang=lang,
+                )
+                if is_group_chat
+                else build_results_keyboard(related_entries, 0, 1, related_query_id)
+            )
             await _edit_progress_or_reply(
                 progress_message,
                 update.message,
                 build_forbidden_related_text(related_entries, lang, blocked_message),
-                reply_markup=build_results_keyboard(related_entries, 0, 1, related_query_id),
+                reply_markup=related_markup,
             )
             return
 
@@ -5498,7 +5553,16 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Build page 0
         result_text, page_entries, pages = build_results_text(query, entries, 0, lang)
-        reply_markup = build_results_keyboard(page_entries, 0, pages, query_id)
+        reply_markup = (
+            await _build_group_private_results_keyboard(
+                update,
+                context,
+                query_text=query,
+                lang=lang,
+            )
+            if is_group_chat
+            else build_results_keyboard(page_entries, 0, pages, query_id)
+        )
 
         # Count searches for books shown on this page
         page_ids = [e.get("id") for e in page_entries if e.get("id")]
