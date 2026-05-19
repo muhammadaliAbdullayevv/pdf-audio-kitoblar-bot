@@ -9,7 +9,7 @@ from telegram import InputFile
 
 from . import WL_SEED_STATUS_FAILED, WL_SEED_STATUS_SENT_TO_CACHE
 from .crypto import redact_token_like_strings
-from .db_helpers import update_connected_bot_cache_seed_job
+from .db_helpers import create_white_label_audit_log, update_connected_bot_cache_seed_job
 from .runtime_utils import build_bot_client
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,25 @@ def parse_cache_seed_caption(text: str | None) -> dict[str, str] | None:
     if data.get("seed_token") and data.get("book_id") and data.get("connected_bot_id"):
         return data
     return None
+
+
+def _audit_cache_seed_failed(connected_bot: dict, seed_job: dict, book: dict, error: str) -> None:
+    try:
+        create_white_label_audit_log(
+            action="CACHE_SEED_FAILED",
+            actor_user_id=None,
+            connected_bot_id=str((connected_bot or {}).get("id") or "").strip() or None,
+            request_id=None,
+            target_bot_username=str((connected_bot or {}).get("bot_username") or "").strip() or None,
+            details={
+                "seed_job_id": str((seed_job or {}).get("id") or ""),
+                "book_id": str((book or {}).get("id") or ""),
+                "cache_channel_id": int((connected_bot or {}).get("cache_channel_id") or 0),
+            },
+            error_message=error,
+        )
+    except Exception:
+        logger.debug("Failed to write cache seed failure audit log", exc_info=True)
 
 
 def _book_filename(book: dict[str, Any]) -> str:
@@ -106,6 +125,7 @@ async def seed_connected_bot_cache(
     if not cache_channel_id:
         error = "cache channel is not configured"
         update_connected_bot_cache_seed_job(str(seed_job.get("id") or ""), status=WL_SEED_STATUS_FAILED, error_message=error)
+        _audit_cache_seed_failed(connected_bot, seed_job, book, error)
         return {"ok": False, "error": error}
 
     created_client = False
@@ -139,6 +159,7 @@ async def seed_connected_bot_cache(
                 status=WL_SEED_STATUS_FAILED,
                 error_message=error or "no cache seed source available",
             )
+            _audit_cache_seed_failed(connected_bot, seed_job, book, error or "no cache seed source available")
             return {"ok": False, "error": error or "no cache seed source available"}
 
         update_connected_bot_cache_seed_job(
@@ -156,6 +177,7 @@ async def seed_connected_bot_cache(
             status=WL_SEED_STATUS_FAILED,
             error_message=error,
         )
+        _audit_cache_seed_failed(connected_bot, seed_job, book, error)
         return {"ok": False, "error": error}
     finally:
         if created_client:
@@ -163,4 +185,3 @@ async def seed_connected_bot_cache(
                 await main_bot.shutdown()
             except Exception:
                 pass
-

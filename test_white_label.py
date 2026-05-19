@@ -9,8 +9,17 @@ import uuid
 sys.path.insert(0, os.path.dirname(__file__))
 
 import db
-from white_label import WL_CACHE_STATUS_INVALID, WL_CACHE_STATUS_VALID, WL_SEED_STATUS_PENDING
+from white_label import (
+    WL_CACHE_STATUS_INVALID,
+    WL_CACHE_STATUS_VALID,
+    WL_PLAN_BASIC,
+    WL_PLAN_COMMUNITY,
+    WL_PLAN_PRO,
+    WL_SEED_STATUS_PENDING,
+)
 from white_label.cache_seeding import build_cache_seed_caption, parse_cache_seed_caption
+from white_label.connected_bot_delivery import _is_pdf_accessible_book
+from white_label import connected_bot_search
 from white_label.crypto import (
     decrypt_bot_token,
     encrypt_bot_token,
@@ -21,19 +30,27 @@ from white_label.crypto import (
 )
 from white_label.db_helpers import (
     accept_connected_bot_request,
+    create_white_label_audit_log,
     create_connected_bot_cache_seed_job,
     create_connected_bot_request,
     delete_connected_bot,
     find_existing_connected_bot_request_or_bot,
     get_active_connected_bot_cache_seed_job,
     get_connected_bot_file_cache,
+    get_connected_bot_request_by_id,
     get_connected_bot_usage,
+    get_latest_white_label_audit_log,
     increment_connected_bot_usage,
     mark_connected_bot_file_cache_invalid,
     reject_connected_bot_request,
+    touch_connected_bot_runtime_heartbeat,
+    update_book_white_label_enabled,
+    update_connected_bot_plan,
     upsert_connected_bot,
     upsert_connected_bot_file_cache,
 )
+from white_label.plans import normalize_plan, plan_limit
+from white_label.runtime_control import format_runtime_status
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -75,9 +92,44 @@ def _test_cache_caption() -> None:
     _assert(parsed["connected_bot_id"] == "bot-456", "parsed connected bot id should match")
 
 
+def _test_runtime_status_and_plans() -> None:
+    formatted = format_runtime_status({"bot_username": "runtime_test"}, {"state": "RUNNING", "pid": 12345, "managed": True})
+    _assert("RUNNING" in formatted, "runtime status display should use the state field")
+    _assert("12345" in formatted, "runtime status display should include pid")
+    _assert(normalize_plan("PLUS") == WL_PLAN_PRO, "legacy PLUS should normalize to PRO")
+    _assert(plan_limit("TRIAL", "daily_search_limit") == 100, "trial search limit should be normalized")
+    _assert(plan_limit(WL_PLAN_BASIC, "daily_send_limit") == 100, "basic send limit should be normalized")
+    _assert(plan_limit("PRO", "daily_send_limit") == 500, "pro send limit should be normalized")
+    _assert(plan_limit(WL_PLAN_COMMUNITY, "daily_send_limit") == 2000, "community send limit should be normalized")
+
+
+def _test_search_fallback_without_full_scan() -> None:
+    original_es = connected_bot_search._search_es
+    original_pg = connected_bot_search._search_pg_fallback
+    try:
+        connected_bot_search._search_es = lambda query, size: ([], "forced es failure")
+        connected_bot_search._search_pg_fallback = lambda query, size: [
+            {
+                "id": "fallback-book",
+                "book_name": "Atomic Habits",
+                "display_name": "Atomic Habits",
+                "file_id": "BQACAgIAAxkBAAIBAWexamplefileid",
+                "path": "",
+                "white_label_enabled": True,
+            }
+        ]
+        result = connected_bot_search.search_connected_books_page("atomic habits", limit=5, offset=0)
+        _assert(int(result.get("total") or 0) == 1, "limited PostgreSQL fallback should return fallback books")
+        _assert(result["books"][0]["id"] == "fallback-book", "fallback result should be preserved")
+    finally:
+        connected_bot_search._search_es = original_es
+        connected_bot_search._search_pg_fallback = original_pg
+
+
 def _cleanup_db_rows(connected_bot_id: str) -> None:
     with db.db_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("DELETE FROM white_label_audit_logs WHERE connected_bot_id=%s", (connected_bot_id,))
             cur.execute("DELETE FROM connected_bot_usage WHERE connected_bot_id=%s", (connected_bot_id,))
             cur.execute("DELETE FROM connected_bot_cache_seed_jobs WHERE connected_bot_id=%s", (connected_bot_id,))
             cur.execute("DELETE FROM connected_bot_file_cache WHERE connected_bot_id=%s", (connected_bot_id,))
@@ -87,6 +139,7 @@ def _cleanup_db_rows(connected_bot_id: str) -> None:
 def _cleanup_db_request(request_id: str, connected_bot_id: str | None = None) -> None:
     with db.db_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("DELETE FROM white_label_audit_logs WHERE request_id=%s", (request_id,))
             if connected_bot_id:
                 cur.execute("DELETE FROM connected_bots WHERE id=%s", (connected_bot_id,))
             cur.execute("DELETE FROM connected_bot_requests WHERE id=%s", (request_id,))
@@ -136,6 +189,19 @@ def _test_db_helpers() -> None:
         _assert(accepted_bot_id, "accepting request should create a connected bot")
         _assert(str((accepted or {}).get("plan") or "") == "TRIAL", "accepted bot should start on TRIAL plan")
         _assert(int((accepted or {}).get("daily_send_limit") or 0) == 20, "accepted bot should use trial send limit")
+        accepted_request = get_connected_bot_request_by_id(request_id)
+        _assert(not (accepted_request or {}).get("bot_token_encrypted"), "accepted request should clear encrypted token retention")
+        create_white_label_audit_log(
+            action="REQUEST_ACCEPTED",
+            actor_user_id=999999000,
+            connected_bot_id=accepted_bot_id,
+            request_id=request_id,
+            target_bot_username=str((accepted or {}).get("bot_username") or ""),
+            details={"test": True, "token": request_token},
+        )
+        latest_audit = get_latest_white_label_audit_log(connected_bot_id=accepted_bot_id)
+        _assert(str((latest_audit or {}).get("action") or "") == "REQUEST_ACCEPTED", "latest audit log should be readable")
+        _assert(request_token not in str((latest_audit or {}).get("details_json") or ""), "audit log must redact token-like details")
     finally:
         _cleanup_db_request(request_id, accepted_bot_id or None)
 
@@ -156,6 +222,8 @@ def _test_db_helpers() -> None:
     try:
         rejected = reject_connected_bot_request(reject_request_id, rejected_by_owner_id=999999000, reason="test")
         _assert(str((rejected or {}).get("status") or "") == "REJECTED", "reject helper should mark request rejected")
+        rejected_request = get_connected_bot_request_by_id(reject_request_id)
+        _assert(not (rejected_request or {}).get("bot_token_encrypted"), "rejected request should clear encrypted token retention")
     finally:
         _cleanup_db_request(reject_request_id)
 
@@ -179,6 +247,16 @@ def _test_db_helpers() -> None:
     connected_bot_id = str(row.get("id") or "")
     _assert(connected_bot_id, "connected bot id should be created")
     try:
+        touched = touch_connected_bot_runtime_heartbeat(connected_bot_id, pid=12345)
+        _assert((touched or {}).get("runtime_last_heartbeat_at") is not None, "runtime heartbeat should be stored")
+        pro_row = update_connected_bot_plan(connected_bot_id, "PLUS")
+        _assert(str((pro_row or {}).get("plan") or "") == WL_PLAN_PRO, "legacy PLUS plan update should store PRO")
+
+        update_book_white_label_enabled(book_id, False)
+        blocked_book = db.get_book_by_id(book_id)
+        _assert(_is_pdf_accessible_book(blocked_book) is False, "white_label_enabled=false should block connected delivery")
+        update_book_white_label_enabled(book_id, True)
+
         seed_job = create_connected_bot_cache_seed_job(
             connected_bot_id=connected_bot_id,
             book_id=book_id,
@@ -218,6 +296,10 @@ def _test_db_helpers() -> None:
         usage_after = get_connected_bot_usage(connected_bot_id)
         _assert(int(usage_after.get("cache_hits") or 0) == 1, "usage should persist cache hits")
     finally:
+        try:
+            update_book_white_label_enabled(book_id, True)
+        except Exception:
+            pass
         _cleanup_db_rows(connected_bot_id)
         delete_connected_bot(connected_bot_id)
 
@@ -226,6 +308,8 @@ def main() -> None:
     print("🧪 White-label MVP tests")
     _test_crypto()
     _test_cache_caption()
+    _test_runtime_status_and_plans()
+    _test_search_fallback_without_full_scan()
 
     try:
         db.init_db()

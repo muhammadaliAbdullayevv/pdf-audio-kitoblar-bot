@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime, timedelta
 
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import Json, RealDictCursor
 
 from config import (
     WHITE_LABEL_DEFAULT_DAILY_SEARCH_LIMIT,
@@ -11,6 +11,7 @@ from config import (
     WHITE_LABEL_DEFAULT_PER_MINUTE_SEND_LIMIT,
 )
 from db import db_conn
+from .crypto import redact_token_like_strings
 from . import (
     WL_CACHE_STATUS_FAILED,
     WL_CACHE_STATUS_INVALID,
@@ -25,11 +26,14 @@ from . import (
     WL_SEED_STATUS_FAILED,
     WL_SEED_STATUS_PENDING,
     WL_SEED_STATUS_SENT_TO_CACHE,
+    WL_SUBSCRIPTION_EXPIRED,
+    WL_SUBSCRIPTION_MANUAL,
     WL_SUBSCRIPTION_TRIALING,
     WL_STATUS_ACTIVE,
     WL_STATUS_ERROR,
     WL_STATUS_SUSPENDED,
 )
+from .plans import normalize_plan, plan_limit
 
 
 def _now_utc() -> datetime:
@@ -46,6 +50,10 @@ def _normalize_bot_status(raw: str | None) -> str:
     if text in {WL_STATUS_ACTIVE, WL_STATUS_SUSPENDED, WL_STATUS_ERROR}:
         return text
     return WL_STATUS_SUSPENDED
+
+
+def _normalize_connected_plan(raw: str | None) -> str:
+    return normalize_plan(raw)
 
 
 def _normalize_request_status(raw: str | None) -> str:
@@ -67,6 +75,98 @@ def _normalize_seed_status(raw: str | None) -> str:
     if text in {WL_SEED_STATUS_PENDING, WL_SEED_STATUS_SENT_TO_CACHE, WL_SEED_STATUS_CACHED, WL_SEED_STATUS_FAILED, WL_SEED_STATUS_EXPIRED}:
         return text
     return WL_SEED_STATUS_PENDING
+
+
+def _non_negative_limit(value: int | None, default: int) -> int:
+    if value is None:
+        value = default
+    return max(0, int(value))
+
+
+def _safe_json_value(value):
+    if isinstance(value, dict):
+        return {str(k): _safe_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_safe_json_value(v) for v in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return redact_token_like_strings(str(value))[:2000]
+
+
+def create_white_label_audit_log(
+    *,
+    action: str,
+    actor_user_id: int | None = None,
+    connected_bot_id: str | None = None,
+    request_id: str | None = None,
+    target_bot_username: str | None = None,
+    details: dict | None = None,
+    error_message: str | None = None,
+) -> dict:
+    audit_id = str(uuid.uuid4())
+    clean_action = str(action or "").strip().upper()
+    if not clean_action:
+        raise ValueError("audit action is required")
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO white_label_audit_logs (
+                    id,
+                    connected_bot_id,
+                    request_id,
+                    actor_user_id,
+                    action,
+                    target_bot_username,
+                    details_json,
+                    error_message,
+                    created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                RETURNING *
+                """,
+                (
+                    audit_id,
+                    str(connected_bot_id or "").strip() or None,
+                    str(request_id or "").strip() or None,
+                    int(actor_user_id) if actor_user_id else None,
+                    clean_action,
+                    str(target_bot_username or "").strip().lstrip("@") or None,
+                    Json(_safe_json_value(details or {})) if details is not None else None,
+                    redact_token_like_strings(str(error_message or ""))[:2000] or None,
+                ),
+            )
+            return cur.fetchone()
+
+
+def get_latest_white_label_audit_log(*, connected_bot_id: str | None = None, request_id: str | None = None) -> dict | None:
+    clean_bot_id = str(connected_bot_id or "").strip()
+    clean_request_id = str(request_id or "").strip()
+    if not clean_bot_id and not clean_request_id:
+        return None
+    clauses: list[str] = []
+    values: list[object] = []
+    if clean_bot_id:
+        clauses.append("connected_bot_id=%s")
+        values.append(clean_bot_id)
+    if clean_request_id:
+        clauses.append("request_id=%s")
+        values.append(clean_request_id)
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT *
+                FROM white_label_audit_logs
+                WHERE {' OR '.join(clauses)}
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                values,
+            )
+            return cur.fetchone()
 
 
 def get_connected_bot_by_id(connected_bot_id: str) -> dict | None:
@@ -140,6 +240,45 @@ def list_connected_bots_page(*, limit: int = 10, offset: int = 0) -> list[dict]:
             return cur.fetchall()
 
 
+def count_connected_bots_for_owner(owner_telegram_id: int) -> int:
+    if not owner_telegram_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM connected_bots
+                WHERE owner_telegram_id=%s OR requested_by_user_id=%s
+                """,
+                (int(owner_telegram_id), int(owner_telegram_id)),
+            )
+            return int(cur.fetchone()[0] or 0)
+
+
+def list_connected_bots_for_owner(owner_telegram_id: int, *, limit: int = 10, offset: int = 0) -> list[dict]:
+    if not owner_telegram_id:
+        return []
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM connected_bots
+                WHERE owner_telegram_id=%s OR requested_by_user_id=%s
+                ORDER BY created_at DESC, bot_username ASC
+                LIMIT %s OFFSET %s
+                """,
+                (
+                    int(owner_telegram_id),
+                    int(owner_telegram_id),
+                    max(1, int(limit or 10)),
+                    max(0, int(offset or 0)),
+                ),
+            )
+            return cur.fetchall()
+
+
 def upsert_connected_bot(
     *,
     owner_telegram_id: int,
@@ -152,7 +291,7 @@ def upsert_connected_bot(
     plan: str | None = None,
 ) -> dict:
     normalized_status = _normalize_bot_status(status)
-    normalized_plan = str(plan or WL_PLAN_MANUAL).strip().upper() or WL_PLAN_MANUAL
+    normalized_plan = _normalize_connected_plan(plan or WL_PLAN_MANUAL)
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -262,6 +401,73 @@ def update_connected_bot_status(connected_bot_id: str, status: str, *, last_erro
             return cur.fetchone()
 
 
+def update_connected_bot_plan(connected_bot_id: str, plan: str, *, trial_days: int = 3) -> dict | None:
+    clean_id = str(connected_bot_id or "").strip()
+    if not clean_id:
+        return None
+    normalized_plan = _normalize_connected_plan(plan)
+    daily_search_limit = plan_limit(normalized_plan, "daily_search_limit", 1000)
+    daily_send_limit = plan_limit(normalized_plan, "daily_send_limit", 100)
+    per_minute_send_limit = plan_limit(normalized_plan, "per_minute_send_limit", 10)
+    search_results_limit = max(1, min(10, plan_limit(normalized_plan, "search_results_limit", 5)))
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if normalized_plan == WL_PLAN_TRIAL:
+                cur.execute(
+                    """
+                    UPDATE connected_bots
+                    SET plan=%s,
+                        subscription_status=%s,
+                        daily_search_limit=%s,
+                        daily_send_limit=%s,
+                        per_minute_send_limit=%s,
+                        search_results_limit=%s,
+                        trial_started_at=NOW(),
+                        trial_ends_at=NOW() + (%s || ' days')::INTERVAL,
+                        trial_expired_notified_at=NULL,
+                        updated_at=NOW()
+                    WHERE id=%s
+                    RETURNING *
+                    """,
+                    (
+                        normalized_plan,
+                        WL_SUBSCRIPTION_TRIALING,
+                        daily_search_limit,
+                        daily_send_limit,
+                        per_minute_send_limit,
+                        search_results_limit,
+                        max(1, int(trial_days or 3)),
+                        clean_id,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE connected_bots
+                    SET plan=%s,
+                        subscription_status=%s,
+                        daily_search_limit=%s,
+                        daily_send_limit=%s,
+                        per_minute_send_limit=%s,
+                        search_results_limit=%s,
+                        trial_expired_notified_at=NULL,
+                        updated_at=NOW()
+                    WHERE id=%s
+                    RETURNING *
+                    """,
+                    (
+                        normalized_plan,
+                        WL_SUBSCRIPTION_MANUAL,
+                        daily_search_limit,
+                        daily_send_limit,
+                        per_minute_send_limit,
+                        search_results_limit,
+                        clean_id,
+                    ),
+                )
+            return cur.fetchone()
+
+
 def record_connected_bot_verification(connected_bot_id: str, *, last_error: str | None = None) -> int:
     clean_id = str(connected_bot_id or "").strip()
     if not clean_id:
@@ -301,6 +507,106 @@ def update_connected_bot_cache_channel(connected_bot_id: str, cache_channel_id: 
             return cur.fetchone()
 
 
+def touch_connected_bot_runtime_heartbeat(connected_bot_id: str, *, pid: int | None = None) -> dict | None:
+    clean_id = str(connected_bot_id or "").strip()
+    if not clean_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE connected_bots
+                SET runtime_last_heartbeat_at=NOW(),
+                    runtime_pid=%s,
+                    updated_at=NOW()
+                WHERE id=%s
+                RETURNING *
+                """,
+                (int(pid) if pid else None, clean_id),
+            )
+            return cur.fetchone()
+
+
+def update_connected_bot_public_settings(
+    connected_bot_id: str,
+    *,
+    branding_title: str | None = None,
+    welcome_text_uz: str | None = None,
+    welcome_text_en: str | None = None,
+    welcome_text_ru: str | None = None,
+    search_results_limit: int | None = None,
+) -> dict | None:
+    clean_id = str(connected_bot_id or "").strip()
+    if not clean_id:
+        return None
+    set_parts = ["updated_at=NOW()"]
+    values: list[object] = []
+    mapping = {
+        "branding_title": branding_title,
+        "welcome_text_uz": welcome_text_uz,
+        "welcome_text_en": welcome_text_en,
+        "welcome_text_ru": welcome_text_ru,
+    }
+    for column, value in mapping.items():
+        if value is None:
+            continue
+        clean_value = str(value or "").strip()
+        set_parts.append(f"{column}=%s")
+        values.append(clean_value or None)
+    if search_results_limit is not None:
+        set_parts.append("search_results_limit=%s")
+        values.append(max(1, min(10, int(search_results_limit or 10))))
+    values.append(clean_id)
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"UPDATE connected_bots SET {', '.join(set_parts)} WHERE id=%s", values)
+            cur.execute("SELECT * FROM connected_bots WHERE id=%s LIMIT 1", (clean_id,))
+            return cur.fetchone()
+
+
+def clear_connected_bot_request_token(request_id: str) -> int:
+    clean_id = str(request_id or "").strip()
+    if not clean_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE connected_bot_requests
+                SET bot_token_encrypted=NULL,
+                    updated_at=NOW()
+                WHERE id=%s
+                  AND bot_token_encrypted IS NOT NULL
+                """,
+                (clean_id,),
+            )
+            return cur.rowcount
+
+
+def clean_processed_connected_bot_request_tokens(*, limit: int = 500) -> int:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH rows AS (
+                    SELECT id
+                    FROM connected_bot_requests
+                    WHERE status IN ('ACCEPTED', 'REJECTED', 'CANCELLED')
+                      AND bot_token_encrypted IS NOT NULL
+                    ORDER BY updated_at ASC
+                    LIMIT %s
+                )
+                UPDATE connected_bot_requests r
+                SET bot_token_encrypted=NULL,
+                    updated_at=NOW()
+                FROM rows
+                WHERE r.id=rows.id
+                """,
+                (max(1, int(limit or 500)),),
+            )
+            return cur.rowcount
+
+
 def delete_connected_bot(connected_bot_id: str) -> int:
     clean_id = str(connected_bot_id or "").strip()
     if not clean_id:
@@ -309,6 +615,98 @@ def delete_connected_bot(connected_bot_id: str) -> int:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM connected_bots WHERE id=%s", (clean_id,))
             return cur.rowcount
+
+
+def get_connected_bot_user(connected_bot_id: str, telegram_user_id: int) -> dict | None:
+    clean_bot_id = str(connected_bot_id or "").strip()
+    user_id = int(telegram_user_id or 0)
+    if not clean_bot_id or not user_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM connected_bot_users
+                WHERE connected_bot_id=%s AND telegram_user_id=%s
+                LIMIT 1
+                """,
+                (clean_bot_id, user_id),
+            )
+            return cur.fetchone()
+
+
+def upsert_connected_bot_user(
+    *,
+    connected_bot_id: str,
+    telegram_user_id: int,
+    username: str | None = None,
+    first_name: str | None = None,
+    language_code: str | None = None,
+) -> dict:
+    clean_bot_id = str(connected_bot_id or "").strip()
+    user_id = int(telegram_user_id or 0)
+    if not clean_bot_id or not user_id:
+        raise ValueError("connected_bot_id and telegram_user_id are required")
+    clean_lang = str(language_code or "").strip().lower() or None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO connected_bot_users (
+                    connected_bot_id,
+                    telegram_user_id,
+                    username,
+                    first_name,
+                    language_code,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (connected_bot_id, telegram_user_id) DO UPDATE SET
+                    username=EXCLUDED.username,
+                    first_name=EXCLUDED.first_name,
+                    language_code=COALESCE(EXCLUDED.language_code, connected_bot_users.language_code),
+                    updated_at=NOW()
+                RETURNING *
+                """,
+                (
+                    clean_bot_id,
+                    user_id,
+                    str(username or "").strip() or None,
+                    str(first_name or "").strip() or None,
+                    clean_lang,
+                ),
+            )
+            return cur.fetchone()
+
+
+def set_connected_bot_user_language(connected_bot_id: str, telegram_user_id: int, language_code: str) -> dict | None:
+    clean_bot_id = str(connected_bot_id or "").strip()
+    user_id = int(telegram_user_id or 0)
+    clean_lang = str(language_code or "").strip().lower()
+    if not clean_bot_id or not user_id or not clean_lang:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO connected_bot_users (
+                    connected_bot_id,
+                    telegram_user_id,
+                    language_code,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, NOW(), NOW())
+                ON CONFLICT (connected_bot_id, telegram_user_id) DO UPDATE SET
+                    language_code=EXCLUDED.language_code,
+                    updated_at=NOW()
+                RETURNING *
+                """,
+                (clean_bot_id, user_id, clean_lang),
+            )
+            return cur.fetchone()
 
 
 def get_connected_bot_request_by_id(request_id: str) -> dict | None:
@@ -516,9 +914,9 @@ def accept_connected_bot_request(
                         WL_STATUS_SUSPENDED,
                         WL_PLAN_TRIAL,
                         WL_SUBSCRIPTION_TRIALING,
-                        max(1, int(daily_search_limit or 100)),
-                        max(1, int(daily_send_limit or 20)),
-                        max(1, int(per_minute_send_limit or 10)),
+                        _non_negative_limit(daily_search_limit, 100),
+                        _non_negative_limit(daily_send_limit, 20),
+                        _non_negative_limit(per_minute_send_limit, 10),
                         trial_ends_at,
                         connected_bot_id,
                     ),
@@ -572,9 +970,9 @@ def accept_connected_bot_request(
                         WL_STATUS_SUSPENDED,
                         WL_PLAN_TRIAL,
                         WL_SUBSCRIPTION_TRIALING,
-                        max(1, int(daily_search_limit or 100)),
-                        max(1, int(daily_send_limit or 20)),
-                        max(1, int(per_minute_send_limit or 10)),
+                        _non_negative_limit(daily_search_limit, 100),
+                        _non_negative_limit(daily_send_limit, 20),
+                        _non_negative_limit(per_minute_send_limit, 10),
                         trial_ends_at,
                     ),
                 )
@@ -585,6 +983,7 @@ def accept_connected_bot_request(
                     accepted_by_owner_id=%s,
                     accepted_at=NOW(),
                     accepted_connected_bot_id=%s,
+                    bot_token_encrypted=NULL,
                     updated_at=NOW()
                 WHERE id=%s
                 """,
@@ -592,6 +991,60 @@ def accept_connected_bot_request(
             )
             cur.execute("SELECT * FROM connected_bots WHERE id=%s LIMIT 1", (connected_bot_id,))
             return cur.fetchone()
+
+
+def mark_connected_bot_trial_expired(connected_bot_id: str) -> dict | None:
+    clean_id = str(connected_bot_id or "").strip()
+    if not clean_id:
+        return None
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM connected_bots WHERE id=%s FOR UPDATE", (clean_id,))
+            existing = cur.fetchone()
+            if not existing:
+                return None
+            should_notify = existing.get("trial_expired_notified_at") is None
+            cur.execute(
+                """
+                UPDATE connected_bots
+                SET status=%s,
+                    subscription_status=%s,
+                    trial_expired_notified_at=COALESCE(trial_expired_notified_at, NOW()),
+                    updated_at=NOW()
+                WHERE id=%s
+                RETURNING *
+                """,
+                (WL_STATUS_SUSPENDED, WL_SUBSCRIPTION_EXPIRED, clean_id),
+            )
+            updated = cur.fetchone()
+            if updated:
+                updated["_should_notify_trial_expired"] = should_notify
+            return updated
+
+
+def expire_due_trial_connected_bots(*, limit: int = 50) -> list[dict]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM connected_bots
+                WHERE plan=%s
+                  AND COALESCE(subscription_status, '') <> %s
+                  AND trial_ends_at IS NOT NULL
+                  AND trial_ends_at <= NOW()
+                ORDER BY trial_ends_at ASC
+                LIMIT %s
+                """,
+                (WL_PLAN_TRIAL, WL_SUBSCRIPTION_EXPIRED, max(1, int(limit or 50))),
+            )
+            ids = [str(row[0] or "").strip() for row in cur.fetchall()]
+    expired: list[dict] = []
+    for connected_bot_id in ids:
+        row = mark_connected_bot_trial_expired(connected_bot_id)
+        if row:
+            expired.append(dict(row))
+    return expired
 
 
 def reject_connected_bot_request(request_id: str, *, rejected_by_owner_id: int, reason: str | None = None) -> dict | None:
@@ -607,6 +1060,7 @@ def reject_connected_bot_request(request_id: str, *, rejected_by_owner_id: int, 
                     rejection_reason=%s,
                     rejected_by_owner_id=%s,
                     rejected_at=NOW(),
+                    bot_token_encrypted=NULL,
                     updated_at=NOW()
                 WHERE id=%s AND status=%s
                 RETURNING *
@@ -645,6 +1099,16 @@ def get_connected_bot_file_cache(connected_bot_id: str, book_id: str, *, only_va
                     (clean_bot_id, clean_book_id),
                 )
             return cur.fetchone()
+
+
+def update_book_white_label_enabled(book_id: str, enabled: bool) -> int:
+    clean_book_id = str(book_id or "").strip()
+    if not clean_book_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE books SET white_label_enabled=%s WHERE id=%s", (bool(enabled), clean_book_id))
+            return cur.rowcount
 
 
 def upsert_connected_bot_file_cache(

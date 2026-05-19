@@ -976,6 +976,69 @@ def _apply_schema_migrations(cur) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_connected_bot_requests_token_fp ON connected_bot_requests (bot_token_fingerprint);",
             ],
         ),
+        (
+            49,
+            "white-label connected bot user language and public settings",
+            [
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS branding_title TEXT;",
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS welcome_text_uz TEXT;",
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS welcome_text_en TEXT;",
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS welcome_text_ru TEXT;",
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS search_results_limit INTEGER NOT NULL DEFAULT 10;",
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS trial_expired_notified_at TIMESTAMP;",
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS runtime_last_heartbeat_at TIMESTAMP;",
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS runtime_pid BIGINT;",
+                """
+                CREATE TABLE IF NOT EXISTS connected_bot_users (
+                    connected_bot_id TEXT NOT NULL REFERENCES connected_bots(id) ON DELETE CASCADE,
+                    telegram_user_id BIGINT NOT NULL,
+                    username TEXT,
+                    first_name TEXT,
+                    language_code TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (connected_bot_id, telegram_user_id)
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_connected_bot_users_updated ON connected_bot_users (connected_bot_id, updated_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_connected_bot_users_user ON connected_bot_users (telegram_user_id, updated_at DESC);",
+            ],
+        ),
+        (
+            50,
+            "white-label safety controls",
+            [
+                "ALTER TABLE connected_bot_requests ALTER COLUMN bot_token_encrypted DROP NOT NULL;",
+                """
+                UPDATE connected_bot_requests
+                SET bot_token_encrypted=NULL,
+                    updated_at=NOW()
+                WHERE status IN ('ACCEPTED', 'REJECTED', 'CANCELLED')
+                  AND bot_token_encrypted IS NOT NULL;
+                """,
+                "ALTER TABLE books ADD COLUMN IF NOT EXISTS white_label_enabled BOOLEAN NOT NULL DEFAULT TRUE;",
+                "CREATE INDEX IF NOT EXISTS idx_books_white_label_enabled ON books (white_label_enabled);",
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS runtime_last_heartbeat_at TIMESTAMP;",
+                "ALTER TABLE connected_bots ADD COLUMN IF NOT EXISTS runtime_pid BIGINT;",
+                "UPDATE connected_bots SET plan='PRO' WHERE UPPER(plan)='PLUS';",
+                """
+                CREATE TABLE IF NOT EXISTS white_label_audit_logs (
+                    id TEXT PRIMARY KEY,
+                    connected_bot_id TEXT REFERENCES connected_bots(id) ON DELETE SET NULL,
+                    request_id TEXT,
+                    actor_user_id BIGINT,
+                    action TEXT NOT NULL,
+                    target_bot_username TEXT,
+                    details_json JSONB,
+                    error_message TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_white_label_audit_logs_bot_created ON white_label_audit_logs (connected_bot_id, created_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_white_label_audit_logs_request_created ON white_label_audit_logs (request_id, created_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_white_label_audit_logs_action_created ON white_label_audit_logs (action, created_at DESC);",
+            ],
+        ),
     ]
     for version, note, stmts in migrations:
         if version in applied:
@@ -1144,6 +1207,8 @@ def init_db():
             cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();")
             cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS uploaded_by_user_id BIGINT;")
             cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS upload_source TEXT;")
+            cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS white_label_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_books_white_label_enabled ON books (white_label_enabled);")
             cur.execute("ALTER TABLE books DROP COLUMN IF EXISTS storage_chat_id;")
             cur.execute("ALTER TABLE books DROP COLUMN IF EXISTS storage_message_id;")
             cur.execute("ALTER TABLE books DROP COLUMN IF EXISTS storage_updated_at;")
@@ -3254,6 +3319,62 @@ def list_books():
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM books")
             return cur.fetchall()
+
+
+def search_books_for_white_label_fallback(query: str, limit: int = 50):
+    """Limited DB fallback for connected bots; do not scan the full catalog in Python."""
+    text = re.sub(r"\s+", " ", str(query or "").strip())
+    if not text:
+        return []
+    try:
+        safe_limit = max(1, min(200, int(limit or 50)))
+    except Exception:
+        safe_limit = 50
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for candidate in [text, *re.split(r"\s+", text)]:
+        clean = str(candidate or "").strip()
+        if len(clean) < 2 or clean.lower() in seen:
+            continue
+        seen.add(clean.lower())
+        tokens.append(clean)
+        if len(tokens) >= 6:
+            break
+    if not tokens:
+        return []
+    where_parts: list[str] = []
+    params: list[object] = []
+    for token in tokens:
+        pattern = f"%{token}%"
+        where_parts.append("(book_name ILIKE %s OR display_name ILIKE %s OR path ILIKE %s)")
+        params.extend([pattern, pattern, pattern])
+    params.append(safe_limit)
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT *
+                FROM books
+                WHERE COALESCE(white_label_enabled, TRUE) = TRUE
+                  AND ((file_id IS NOT NULL AND file_id <> '') OR (path IS NOT NULL AND path <> ''))
+                  AND (path IS NULL OR path = '' OR LOWER(path) LIKE '%%.pdf')
+                  AND ({' OR '.join(where_parts)})
+                ORDER BY searches DESC, downloads DESC, created_at DESC NULLS LAST, display_name ASC NULLS LAST
+                LIMIT %s
+                """,
+                params,
+            )
+            return cur.fetchall()
+
+
+def update_book_white_label_enabled(book_id: str, enabled: bool):
+    clean_id = str(book_id or "").strip()
+    if not clean_id:
+        return 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE books SET white_label_enabled=%s WHERE id=%s", (bool(enabled), clean_id))
+            return cur.rowcount
 
 
 def get_random_book(require_accessible: bool = True):

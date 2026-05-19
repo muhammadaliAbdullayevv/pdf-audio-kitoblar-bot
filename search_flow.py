@@ -4446,6 +4446,7 @@ async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.get("pending_wl_connect_request")
             or context.user_data.get("pending_wl_accept_cache_channel")
             or context.user_data.get("pending_wl_reject_request")
+            or context.user_data.get("pending_wl_bot_settings")
             or context.user_data.get("pending_wl_add_bot")
             or context.user_data.get("pending_wl_set_cache_channel")
         )

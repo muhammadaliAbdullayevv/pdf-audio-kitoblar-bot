@@ -102,6 +102,7 @@ REQUIRED_DEP_KEYS = (
     "handle_white_label_owner_menu_callback",
     "handle_white_label_request_callback",
     "handle_white_label_connected_bot_callback",
+    "handle_white_label_upgrade_callback",
     "handle_upload_help_callback",
     "handle_upload_request_status_callback",
     "handle_delete_book_callback",
@@ -272,7 +273,8 @@ def register_handlers(app, deps: Mapping[str, Any]) -> None:
     app.add_handler(CallbackQueryHandler(d["handle_white_label_public_request_callback"], pattern=r"^wlreq:(?:sendtoken|cancel)$"))
     app.add_handler(CallbackQueryHandler(d["handle_white_label_owner_menu_callback"], pattern=r"^wlmenu$"))
     app.add_handler(CallbackQueryHandler(d["handle_white_label_request_callback"], pattern=r"^wlreq(?:page|view|accept|reject):"))
-    app.add_handler(CallbackQueryHandler(d["handle_white_label_connected_bot_callback"], pattern=r"^wlbot(?:page|view|start|stop|restart|test|suspend|resume|delete|deleteconfirm):"))
+    app.add_handler(CallbackQueryHandler(d["handle_white_label_connected_bot_callback"], pattern=r"^wlbot(?:page|view|start|stop|restart|test|settings|plan|suspend|resume|delete|deleteconfirm):"))
+    app.add_handler(CallbackQueryHandler(d["handle_white_label_upgrade_callback"], pattern=r"^wlupg(?:page|view|plan):"))
     app.add_handler(
         CallbackQueryHandler(
             d["handle_book_selection"],

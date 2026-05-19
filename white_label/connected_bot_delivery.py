@@ -42,6 +42,8 @@ def _is_invalid_file_id_error(exc: Exception | str) -> bool:
 
 
 def _is_pdf_accessible_book(book: dict[str, Any]) -> bool:
+    if book.get("white_label_enabled") is False:
+        return False
     path = str(book.get("path") or "").strip().lower()
     file_id = str(book.get("file_id") or "").strip()
     if not path and not file_id:

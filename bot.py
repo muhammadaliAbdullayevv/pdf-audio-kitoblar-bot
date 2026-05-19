@@ -1324,6 +1324,10 @@ import upload_flow as _upload_flow
 import command_sync as _command_sync
 import handler_registry as _handler_registry
 from white_label import (
+    WL_PLAN_BASIC,
+    WL_PLAN_COMMUNITY,
+    WL_PLAN_PLUS,
+    WL_PLAN_PRO,
     WL_PLAN_TRIAL,
     WL_REQUEST_STATUS_PENDING,
     WL_STATUS_ACTIVE,
@@ -1346,11 +1350,14 @@ from white_label.crypto import (
 )
 from white_label.db_helpers import (
     accept_connected_bot_request as db_accept_connected_bot_request,
+    create_white_label_audit_log as db_create_white_label_audit_log,
     count_connected_bot_requests as db_count_connected_bot_requests,
+    count_connected_bots_for_owner as db_count_connected_bots_for_owner,
     count_connected_bots as db_count_connected_bots,
     create_connected_bot_cache_seed_job as db_create_connected_bot_cache_seed_job,
     create_connected_bot_request as db_create_connected_bot_request,
     delete_connected_bot as db_delete_connected_bot,
+    expire_due_trial_connected_bots as db_expire_due_trial_connected_bots,
     find_existing_connected_bot_request_or_bot as db_find_existing_connected_bot_request_or_bot,
     get_connected_bot_by_id as db_get_connected_bot_by_id,
     get_connected_bot_by_identifier as db_get_connected_bot_by_identifier,
@@ -1358,15 +1365,21 @@ from white_label.db_helpers import (
     get_connected_bot_file_cache as db_get_connected_bot_file_cache,
     get_connected_bot_request_by_id as db_get_connected_bot_request_by_id,
     get_connected_bot_usage as db_get_connected_bot_usage,
+    get_latest_white_label_audit_log as db_get_latest_white_label_audit_log,
     list_connected_bot_requests as db_list_connected_bot_requests,
+    list_connected_bots_for_owner as db_list_connected_bots_for_owner,
     list_connected_bots as db_list_connected_bots,
     list_connected_bots_page as db_list_connected_bots_page,
+    mark_connected_bot_trial_expired as db_mark_connected_bot_trial_expired,
     record_connected_bot_verification as db_record_connected_bot_verification,
     reject_connected_bot_request as db_reject_connected_bot_request,
     update_connected_bot_cache_channel as db_update_connected_bot_cache_channel,
+    update_connected_bot_plan as db_update_connected_bot_plan,
+    update_connected_bot_public_settings as db_update_connected_bot_public_settings,
     update_connected_bot_status as db_update_connected_bot_status,
     upsert_connected_bot as db_upsert_connected_bot,
 )
+from white_label.plans import normalize_plan as wl_normalize_plan, plan_feature_summary as wl_plan_feature_summary
 from white_label.runtime_utils import build_bot_client as wl_build_bot_client
 from white_label.runtime_control import (
     format_runtime_status as wl_format_runtime_status,
@@ -4577,6 +4590,7 @@ def _white_label_feature_error() -> str | None:
 
 _WL_REQUEST_PAGE_SIZE = 10
 _WL_CONNECTED_BOT_PAGE_SIZE = 10
+_WL_UPGRADE_BOT_PAGE_SIZE = 10
 _WL_PUBLIC_TOKEN_TTL_SECONDS = 10 * 60
 _WL_OWNER_FLOW_TTL_SECONDS = 10 * 60
 _WL_TRIAL_DAYS = 3
@@ -4587,6 +4601,31 @@ _WL_TRIAL_PER_MINUTE_SEND_LIMIT = 10
 
 def _wl_text(lang: str, key: str, default: str) -> str:
     return MESSAGES.get(lang, MESSAGES["en"]).get(key, default)
+
+
+async def _wl_audit(
+    action: str,
+    *,
+    actor_user_id: int | None = None,
+    connected_bot_id: str | None = None,
+    request_id: str | None = None,
+    target_bot_username: str | None = None,
+    details: dict | None = None,
+    error_message: str | None = None,
+) -> None:
+    try:
+        await run_blocking(
+            db_create_white_label_audit_log,
+            action=action,
+            actor_user_id=actor_user_id,
+            connected_bot_id=connected_bot_id,
+            request_id=request_id,
+            target_bot_username=target_bot_username,
+            details=details or {},
+            error_message=wl_redact_token_like_strings(str(error_message or "")) if error_message else None,
+        )
+    except Exception:
+        logger.debug("Failed to write white-label audit log for action=%s", action, exc_info=True)
 
 
 def _wl_user_line(user: Any) -> str:
@@ -4633,6 +4672,38 @@ def _wl_format_dt(value: Any) -> str:
         except Exception:
             return str(value)
     return str(value)[:16]
+
+
+def _wl_connected_bot_trial_expired(row: dict | None) -> bool:
+    if not row:
+        return False
+    if str((row or {}).get("subscription_status") or "").strip().upper() == "EXPIRED":
+        return True
+    if str((row or {}).get("plan") or "").strip().upper() != WL_PLAN_TRIAL:
+        return False
+    value = (row or {}).get("trial_ends_at")
+    if not value:
+        return False
+    try:
+        if hasattr(value, "replace") and hasattr(value, "tzinfo"):
+            expiry = value.replace(tzinfo=None)
+        else:
+            expiry = datetime.fromisoformat(str(value).replace("Z", "").split("+", 1)[0]).replace(tzinfo=None)
+        return datetime.utcnow() > expiry
+    except Exception:
+        return False
+
+
+def _wl_runtime_state(runtime_status: dict | None, row: dict | None = None) -> str:
+    state = str((runtime_status or {}).get("state") or "").strip().upper()
+    if state:
+        return state
+    db_status = str((row or {}).get("status") or "").strip().upper()
+    if db_status == WL_STATUS_ERROR:
+        return "ERROR"
+    if db_status == WL_STATUS_ACTIVE:
+        return "UNKNOWN"
+    return "STOPPED"
 
 
 def _wl_escape(value: Any) -> str:
@@ -4778,9 +4849,21 @@ async def _perform_white_label_public_request_token(
         )
         context.user_data.pop("pending_wl_connect_request", None)
         await update.message.reply_text(_wl_text(lang, "wlreq_sent", "✅ Your request has been sent to the owner."))
+        await _wl_audit(
+            "REQUEST_CREATED",
+            actor_user_id=int(update.effective_user.id),
+            request_id=str((request_row or {}).get("id") or ""),
+            target_bot_username=str(verified.get("bot_username") or "").strip(),
+            details={"bot_telegram_id": int(verified.get("bot_telegram_id") or 0)},
+        )
         await _notify_owner_connected_bot_request(context, dict(request_row or {}), lang)
     except Exception as exc:
         logger.warning("Public white-label bot request failed: %s", wl_redact_token_like_strings(str(exc)), exc_info=True)
+        await _wl_audit(
+            "TOKEN_VERIFICATION_FAILED",
+            actor_user_id=int(update.effective_user.id or 0),
+            error_message=str(exc),
+        )
         await update.message.reply_text(_wl_text(lang, "wlreq_invalid_token", "⚠️ Invalid bot token."))
 
 
@@ -4967,6 +5050,22 @@ async def _perform_wl_accept_cache_channel(
         if not connected_bot:
             await update.message.reply_text("⚠️ Request could not be accepted. It may already be processed.")
             return True
+        await _wl_audit(
+            "REQUEST_ACCEPTED",
+            actor_user_id=int(update.effective_user.id or 0),
+            connected_bot_id=str(connected_bot.get("id") or ""),
+            request_id=request_id,
+            target_bot_username=str(connected_bot.get("bot_username") or ""),
+            details={"cache_channel_id": cache_channel_id, "plan": str(connected_bot.get("plan") or ""), "trial_days": _WL_TRIAL_DAYS},
+        )
+        await _wl_audit(
+            "TRIAL_STARTED",
+            actor_user_id=int(update.effective_user.id or 0),
+            connected_bot_id=str(connected_bot.get("id") or ""),
+            request_id=request_id,
+            target_bot_username=str(connected_bot.get("bot_username") or ""),
+            details={"trial_ends_at": connected_bot.get("trial_ends_at")},
+        )
         try:
             await context.bot.send_message(
                 chat_id=int(request_row.get("requesting_user_id") or 0),
@@ -4988,6 +5087,12 @@ async def _perform_wl_accept_cache_channel(
         return True
     except Exception as exc:
         logger.error("White-label request accept failed: %s", wl_redact_token_like_strings(str(exc)), exc_info=True)
+        await _wl_audit(
+            "REQUEST_ACCEPT_FAILED",
+            actor_user_id=int(update.effective_user.id or 0),
+            request_id=request_id,
+            error_message=str(exc),
+        )
         await update.message.reply_text(f"⚠️ Could not accept request.\n{wl_redact_token_like_strings(str(exc))}")
         return True
 
@@ -5014,6 +5119,13 @@ async def _perform_wl_reject_reason(update: Update, context: ContextTypes.DEFAUL
     if not rejected:
         await update.message.reply_text("⚠️ Request could not be rejected. It may already be processed.")
         return True
+    await _wl_audit(
+        "REQUEST_REJECTED",
+        actor_user_id=int(update.effective_user.id or 0),
+        request_id=request_id,
+        target_bot_username=str((request_row or rejected).get("bot_username") or ""),
+        details={"reason": reason} if reason else {},
+    )
     try:
         notify_text = (
             _wl_text(lang, "wlreq_rejected_user_reason", "❌ Your bot connection request was rejected.\nReason: {reason}").format(reason=reason)
@@ -5024,6 +5136,62 @@ async def _perform_wl_reject_reason(update: Update, context: ContextTypes.DEFAUL
     except Exception:
         logger.debug("Failed to notify connected bot requester about rejection", exc_info=True)
     await update.message.reply_text("✅ Request rejected.")
+    return True
+
+
+def _parse_wl_bot_settings(raw_text: str) -> dict[str, Any] | None:
+    settings: dict[str, Any] = {}
+    for line in str(raw_text or "").splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().lower().replace("-", "_")
+        value = value.strip()
+        if key in {"title", "brand", "branding", "branding_title"}:
+            settings["branding_title"] = value
+        elif key in {"welcome_uz", "uz"}:
+            settings["welcome_text_uz"] = value
+        elif key in {"welcome_en", "en"}:
+            settings["welcome_text_en"] = value
+        elif key in {"welcome_ru", "ru"}:
+            settings["welcome_text_ru"] = value
+        elif key in {"results", "limit", "search_results", "search_results_limit"}:
+            try:
+                settings["search_results_limit"] = max(1, min(10, int(value)))
+            except Exception:
+                return None
+    return settings or None
+
+
+async def _perform_wl_bot_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, *, raw_text: str, lang: str) -> bool:
+    pending = context.user_data.get("pending_wl_bot_settings")
+    if not pending:
+        return False
+    if time.time() > float((pending or {}).get("expires_at", 0) or 0):
+        context.user_data.pop("pending_wl_bot_settings", None)
+        return False
+    if not update.message:
+        return True
+    text = str(raw_text or "").strip()
+    if text.lower() in {"cancel", "stop", "/cancel"}:
+        context.user_data.pop("pending_wl_bot_settings", None)
+        await update.message.reply_text(_wl_text(lang, "menu_flow_cancelled", "❌ Cancelled."))
+        return True
+    settings = _parse_wl_bot_settings(text)
+    if not settings:
+        await update.message.reply_text(
+            _wl_text(lang, "wlbot_settings_invalid", "⚠️ Send at least one setting."),
+            parse_mode="HTML",
+        )
+        return True
+    connected_bot_id = str((pending or {}).get("connected_bot_id") or "").strip()
+    updated = await run_blocking(db_update_connected_bot_public_settings, connected_bot_id, **settings)
+    context.user_data.pop("pending_wl_bot_settings", None)
+    if not updated:
+        await update.message.reply_text("⚠️ Connected bot not found.")
+        return True
+    await update.message.reply_text(_wl_text(lang, "wlbot_settings_saved", "✅ Connected bot settings saved."))
     return True
 
 
@@ -5045,12 +5213,16 @@ async def _build_wl_connected_bots_view(context: ContextTypes.DEFAULT_TYPE, lang
         for idx, row in enumerate(rows, start=1):
             usage = await run_blocking(db_get_connected_bot_usage, str(row.get("id") or ""))
             runtime_status = await wl_get_runtime_status(context.application.bot_data, str(row.get("id") or ""))
-            is_running = bool(runtime_status.get("running"))
-            status_text = "RUNNING" if is_running else ("STOPPED" if str(row.get("status") or "").upper() == WL_STATUS_SUSPENDED else str(row.get("status") or "-"))
+            status_text = _wl_runtime_state(runtime_status, row)
+            if str(row.get("status") or "").upper() == WL_STATUS_ERROR:
+                status_text = "ERROR"
+            if _wl_connected_bot_trial_expired(row):
+                status_text = "EXPIRED"
+            pid_text = runtime_status.get("pid") or row.get("runtime_pid") or "-"
             lines.extend(
                 [
                     f"{idx}. {_wl_escape(_wl_bot_reference(row))} — {_wl_escape(row.get('bot_first_name') or '-')}",
-                    f"   Status: {status_text} • Plan: {_wl_escape(row.get('plan') or '-')}",
+                    f"   Runtime: {status_text} • PID: {_wl_escape(pid_text)} • Plan: {_wl_escape(wl_normalize_plan(row.get('plan')))}",
                     f"   Trial end: {_wl_escape(_wl_format_dt(row.get('trial_ends_at')))}",
                     f"   Today: searches {int((usage or {}).get('searches') or 0)} / sends {int((usage or {}).get('sends') or 0)}",
                 ]
@@ -5080,8 +5252,16 @@ async def _show_wl_connected_bots_page(update: Update, context: ContextTypes.DEF
 async def _build_wl_connected_bot_detail(context: ContextTypes.DEFAULT_TYPE, row: dict, lang: str) -> tuple[str, InlineKeyboardMarkup]:
     usage = await run_blocking(db_get_connected_bot_usage, str(row.get("id") or ""))
     runtime_status = await wl_get_runtime_status(context.application.bot_data, str(row.get("id") or ""))
-    running = bool(runtime_status.get("running"))
-    status_text = "RUNNING" if running else ("STOPPED" if str(row.get("status") or "").upper() == WL_STATUS_SUSPENDED else str(row.get("status") or "-"))
+    status_text = _wl_runtime_state(runtime_status, row)
+    if str(row.get("status") or "").upper() == WL_STATUS_ERROR:
+        status_text = "ERROR"
+    if _wl_connected_bot_trial_expired(row):
+        status_text = "EXPIRED"
+    latest_audit = await run_blocking(db_get_latest_white_label_audit_log, connected_bot_id=str(row.get("id") or ""))
+    latest_audit_text = "-"
+    if latest_audit:
+        latest_audit_text = f"{latest_audit.get('action') or '-'} at {_wl_format_dt(latest_audit.get('created_at'))}"
+    runtime_pid = runtime_status.get("pid") or row.get("runtime_pid") or "-"
     text = "\n".join(
         [
             "🤖 <b>Connected bot</b>",
@@ -5091,14 +5271,21 @@ async def _build_wl_connected_bot_detail(context: ContextTypes.DEFAULT_TYPE, row
             f"Bot name: {_wl_escape(row.get('bot_first_name') or '-')}",
             f"Telegram ID: <code>{int(row.get('bot_telegram_id') or 0)}</code>",
             f"Requester: {_wl_escape(_wl_requester_line(row))}",
-            f"Status: <b>{_wl_escape(status_text)}</b>",
-            f"Plan: <b>{_wl_escape(row.get('plan') or '-')}</b>",
+            f"DB status: <b>{_wl_escape(row.get('status') or '-')}</b>",
+            f"Runtime: <b>{_wl_escape(status_text)}</b>",
+            f"Runtime PID: <code>{_wl_escape(runtime_pid)}</code>",
+            f"Last heartbeat: {_wl_escape(_wl_format_dt(row.get('runtime_last_heartbeat_at')))}",
+            f"Plan: <b>{_wl_escape(wl_normalize_plan(row.get('plan')))}</b>",
+            f"Plan features: {_wl_escape(wl_plan_feature_summary(row.get('plan')))}",
             f"Subscription: {_wl_escape(row.get('subscription_status') or '-')}",
             f"Trial end: {_wl_escape(_wl_format_dt(row.get('trial_ends_at')))}",
             f"Cache channel: <code>{_wl_escape(row.get('cache_channel_id') or '-')}</code>",
+            f"Branding: {_wl_escape(row.get('branding_title') or row.get('bot_first_name') or '-')}",
+            f"Results/page: <b>{int(row.get('search_results_limit') or 10)}</b>",
             f"Today: searches {int((usage or {}).get('searches') or 0)} / sends {int((usage or {}).get('sends') or 0)}",
             f"Cache: hits {int((usage or {}).get('cache_hits') or 0)} / misses {int((usage or {}).get('cache_misses') or 0)}",
             f"Last error: {_wl_escape(row.get('last_error') or '-')}",
+            f"Last audit: {_wl_escape(latest_audit_text)}",
             f"Token: <code>masked</code>",
         ]
     )
@@ -5111,6 +5298,12 @@ async def _build_wl_connected_bot_detail(context: ContextTypes.DEFAULT_TYPE, row
         [
             InlineKeyboardButton(_wl_text(lang, "wlbot_restart_button", "🔄 Restart"), callback_data=f"wlbotrestart:{bot_id}"),
             InlineKeyboardButton(_wl_text(lang, "wlbot_test_cache_button", "🧪 Test cache"), callback_data=f"wlbottest:{bot_id}"),
+        ],
+        [InlineKeyboardButton(_wl_text(lang, "wlbot_settings_button", "⚙️ Settings"), callback_data=f"wlbotsettings:{bot_id}")],
+        [
+            InlineKeyboardButton(_wl_upgrade_plan_label(lang, WL_PLAN_BASIC), callback_data=f"wlbotplan:{bot_id}:{WL_PLAN_BASIC}"),
+            InlineKeyboardButton(_wl_upgrade_plan_label(lang, WL_PLAN_PRO), callback_data=f"wlbotplan:{bot_id}:{WL_PLAN_PRO}"),
+            InlineKeyboardButton(_wl_upgrade_plan_label(lang, WL_PLAN_COMMUNITY), callback_data=f"wlbotplan:{bot_id}:{WL_PLAN_COMMUNITY}"),
         ],
         [
             InlineKeyboardButton(_wl_text(lang, "wlbot_suspend_button", "⛔ Suspend"), callback_data=f"wlbotsuspend:{bot_id}"),
@@ -5131,9 +5324,242 @@ async def _show_wl_connected_bot_detail(update: Update, context: ContextTypes.DE
     await _reply_or_edit_wl(update, text, reply_markup=markup)
 
 
+def _normalize_wl_upgrade_plan(raw: str | None) -> str:
+    normalized = wl_normalize_plan(raw)
+    if normalized in {WL_PLAN_BASIC, WL_PLAN_PRO, WL_PLAN_COMMUNITY}:
+        return normalized
+    return WL_PLAN_PRO
+
+
+def _user_owns_connected_bot(user_id: int, row: dict | None) -> bool:
+    if not user_id or not row:
+        return False
+    return int((row or {}).get("owner_telegram_id") or 0) == int(user_id) or int((row or {}).get("requested_by_user_id") or 0) == int(user_id)
+
+
+def _wl_upgrade_plan_label(lang: str, plan: str) -> str:
+    normalized = _normalize_wl_upgrade_plan(plan)
+    if normalized == WL_PLAN_BASIC:
+        return "⭐ Basic"
+    if normalized == WL_PLAN_COMMUNITY:
+        return "🌍 Community"
+    return _wl_text(lang, "wl_upgrade_pro_button", "🚀 Pro")
+
+
+async def _build_wl_upgrade_bots_view(lang: str, user_id: int, plan: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    normalized_plan = _normalize_wl_upgrade_plan(plan)
+    page = max(0, int(page or 0))
+    total = int(await run_blocking(db_count_connected_bots_for_owner, int(user_id or 0)) or 0)
+    pages = max(1, math.ceil(total / _WL_UPGRADE_BOT_PAGE_SIZE))
+    if page >= pages:
+        page = pages - 1
+    rows = await run_blocking(
+        db_list_connected_bots_for_owner,
+        int(user_id or 0),
+        limit=_WL_UPGRADE_BOT_PAGE_SIZE,
+        offset=page * _WL_UPGRADE_BOT_PAGE_SIZE,
+    )
+    lines = [
+        f"<b>{_wl_escape(_wl_text(lang, 'wl_upgrade_choose_title', '🤖 My connected bots'))}</b>",
+        _wl_escape(_wl_text(lang, "wl_upgrade_choose_hint", "Choose the bot you want to upgrade.")),
+        f"Plan: <b>{_wl_escape(normalized_plan)}</b>",
+        f"Jami: {total} • Sahifa {page + 1}/{pages}",
+        "",
+    ]
+    if not rows:
+        lines.append(_wl_escape(_wl_text(lang, "wl_upgrade_no_bots", "You do not have connected bots yet.")))
+    else:
+        for idx, row in enumerate(rows, start=1):
+            lines.extend(
+                [
+                    f"{idx}. {_wl_escape(_wl_bot_reference(row))} — {_wl_escape(row.get('bot_first_name') or '-')}",
+                    f"   Status: {_wl_escape(row.get('status') or '-')} • Plan: {_wl_escape(row.get('plan') or '-')}",
+                    f"   Trial end: {_wl_escape(_wl_format_dt(row.get('trial_ends_at')))}",
+                ]
+            )
+    button_rows: list[list[InlineKeyboardButton]] = []
+    number_row: list[InlineKeyboardButton] = []
+    for idx, row in enumerate(rows or [], start=1):
+        bot_id = str((row or {}).get("id") or "").strip()
+        if not bot_id:
+            continue
+        number_row.append(InlineKeyboardButton(str(idx), callback_data=f"wlupgview:{normalized_plan}:{bot_id}"))
+        if len(number_row) >= 5:
+            button_rows.append(number_row)
+            number_row = []
+    if number_row:
+        button_rows.append(number_row)
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(_wl_text(lang, "wlreq_prev_button", "⬅️ Prev"), callback_data=f"wlupgpage:{normalized_plan}:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(_wl_text(lang, "wlreq_next_button", "Next ➡️"), callback_data=f"wlupgpage:{normalized_plan}:{page + 1}"))
+    if nav:
+        button_rows.append(nav)
+    button_rows.append([InlineKeyboardButton(_wl_text(lang, "wlreq_refresh_button", "🔄 Refresh"), callback_data=f"wlupgpage:{normalized_plan}:{page}")])
+    return "\n".join(lines), InlineKeyboardMarkup(button_rows)
+
+
+async def _show_wl_upgrade_bots(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, plan: str = WL_PLAN_PRO, page: int = 0) -> None:
+    del context
+    user_id = int(update.effective_user.id if update.effective_user else 0)
+    text, markup = await _build_wl_upgrade_bots_view(lang, user_id, plan, page)
+    await _reply_or_edit_wl(update, text, reply_markup=markup)
+
+
+async def _show_wl_upgrade_bot_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, connected_bot_id: str, plan: str = WL_PLAN_PRO) -> None:
+    del context
+    user_id = int(update.effective_user.id if update.effective_user else 0)
+    row = await run_blocking(db_get_connected_bot_by_id, str(connected_bot_id or "").strip())
+    if not _user_owns_connected_bot(user_id, row):
+        await _reply_or_edit_wl(update, _wl_text(lang, "wl_upgrade_bot_not_found", "⚠️ Connected bot not found."), parse_mode=None)
+        return
+    normalized_plan = _normalize_wl_upgrade_plan(plan)
+    text = "\n".join(
+        [
+            f"<b>{_wl_escape(_wl_text(lang, 'wl_upgrade_detail_title', '🤖 Upgrade connected bot'))}</b>",
+            "",
+            f"Bot: {_wl_escape(_wl_bot_reference(row))}",
+            f"Bot name: {_wl_escape(row.get('bot_first_name') or '-')}",
+            f"Current plan: <b>{_wl_escape(row.get('plan') or '-')}</b>",
+            f"Subscription: {_wl_escape(row.get('subscription_status') or '-')}",
+            f"Trial end: {_wl_escape(_wl_format_dt(row.get('trial_ends_at')))}",
+            "",
+            _wl_escape(
+                _wl_text(
+                    lang,
+                    "wl_upgrade_detail_hint",
+                    "Choose a plan below. The owner will contact you for manual payment/activation.",
+                )
+            ),
+        ]
+    )
+    bot_id = str(row.get("id") or "")
+    buttons = [
+        [
+            InlineKeyboardButton(_wl_upgrade_plan_label(lang, WL_PLAN_BASIC), callback_data=f"wlupgplan:{bot_id}:{WL_PLAN_BASIC}"),
+            InlineKeyboardButton(_wl_upgrade_plan_label(lang, WL_PLAN_PRO), callback_data=f"wlupgplan:{bot_id}:{WL_PLAN_PRO}"),
+            InlineKeyboardButton(_wl_upgrade_plan_label(lang, WL_PLAN_COMMUNITY), callback_data=f"wlupgplan:{bot_id}:{WL_PLAN_COMMUNITY}"),
+        ],
+        [InlineKeyboardButton(_wl_text(lang, "wlreq_back_button", "⬅️ Back"), callback_data=f"wlupgpage:{normalized_plan}:0")],
+    ]
+    await _reply_or_edit_wl(update, text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def _request_wl_upgrade_plan(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, connected_bot_id: str, plan: str) -> None:
+    user = update.effective_user
+    user_id = int(user.id if user else 0)
+    row = await run_blocking(db_get_connected_bot_by_id, str(connected_bot_id or "").strip())
+    if not _user_owns_connected_bot(user_id, row):
+        await _reply_or_edit_wl(update, _wl_text(lang, "wl_upgrade_bot_not_found", "⚠️ Connected bot not found."), parse_mode=None)
+        return
+    normalized_plan = _normalize_wl_upgrade_plan(plan)
+    if OWNER_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=int(OWNER_ID),
+                text="\n".join(
+                    [
+                        "💳 <b>White-label upgrade request</b>",
+                        "",
+                        f"User: {_wl_escape(_wl_user_line(user))}",
+                        f"Bot: {_wl_escape(_wl_bot_reference(row))}",
+                        f"Bot name: {_wl_escape(row.get('bot_first_name') or '-')}",
+                        f"Requested plan: <b>{_wl_escape(normalized_plan)}</b>",
+                        "",
+                        f"Open: /connected_bots",
+                    ]
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(_wl_upgrade_plan_label(lang, normalized_plan), callback_data=f"wlbotplan:{row.get('id')}:{normalized_plan}"),
+                        ],
+                        [InlineKeyboardButton(_wl_text(lang, "wlreq_owner_view_button", "👁 View"), callback_data=f"wlbotview:{row.get('id')}")],
+                    ]
+                ),
+            )
+        except Exception:
+            logger.debug("Failed to notify owner about white-label upgrade request", exc_info=True)
+    await _reply_or_edit_wl(
+        update,
+        _wl_text(
+            lang,
+            "wl_upgrade_requested",
+            "✅ Upgrade request sent. The owner will contact you soon.",
+        ),
+        parse_mode=None,
+    )
+
+
+async def _notify_wl_trial_expired_owner_main(context: ContextTypes.DEFAULT_TYPE, row: dict) -> None:
+    owner_id = int((row or {}).get("requested_by_user_id") or (row or {}).get("owner_telegram_id") or 0)
+    if not owner_id:
+        return
+    user_record = get_user_record(owner_id) or {}
+    lang = detect_language_code(user_record.get("language") or user_record.get("group_language") or "uz")
+    text = _wl_text(
+        lang,
+        "wl_trial_expired_owner_notice",
+        "Your 3-day free trial has ended.\n\nBot: {bot}\n\nTo keep using this bot, please subscribe to Basic or Pro.",
+    ).format(bot=_wl_escape(_wl_bot_reference(row)))
+    try:
+        await context.bot.send_message(
+            chat_id=owner_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(_wl_upgrade_plan_label(lang, WL_PLAN_BASIC), callback_data=f"wlupgpage:{WL_PLAN_BASIC}:0"),
+                        InlineKeyboardButton(_wl_upgrade_plan_label(lang, WL_PLAN_PRO), callback_data=f"wlupgpage:{WL_PLAN_PRO}:0"),
+                    ]
+                ]
+            ),
+        )
+    except Exception:
+        logger.debug("Failed to notify connected bot owner about trial expiry", exc_info=True)
+
+
+async def _bg_expire_white_label_trials(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ENABLE_WHITE_LABEL:
+        return
+    try:
+        rows = await run_blocking(db_expire_due_trial_connected_bots, limit=50)
+        for row in rows or []:
+            connected_bot_id = str((row or {}).get("id") or "").strip()
+            if connected_bot_id:
+                try:
+                    await wl_stop_runtime(context.application.bot_data, connected_bot_id)
+                except Exception:
+                    logger.debug("Failed to stop expired connected bot runtime %s", connected_bot_id, exc_info=True)
+            if (row or {}).get("_should_notify_trial_expired"):
+                await _notify_wl_trial_expired_owner_main(context, dict(row))
+                await _wl_audit(
+                    "TRIAL_EXPIRED",
+                    actor_user_id=None,
+                    connected_bot_id=str((row or {}).get("id") or ""),
+                    target_bot_username=str((row or {}).get("bot_username") or ""),
+                    details={"trial_ends_at": (row or {}).get("trial_ends_at")},
+                )
+    except Exception:
+        logger.debug("White-label trial expiry sweep failed", exc_info=True)
+
+
 async def _start_wl_connected_bot_from_row(context: ContextTypes.DEFAULT_TYPE, row: dict) -> dict:
     if not int(row.get("cache_channel_id") or 0):
         return {"ok": False, "error": "cache channel is not configured"}
+    if _wl_connected_bot_trial_expired(row):
+        await run_blocking(db_mark_connected_bot_trial_expired, str(row.get("id") or ""))
+        await _wl_audit(
+            "TRIAL_EXPIRED",
+            actor_user_id=None,
+            connected_bot_id=str(row.get("id") or ""),
+            target_bot_username=str(row.get("bot_username") or ""),
+            details={"trial_ends_at": row.get("trial_ends_at")},
+        )
+        return {"ok": False, "error": "trial expired; upgrade the bot to Basic, Pro, or Community first"}
     updated = await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ACTIVE, clear_error=True)
     result = await wl_start_runtime(context.application.bot_data, dict(updated or row))
     if not result.get("ok"):
@@ -5292,6 +5718,7 @@ async def process_pending_white_label_owner_input(update: Update, context: Conte
         context.user_data.get("pending_wl_connect_request")
         or context.user_data.get("pending_wl_accept_cache_channel")
         or context.user_data.get("pending_wl_reject_request")
+        or context.user_data.get("pending_wl_bot_settings")
         or context.user_data.get("pending_wl_add_bot")
         or context.user_data.get("pending_wl_set_cache_channel")
     )
@@ -5300,12 +5727,24 @@ async def process_pending_white_label_owner_input(update: Update, context: Conte
         context.user_data.pop("pending_wl_connect_request", None)
         context.user_data.pop("pending_wl_accept_cache_channel", None)
         context.user_data.pop("pending_wl_reject_request", None)
+        context.user_data.pop("pending_wl_bot_settings", None)
         context.user_data.pop("pending_wl_add_bot", None)
         context.user_data.pop("pending_wl_set_cache_channel", None)
         if had_pending:
             await update.message.reply_text(feature_error)
             return True
         return False
+
+    # Owner approval inputs must win over stale public token-request state.
+    # Otherwise a cache channel id like -100... can be misread as a bot token.
+    if user_is_owner and context.user_data.get("pending_wl_accept_cache_channel"):
+        return await _perform_wl_accept_cache_channel(update, context, cache_channel_raw=str(update.message.text or ""), lang=lang)
+
+    if user_is_owner and context.user_data.get("pending_wl_reject_request"):
+        return await _perform_wl_reject_reason(update, context, reason_raw=str(update.message.text or ""), lang=lang)
+
+    if user_is_owner and context.user_data.get("pending_wl_bot_settings"):
+        return await _perform_wl_bot_settings(update, context, raw_text=str(update.message.text or ""), lang=lang)
 
     pending_public = context.user_data.get("pending_wl_connect_request")
     if pending_public:
@@ -5324,12 +5763,6 @@ async def process_pending_white_label_owner_input(update: Update, context: Conte
 
     if not user_is_owner:
         return False
-
-    if context.user_data.get("pending_wl_accept_cache_channel"):
-        return await _perform_wl_accept_cache_channel(update, context, cache_channel_raw=str(update.message.text or ""), lang=lang)
-
-    if context.user_data.get("pending_wl_reject_request"):
-        return await _perform_wl_reject_reason(update, context, reason_raw=str(update.message.text or ""), lang=lang)
 
     pending_add = context.user_data.get("pending_wl_add_bot")
     if pending_add:
@@ -5456,6 +5889,13 @@ async def _white_label_test_bot_impl(update: Update, context: ContextTypes.DEFAU
     except Exception as exc:
         error_text = wl_redact_token_like_strings(str(exc))
         await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ERROR, last_error=error_text)
+        await _wl_audit(
+            "TOKEN_VERIFICATION_FAILED",
+            actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+            connected_bot_id=str(row.get("id") or ""),
+            target_bot_username=str(row.get("bot_username") or ""),
+            error_message=error_text,
+        )
         await target_message.reply_text(f"⚠️ Token verification failed.\n{error_text}")
 
 
@@ -5488,6 +5928,13 @@ async def _white_label_activate_bot_impl(update: Update, context: ContextTypes.D
             runtime_line = f"Runtime: start failed ({runtime_result.get('error') or 'unknown error'})"
         else:
             runtime_line = "Runtime: already running" if runtime_result.get("already_running") else f"Runtime: started, PID {runtime_result.get('pid') or '-'}"
+        await _wl_audit(
+            "BOT_STARTED",
+            actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+            connected_bot_id=str((updated or row).get("id") or ""),
+            target_bot_username=str((updated or row).get("bot_username") or ""),
+            details={"runtime": runtime_result},
+        )
         await target_message.reply_text(
             "\n".join(
                 [
@@ -5500,6 +5947,13 @@ async def _white_label_activate_bot_impl(update: Update, context: ContextTypes.D
     except Exception as exc:
         error_text = wl_redact_token_like_strings(str(exc))
         await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ERROR, last_error=error_text)
+        await _wl_audit(
+            "BOT_START_FAILED",
+            actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+            connected_bot_id=str(row.get("id") or ""),
+            target_bot_username=str(row.get("bot_username") or ""),
+            error_message=error_text,
+        )
         await target_message.reply_text(f"⚠️ Could not activate the connected bot.\n{error_text}")
 
 
@@ -5521,6 +5975,13 @@ async def _white_label_suspend_bot_impl(update: Update, context: ContextTypes.DE
         return
     updated = await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_SUSPENDED, clear_error=False)
     runtime_result = await wl_stop_runtime(context.application.bot_data, str(row.get("id") or ""))
+    await _wl_audit(
+        "BOT_SUSPENDED",
+        actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+        connected_bot_id=str(row.get("id") or ""),
+        target_bot_username=str(row.get("bot_username") or ""),
+        details={"runtime": runtime_result},
+    )
     runtime_line = "Runtime: already stopped" if runtime_result.get("already_stopped") else f"Runtime: {runtime_result.get('state') or 'STOPPED'}"
     await target_message.reply_text(
         "\n".join(
@@ -5549,6 +6010,12 @@ async def _white_label_delete_bot_impl(update: Update, context: ContextTypes.DEF
         await target_message.reply_text("⚠️ Connected bot not found.")
         return
     await wl_stop_runtime(context.application.bot_data, str(row.get("id") or ""))
+    await _wl_audit(
+        "BOT_DELETED",
+        actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+        connected_bot_id=str(row.get("id") or ""),
+        target_bot_username=str(row.get("bot_username") or ""),
+    )
     deleted = await run_blocking(db_delete_connected_bot, str(row.get("id") or ""))
     if int(deleted or 0) <= 0:
         await target_message.reply_text("⚠️ Connected bot could not be deleted.")
@@ -5580,8 +6047,22 @@ async def _white_label_start_bot_impl(update: Update, context: ContextTypes.DEFA
             row = await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_ACTIVE, clear_error=True) or row
         result = await wl_start_runtime(context.application.bot_data, dict(row))
         if not result.get("ok"):
+            await _wl_audit(
+                "BOT_START_FAILED",
+                actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+                connected_bot_id=str(row.get("id") or ""),
+                target_bot_username=str(row.get("bot_username") or ""),
+                error_message=str(result.get("error") or "unknown error"),
+            )
             await target_message.reply_text(f"⚠️ Connected bot runtime did not start.\n{result.get('error') or 'unknown error'}")
             return
+        await _wl_audit(
+            "BOT_STARTED",
+            actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+            connected_bot_id=str(row.get("id") or ""),
+            target_bot_username=str(row.get("bot_username") or ""),
+            details={"runtime": result},
+        )
         if result.get("already_running"):
             await target_message.reply_text(
                 "\n".join(
@@ -5624,6 +6105,13 @@ async def _white_label_stop_bot_impl(update: Update, context: ContextTypes.DEFAU
         return
     await run_blocking(db_update_connected_bot_status, str(row.get("id") or ""), WL_STATUS_SUSPENDED, clear_error=False)
     result = await wl_stop_runtime(context.application.bot_data, str(row.get("id") or ""))
+    await _wl_audit(
+        "BOT_STOPPED",
+        actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+        connected_bot_id=str(row.get("id") or ""),
+        target_bot_username=str(row.get("bot_username") or ""),
+        details={"runtime": result},
+    )
     if result.get("already_stopped"):
         await target_message.reply_text(f"ℹ️ Connected bot runtime was already stopped: {format_connected_bot_reference(row)}")
         return
@@ -5867,6 +6355,7 @@ async def handle_white_label_request_callback(update: Update, context: ContextTy
             "request_id": request_id,
             "expires_at": time.time() + _WL_OWNER_FLOW_TTL_SECONDS,
         }
+        context.user_data.pop("pending_wl_connect_request", None)
         if query.message:
             await query.message.reply_text(_wl_text(lang, "wlreq_accept_cache_prompt", "Send the cache channel ID."))
         return
@@ -5880,6 +6369,7 @@ async def handle_white_label_request_callback(update: Update, context: ContextTy
             "request_id": request_id,
             "expires_at": time.time() + _WL_OWNER_FLOW_TTL_SECONDS,
         }
+        context.user_data.pop("pending_wl_connect_request", None)
         if query.message:
             await query.message.reply_text(_wl_text(lang, "wlreq_reject_reason_prompt", "Send the rejection reason or /skip."))
 
@@ -5952,6 +6442,52 @@ async def handle_white_label_connected_bot_callback(update: Update, context: Con
         return
     data = str(query.data or "")
     await query.answer()
+    if data.startswith("wlbotplan:"):
+        try:
+            _prefix, connected_bot_id, plan = data.split(":", 2)
+        except Exception:
+            await _reply_or_edit_wl(update, "⚠️ Invalid plan action.", parse_mode=None)
+            return
+        updated = await run_blocking(db_update_connected_bot_plan, connected_bot_id, plan, trial_days=_WL_TRIAL_DAYS)
+        if not updated:
+            await _reply_or_edit_wl(update, "⚠️ Connected bot not found.", parse_mode=None)
+            return
+        await _wl_audit(
+            "PLAN_CHANGED",
+            actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+            connected_bot_id=connected_bot_id,
+            target_bot_username=str(updated.get("bot_username") or ""),
+            details={"plan": str(updated.get("plan") or plan).upper()},
+        )
+        start_result = {"ok": False, "error": ""}
+        if str(updated.get("plan") or "").upper() in {WL_PLAN_BASIC, WL_PLAN_PRO, WL_PLAN_COMMUNITY, WL_PLAN_PLUS}:
+            start_result = await _start_wl_connected_bot_from_row(context, dict(updated))
+        if not start_result.get("ok") and str(updated.get("plan") or "").upper() in {WL_PLAN_BASIC, WL_PLAN_PRO, WL_PLAN_COMMUNITY, WL_PLAN_PLUS}:
+            await _reply_or_edit_wl(
+                update,
+                "✅ Plan saved, but runtime was not started automatically.\n"
+                f"Reason: {wl_redact_token_like_strings(str(start_result.get('error') or 'unknown error'))}",
+                parse_mode=None,
+            )
+            return
+        try:
+            requester_id = int(updated.get("requested_by_user_id") or updated.get("owner_telegram_id") or 0)
+            if requester_id:
+                user_record = get_user_record(requester_id) or {}
+                user_lang = detect_language_code(user_record.get("language") or lang)
+                await context.bot.send_message(
+                    chat_id=requester_id,
+                    text=_wl_text(
+                        user_lang,
+                        "wl_plan_activated_user",
+                        "✅ Your bot has been activated on the {plan} plan.",
+                    ).format(plan=_wl_escape(str(updated.get("plan") or plan).upper())),
+                    parse_mode="HTML",
+                )
+        except Exception:
+            logger.debug("Failed to notify requester about connected bot plan activation", exc_info=True)
+        await _show_wl_connected_bot_detail(update, context, lang, connected_bot_id)
+        return
     if data.startswith("wlbotpage:"):
         try:
             page = int(data.split(":", 1)[1])
@@ -5970,25 +6506,73 @@ async def handle_white_label_connected_bot_callback(update: Update, context: Con
     if action == "wlbotstart" or action == "wlbotresume":
         result = await _start_wl_connected_bot_from_row(context, dict(row))
         if not result.get("ok"):
+            await _wl_audit(
+                "BOT_START_FAILED",
+                actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+                connected_bot_id=connected_bot_id,
+                target_bot_username=str(row.get("bot_username") or ""),
+                error_message=str(result.get("error") or "unknown error"),
+            )
             await _reply_or_edit_wl(update, f"⚠️ Runtime did not start.\n{wl_redact_token_like_strings(str(result.get('error') or 'unknown error'))}", parse_mode=None)
             return
+        await _wl_audit(
+            "BOT_RESUMED" if action == "wlbotresume" else "BOT_STARTED",
+            actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+            connected_bot_id=connected_bot_id,
+            target_bot_username=str(row.get("bot_username") or ""),
+            details={"runtime": result},
+        )
         await _show_wl_connected_bot_detail(update, context, lang, connected_bot_id)
         return
     if action == "wlbotstop" or action == "wlbotsuspend":
         await run_blocking(db_update_connected_bot_status, connected_bot_id, WL_STATUS_SUSPENDED, clear_error=False)
-        await wl_stop_runtime(context.application.bot_data, connected_bot_id)
+        stop_result = await wl_stop_runtime(context.application.bot_data, connected_bot_id)
+        await _wl_audit(
+            "BOT_SUSPENDED" if action == "wlbotsuspend" else "BOT_STOPPED",
+            actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+            connected_bot_id=connected_bot_id,
+            target_bot_username=str(row.get("bot_username") or ""),
+            details={"runtime": stop_result},
+        )
         await _show_wl_connected_bot_detail(update, context, lang, connected_bot_id)
         return
     if action == "wlbotrestart":
-        await wl_stop_runtime(context.application.bot_data, connected_bot_id)
+        stop_result = await wl_stop_runtime(context.application.bot_data, connected_bot_id)
         result = await _start_wl_connected_bot_from_row(context, dict(row))
         if not result.get("ok"):
+            await _wl_audit(
+                "BOT_RESTART_FAILED",
+                actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+                connected_bot_id=connected_bot_id,
+                target_bot_username=str(row.get("bot_username") or ""),
+                details={"stop_runtime": stop_result},
+                error_message=str(result.get("error") or "unknown error"),
+            )
             await _reply_or_edit_wl(update, f"⚠️ Runtime did not restart.\n{wl_redact_token_like_strings(str(result.get('error') or 'unknown error'))}", parse_mode=None)
             return
+        await _wl_audit(
+            "BOT_RESTARTED",
+            actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+            connected_bot_id=connected_bot_id,
+            target_bot_username=str(row.get("bot_username") or ""),
+            details={"stop_runtime": stop_result, "start_runtime": result},
+        )
         await _show_wl_connected_bot_detail(update, context, lang, connected_bot_id)
         return
     if action == "wlbottest":
         await _run_wl_cache_test_for_row(update, context, dict(row), lang)
+        return
+    if action == "wlbotsettings":
+        context.user_data["pending_wl_bot_settings"] = {
+            "connected_bot_id": connected_bot_id,
+            "expires_at": time.time() + _WL_OWNER_FLOW_TTL_SECONDS,
+        }
+        context.user_data.pop("pending_wl_connect_request", None)
+        if query.message:
+            await query.message.reply_text(
+                _wl_text(lang, "wlbot_settings_prompt", "⚙️ Send connected bot settings."),
+                parse_mode="HTML",
+            )
         return
     if action == "wlbotdelete":
         await _reply_or_edit_wl(
@@ -6004,8 +6588,49 @@ async def handle_white_label_connected_bot_callback(update: Update, context: Con
         return
     if action == "wlbotdeleteconfirm":
         await wl_stop_runtime(context.application.bot_data, connected_bot_id)
+        await _wl_audit(
+            "BOT_DELETED",
+            actor_user_id=int(update.effective_user.id or 0) if update.effective_user else None,
+            connected_bot_id=connected_bot_id,
+            target_bot_username=str(row.get("bot_username") or ""),
+        )
         await run_blocking(db_delete_connected_bot, connected_bot_id)
         await _show_wl_connected_bots_page(update, context, lang, 0)
+
+
+async def handle_white_label_upgrade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    lang = ensure_user_language(update, context)
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await query.answer(feature_error, show_alert=True)
+        return
+    data = str(query.data or "")
+    await query.answer()
+    if data.startswith("wlupgpage:"):
+        try:
+            _prefix, plan, page_raw = data.split(":", 2)
+            page = int(page_raw or 0)
+        except Exception:
+            plan = WL_PLAN_PRO
+            page = 0
+        await _show_wl_upgrade_bots(update, context, lang, plan, page)
+        return
+    if data.startswith("wlupgview:"):
+        try:
+            _prefix, plan, connected_bot_id = data.split(":", 2)
+        except Exception:
+            return
+        await _show_wl_upgrade_bot_detail(update, context, lang, connected_bot_id, plan)
+        return
+    if data.startswith("wlupgplan:"):
+        try:
+            _prefix, connected_bot_id, plan = data.split(":", 2)
+        except Exception:
+            return
+        await _request_wl_upgrade_plan(update, context, lang, connected_bot_id, plan)
 
 
 def get_public_commands(lang: str = "en"):
@@ -6173,6 +6798,12 @@ async def post_init(application):
         application.job_queue.run_repeating(_bg_cleanup_job_dirs, interval=60 * 60, first=60 * 60)
     except Exception as e:
         logger.error("Failed to schedule job temp cleanup: %s", e)
+    if ENABLE_WHITE_LABEL:
+        try:
+            application.job_queue.run_once(_bg_expire_white_label_trials, when=15)
+            application.job_queue.run_repeating(_bg_expire_white_label_trials, interval=15 * 60, first=15 * 60)
+        except Exception as e:
+            logger.error("Failed to schedule white-label trial expiry sweep: %s", e)
 
 
 def get_es():
@@ -7333,6 +7964,28 @@ async def _post_start_background_sync(
         logger.error(f"Failed to notify referrer {referrer_id}: {e}")
 
 
+def _parse_wl_upgrade_start_payload(payload: str | None) -> str | None:
+    text = str(payload or "").strip()
+    if not text.startswith("wlupgrade"):
+        return None
+    parts = text.split("_", 1)
+    if len(parts) == 1:
+        return WL_PLAN_PRO
+    return _normalize_wl_upgrade_plan(parts[1])
+
+
+async def _handle_wl_upgrade_start_payload(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str | None, lang: str) -> bool:
+    plan = _parse_wl_upgrade_start_payload(payload)
+    if not plan:
+        return False
+    feature_error = _white_label_feature_error()
+    if feature_error:
+        await safe_reply(update, feature_error)
+        return True
+    await _show_wl_upgrade_bots(update, context, lang, plan, 0)
+    return True
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if is_blocked(update.effective_user.id):
@@ -7379,6 +8032,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt_lang = _language_picker_prompt_lang(user_record, update.effective_user)
         selected_lang = str(user_record.get("language") or "").strip()
         language_selected = bool(user_record.get("language_selected")) and bool(selected_lang)
+        if await _handle_wl_upgrade_start_payload(update, context, start_payload, detect_language_code(selected_lang or prompt_lang)):
+            _schedule_application_task(
+                context.application,
+                _post_start_background_sync(update, context, referrer_id),
+            )
+            return
         if guest_handoff_token:
             handled = await _handle_guest_private_start_payload(
                 update,
@@ -7634,6 +8293,9 @@ async def _cancel_menu_conflicting_flows(update: Update, context: ContextTypes.D
         cancelled = True
     if context.user_data.get("pending_wl_reject_request"):
         context.user_data.pop("pending_wl_reject_request", None)
+        cancelled = True
+    if context.user_data.get("pending_wl_bot_settings"):
+        context.user_data.pop("pending_wl_bot_settings", None)
         cancelled = True
     if context.user_data.get("admin_menu_prompt"):
         context.user_data.pop("admin_menu_prompt", None)
